@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          pip install numpy
+          pip install git+https://github.com/bri3d/sa2_seed_key.git || true
+          # udsoncan/bleak/pyserial deliberately not installed here —
+          # headless tests must pass without hardware deps
+          echo "Dependencies installed (hardware deps skipped for CI)"
+
+      - name: Run headless smoke test
+        run: python -m tests.sim_runner --headless
+
+      - name: Run ECU backend tests
+        run: python -m tests.sim_ecu
+
+      - name: Run transmission backend tests
+        run: python -m tests.sim_trans
+
+      - name: Full test runner
+        run: python -m tests --headless
+
+      - name: Check imports (no tkinter on CI)
+        run: |
+          python -c "from core.ecu_defs import ECU_REGISTRY, TCU_REGISTRY, SIMOS85, ZF8HP; print('core OK')"
+          python -c "from core.trans_defs import TRANS_REGISTRY, ECU_DEFAULT_TRANS; print('trans_defs OK')"
+          python -c "from logger import LogSession, SIMOS85_CHANNELS, Channel; print('logger OK')"
+          python -c "from tuner.cal_parser import CalParser; print('cal_parser OK')"
