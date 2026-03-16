@@ -1,1233 +1,1390 @@
 """
-ui/main_window.py — Simos Tuning Suite — Main Application Window
+ui/main_window.py — Simos Tuning Suite main application window
 
-Tabbed desktop GUI. Hosts all functional panels wired to the backend.
+Tabbed desktop GUI (Tkinter + ttk) for the full simos-suite workflow.
+Tabs:
+    1. Connect    — InterfacePanel: hardware interface selection, ECU picker
+    2. ECU Info   — Read all VW identification DIDs, display live
+    3. Flash      — Read CAL block / write CAL block with progress bar
+    4. Tune       — Calibration table editor (2D grid + value scaling)
+    5. Logger     — Live DID poller with configurable channels
+    6. CP Tools   — J533 probe, constellation capture, ODX viewer
+    7. Raw Sniff  — Pass-through hex log of all ISO-TP frames
 
-Tabs
-────
-  Hardware    InterfacePanel — auto-detect + connect. Drives all other tabs.
-  ECU Info    Read all standard VW DIDs (VIN, part numbers, session info, etc.)
-  Flash       Read / write CAL block with progress bar and checksum auto-fix.
-  Tune        Calibration table editor — dropdown, editable grid, 2D chart stub.
-  Logger      Live DID poller — configurable channels, running readouts.
-  CP Tools    J533 active DID probe + ODX parser output.
-  Raw Sniff   Hex dump of raw ISO-TP frames from BLE bridge sniff mode.
-
-State model
-───────────
-  _ecu        Currently selected ECUDef (from ECU selector dropdown)
-  _interface  Currently connected interface string (e.g. "BLE", "USBISOTP")
-  _iface_path Path (COM port, DLL path, or "" for BLE)
-  _connected  Bool — True when InterfacePanel reports connected
-
-Run standalone:
+Usage:
     python -m ui.main_window
+    python -m ui.main_window --ecu S85          # pre-select Simos8.5
+    python -m ui.main_window --ecu SC8          # pre-select Simos18.1/6
+
+Architecture:
+    MainWindow holds shared state:
+        self.ecu          — currently selected ECUDef
+        self.interface    — interface string ("BLE", "USBISOTP", "J2534", ...)
+        self.iface_path   — interface path (COM port, DLL path, or "")
+        self.connected    — bool
+        self.ble_bridge   — BLEBridgeSync instance (if BLE connected)
+
+    Each tab receives a reference to the MainWindow and calls
+    self.mw.get_connection() to get a fresh udsoncan connection.
+    All backend calls run in daemon threads; UI updates use self.after().
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from typing import Optional, Dict, Any
+from tkinter import filedialog, messagebox, ttk
+from typing import Callable, Dict, List, Optional, Tuple
 
-from core.ecu_defs import (
-    ECUDef, SIMOS85,
-    SIMOS12, SIMOS122, SIMOS181, SIMOS1810,
-)
-from ui.interface_panel import InterfacePanel, COLORS
+# ── Suite imports (relative) ──────────────────────────────────────────────────
+try:
+    from core.ecu_defs import (
+        ECUDef, SIMOS85, SIMOS12, SIMOS12_2, SIMOS18, SIMOS18_10,
+        BlockDef, CryptoType,
+    )
+    from flasher.uds_flash import (
+        flash_cal, read_ecu_info, FlashProgress, _make_connection,
+    )
+    from tuner.cal_parser import CalParser
+    from transport.interfaces import InterfaceRegistry
+    from ui.interface_panel import InterfacePanel
+except ImportError as e:
+    print(f"[WARN] Import error (run from repo root): {e}")
+    ECUDef = SIMOS85 = SIMOS12 = SIMOS12_2 = SIMOS18 = SIMOS18_10 = None
+    InterfacePanel = None
 
 log = logging.getLogger("SimosSuite.GUI")
 
-# ── All ECU targets available in the selector ─────────────────────────────────
-ECU_REGISTRY: Dict[str, ECUDef] = {
-    "Simos8.5  — 3.0T TFSI (C7 A6/A7)":  SIMOS85,
-    "Simos12   — 2.0T EA888 Gen1/2":       SIMOS12,
-    "Simos12.2 — 2.0T EA888 Gen3":         SIMOS122,
-    "Simos18.1 — 2.0T EA888 Gen3b MQB":   SIMOS181,
-    "Simos18.10 — 2.0T MQB Evo (Golf 8)": SIMOS1810,
+# ── Palette ───────────────────────────────────────────────────────────────────
+C = {
+    "bg":         "#0d1117",
+    "surface":    "#161b22",
+    "border":     "#30363d",
+    "text":       "#e6edf3",
+    "muted":      "#8b949e",
+    "dim":        "#484f58",
+    "green":      "#3fb950",
+    "amber":      "#d29922",
+    "red":        "#f85149",
+    "blue":       "#58a6ff",
+    "blue_dim":   "#0d2748",
+    "btn":        "#21262d",
+    "btn_h":      "#30363d",
+    "sel":        "#0d2748",
+    "sel_border": "#58a6ff",
+    "progress":   "#238636",
 }
 
-C = COLORS   # shorthand
+ECU_MAP: Dict[str, object] = {}
 
-# ── Helper: themed label ──────────────────────────────────────────────────────
 
-def lbl(parent, text, fg=None, font=None, **kw):
-    return tk.Label(parent, text=text,
-                    fg=fg or C["text"], bg=kw.pop("bg", C["bg"]),
-                    font=font or ("Menlo", 10), **kw)
+def _ecus():
+    """Return ECU map, handling import failures gracefully."""
+    if SIMOS85:
+        return {
+            "Simos8.5  (3.0T TFSI C7 A6/A7)":  SIMOS85,
+            "Simos12   (2.0T EA888 Gen1/2)":    SIMOS12,
+            "Simos12.2 (2.0T EA888 Gen3)":       SIMOS12_2,
+            "Simos18.1/6 (MQB SC8)":            SIMOS18,
+            "Simos18.10 (MQB Evo SCG)":         SIMOS18_10,
+        }
+    return {"Simos8.5 (demo)": None}
 
-def sep(parent):
-    return tk.Frame(parent, bg=C["border"], height=1)
 
-def btn(parent, text, command, primary=False, **kw):
-    b = tk.Button(
-        parent, text=text, command=command,
-        fg="#0d1117" if primary else C["text"],
-        bg=C["blue"] if primary else C["btn"],
-        activeforeground="#0d1117" if primary else C["text"],
-        activebackground="#79b8ff" if primary else C["btn_hover"],
-        font=("Menlo", 10, "bold" if primary else "normal"),
-        bd=0, padx=12, pady=5, cursor="hand2",
-        highlightbackground=C["border"], highlightthickness=1,
-        **kw,
-    )
+# ── Shared style helpers ───────────────────────────────────────────────────────
+
+def _label(parent, text, size=11, color=None, **kw):
+    return tk.Label(parent, text=text, fg=color or C["muted"],
+                    bg=parent["bg"], font=("Menlo", size), **kw)
+
+
+def _btn(parent, text, cmd, primary=False, **kw):
+    fg = "#0d1117" if primary else C["text"]
+    bg = C["blue"] if primary else C["btn"]
+    abg = "#79b8ff" if primary else C["btn_h"]
+    b = tk.Button(parent, text=text, command=cmd,
+                  fg=fg, bg=bg, activeforeground=fg, activebackground=abg,
+                  font=("Menlo", 11), bd=0, padx=12, pady=5, cursor="hand2",
+                  highlightbackground=C["border"], highlightthickness=1, **kw)
     return b
 
-def card(parent, **kw):
+
+def _frame(parent, bg=None, **kw):
+    return tk.Frame(parent, bg=bg or C["bg"], **kw)
+
+
+def _section(parent, title):
+    """Titled section divider."""
+    f = _frame(parent)
+    f.pack(fill="x", padx=14, pady=(10, 2))
+    tk.Label(f, text=title.upper(), fg=C["dim"], bg=C["bg"],
+             font=("Menlo", 9)).pack(side="left")
+    tk.Frame(f, bg=C["border"], height=1).pack(side="left", fill="x",
+                                                expand=True, padx=(8, 0))
+    return f
+
+
+def _card(parent, **kw):
     return tk.Frame(parent, bg=C["surface"],
                     highlightbackground=C["border"],
                     highlightthickness=1, **kw)
 
-def section_label(parent, text):
-    tk.Label(parent, text=text.upper(),
-             fg=C["text_dim"], bg=C["bg"],
-             font=("Menlo", 9)).pack(anchor="w", pady=(10, 4))
+
+def _scrolled_text(parent, height=8, **kw):
+    f = _frame(parent)
+    sb = tk.Scrollbar(f, bg=C["surface"])
+    sb.pack(side="right", fill="y")
+    t = tk.Text(f, height=height, bg=C["bg"], fg=C["text"],
+                insertbackground=C["text"], font=("Menlo", 10),
+                bd=0, highlightthickness=0, yscrollcommand=sb.set,
+                state="disabled", **kw)
+    t.pack(side="left", fill="both", expand=True)
+    sb.config(command=t.yview)
+    return f, t
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Individual tab panels
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Tab base ───────────────────────────────────────────────────────────────────
 
-class EcuInfoTab(tk.Frame):
-    """Reads all standard VW DIDs and displays them in a table."""
-
-    DID_LABELS = {
-        0xF190: "VIN",
-        0xF18C: "ECU Serial",
-        0xF187: "Part Number",
-        0xF189: "SW Version",
-        0xF191: "HW Number",
-        0xF1A3: "HW Version",
-        0xF197: "System Name",
-        0xF1AD: "Engine Code",
-        0xF17C: "FAZIT",
-        0xF19E: "ASAM File ID",
-        0xF1A2: "ASAM File Version",
-        0x0405: "Flash State",
-        0x0407: "Program Attempts",
-        0x0408: "Successful Programs",
-        0xF186: "Active Session",
-        0xF442: "Module Voltage",
-        0x295A: "Vehicle Mileage",
-        0x295B: "Module Mileage",
-    }
-
-    def __init__(self, parent, app: "MainWindow"):
+class _Tab(tk.Frame):
+    def __init__(self, parent, mw: "MainWindow"):
         super().__init__(parent, bg=C["bg"])
-        self._app = app
-        self._rows: Dict[str, tk.StringVar] = {}
-        self._build()
+        self.mw = mw
 
-    def _build(self):
-        top = tk.Frame(self, bg=C["bg"])
-        top.pack(fill="x", padx=16, pady=12)
+    def on_connect(self):
+        """Called by MainWindow when interface connects."""
+        pass
 
-        section_label(top, "ECU identification")
+    def on_disconnect(self):
+        """Called by MainWindow when interface disconnects."""
+        pass
 
-        action_row = tk.Frame(top, bg=C["bg"])
-        action_row.pack(fill="x", pady=(0, 8))
-        btn(action_row, "read ECU info", self._do_read, primary=True).pack(side="left")
-        self._status_var = tk.StringVar(value="connect an interface first")
-        tk.Label(action_row, textvariable=self._status_var,
-                 fg=C["text_muted"], bg=C["bg"], font=("Menlo", 9)).pack(
-                 side="left", padx=12)
+    def _run(self, fn: Callable, *args, **kwargs):
+        """Run fn in a daemon thread."""
+        threading.Thread(target=fn, args=args, kwargs=kwargs,
+                         daemon=True).start()
 
-        # DID table
-        tbl_frame = card(top, padx=0, pady=0)
-        tbl_frame.pack(fill="x")
+    def _ui(self, fn: Callable, *args):
+        """Schedule fn on the UI thread."""
+        self.after(0, fn, *args)
 
-        for i, (did, label) in enumerate(self.DID_LABELS.items()):
-            row_bg = C["surface"] if i % 2 == 0 else C["bg"]
-            row = tk.Frame(tbl_frame, bg=row_bg)
-            row.pack(fill="x")
-            tk.Label(row, text=f"0x{did:04X}  {label}",
-                     fg=C["text_muted"], bg=row_bg,
-                     font=("Menlo", 9), width=30, anchor="w",
-                     padx=10, pady=5).pack(side="left")
-            var = tk.StringVar(value="—")
-            self._rows[label] = var
-            tk.Label(row, textvariable=var,
-                     fg=C["text"], bg=row_bg,
-                     font=("Menlo", 10), anchor="w",
-                     padx=10, pady=5).pack(side="left", fill="x", expand=True)
+    def _append_log(self, widget: tk.Text, text: str,
+                    tag: Optional[str] = None):
+        widget.config(state="normal")
+        widget.insert("end", text, tag or "")
+        widget.see("end")
+        widget.config(state="disabled")
+
+    def _clear_log(self, widget: tk.Text):
+        widget.config(state="normal")
+        widget.delete("1.0", "end")
+        widget.config(state="disabled")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 1 — Connect
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ConnectTab(_Tab):
+    def __init__(self, parent, mw):
+        super().__init__(parent, mw)
+
+        # ECU selector at top
+        ecu_bar = _frame(self)
+        ecu_bar.pack(fill="x", padx=14, pady=(12, 0))
+        tk.Label(ecu_bar, text="ECU  ", fg=C["muted"], bg=C["bg"],
+                 font=("Menlo", 11)).pack(side="left")
+        self._ecu_var = tk.StringVar()
+        self._ecu_map = _ecus()
+        names = list(self._ecu_map.keys())
+        self._ecu_var.set(names[0])
+        om = ttk.Combobox(ecu_bar, textvariable=self._ecu_var,
+                          values=names, state="readonly",
+                          font=("Menlo", 11), width=38)
+        om.pack(side="left")
+        om.bind("<<ComboboxSelected>>", self._on_ecu_change)
+        self._on_ecu_change()
+
+        # Interface panel fills the rest
+        if InterfacePanel:
+            self._panel = InterfacePanel(
+                self,
+                on_connect=self._on_connected,
+                on_disconnect=self._on_disconnected,
+                ecu=mw.ecu,
+            )
+            self._panel.pack(fill="both", expand=True, padx=0, pady=(6, 0))
+        else:
+            tk.Label(self, text="[InterfacePanel not available — check imports]",
+                     fg=C["amber"], bg=C["bg"],
+                     font=("Menlo", 10)).pack(pady=20)
+
+    def _on_ecu_change(self, *_):
+        name = self._ecu_var.get()
+        self.mw.ecu = self._ecu_map.get(name)
+        self.mw._update_ecu_label(name)
+
+    def _on_connected(self, interface: str, path: str):
+        self.mw.interface   = interface
+        self.mw.iface_path  = path
+        self.mw.connected   = True
+        self.mw._on_connected(interface, path)
+
+    def _on_disconnected(self):
+        self.mw.connected  = False
+        self.mw.interface  = None
+        self.mw.iface_path = None
+        self.mw._on_disconnected()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 2 — ECU Info
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EcuInfoTab(_Tab):
+    def __init__(self, parent, mw):
+        super().__init__(parent, mw)
+        self._rows: Dict[str, tk.Label] = {}
+
+        _section(self, "identification DIDs")
+
+        # DID table card
+        card = _card(self, padx=14, pady=10)
+        card.pack(fill="x", padx=14, pady=4)
+
+        dids = [
+            "VIN", "ECU Serial", "Part Number", "SW Version",
+            "HW Number", "HW Version", "System Name", "Engine Code",
+            "FAZIT", "ASAM File ID", "ASAM File Version",
+            "Flash State", "Program Attempts", "Successful Programs",
+            "Active Session", "Module Voltage", "Vehicle Mileage",
+            "Module Mileage",
+        ]
+        for i, name in enumerate(dids):
+            row = _frame(card, bg=C["surface"])
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=f"{name:<22}", fg=C["muted"],
+                     bg=C["surface"], font=("Menlo", 10),
+                     anchor="w").pack(side="left")
+            val = tk.Label(row, text="—", fg=C["text"],
+                           bg=C["surface"], font=("Menlo", 10),
+                           anchor="w")
+            val.pack(side="left", fill="x", expand=True)
+            self._rows[name] = val
+
+        # Bottom bar
+        bot = _frame(self)
+        bot.pack(fill="x", padx=14, pady=8)
+        self._read_btn = _btn(bot, "read ECU info", self._do_read,
+                              primary=True, state="disabled")
+        self._read_btn.pack(side="left")
+        self._status = tk.Label(bot, text="not connected",
+                                fg=C["dim"], bg=C["bg"],
+                                font=("Menlo", 10))
+        self._status.pack(side="left", padx=12)
+
+    def on_connect(self):
+        self._read_btn.config(state="normal")
+        self._status.config(text="connected — press read", fg=C["green"])
+
+    def on_disconnect(self):
+        self._read_btn.config(state="disabled")
+        self._status.config(text="not connected", fg=C["dim"])
+        for v in self._rows.values():
+            v.config(text="—", fg=C["text"])
 
     def _do_read(self):
-        if not self._app.connected:
-            messagebox.showwarning("Not connected",
-                                   "Connect a hardware interface first.")
+        if not self.mw.connected:
             return
-        self._status_var.set("reading...")
-        for var in self._rows.values():
-            var.set("…")
+        self._read_btn.config(state="disabled")
+        self._status.config(text="reading...", fg=C["amber"])
+        self._run(self._read_task)
 
-        def _task():
-            try:
-                from flasher.uds_flash import read_ecu_info
-                result = read_ecu_info(
-                    self._app.ecu,
-                    self._app.interface,
-                    self._app.iface_path or None,
-                )
-                self.after(0, lambda r=result: self._populate(r))
-            except Exception as e:
-                self.after(0, lambda: self._status_var.set(f"error: {e}"))
+    def _read_task(self):
+        try:
+            info = read_ecu_info(
+                self.mw.ecu,
+                interface=self.mw.interface,
+                interface_path=self.mw.iface_path,
+            )
+            self._ui(self._show_info, info)
+        except Exception as e:
+            self._ui(self._show_error, str(e))
 
-        threading.Thread(target=_task, daemon=True).start()
+    def _show_info(self, info: Dict[str, str]):
+        for name, val in info.items():
+            if name in self._rows:
+                err = val.startswith("<") and val.endswith(">")
+                self._rows[name].config(
+                    text=val,
+                    fg=C["red"] if err else C["green"])
+        self._read_btn.config(state="normal")
+        self._status.config(text="read complete", fg=C["green"])
 
-    def _populate(self, result: Dict[str, str]):
-        for label, var in self._rows.items():
-            val = result.get(label, "—")
-            var.set(val)
-        self._status_var.set(f"read OK — {len(result)} DIDs")
+    def _show_error(self, msg: str):
+        self._read_btn.config(state="normal")
+        self._status.config(text=f"error: {msg[:60]}", fg=C["red"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TAB 3 — Flash
+# ─────────────────────────────────────────────────────────────────────────────
 
-class FlashTab(tk.Frame):
-    """Read / write CAL block with progress bar and checksum auto-fix."""
+class FlashTab(_Tab):
+    def __init__(self, parent, mw):
+        super().__init__(parent, mw)
+        self._cal_bytes: Optional[bytes] = None
+        self._cal_path = tk.StringVar(value="no file loaded")
 
-    STEPS = ["CONNECT", "ERASE", "TRANSFER", "VERIFY", "DONE", "ERROR"]
+        _section(self, "CAL block")
 
-    def __init__(self, parent, app: "MainWindow"):
-        super().__init__(parent, bg=C["bg"])
-        self._app = app
-        self._cal_path: Optional[str] = None
-        self._build()
+        # File row
+        file_card = _card(self, padx=12, pady=10)
+        file_card.pack(fill="x", padx=14, pady=4)
+        fr = _frame(file_card, bg=C["surface"])
+        fr.pack(fill="x")
+        _btn(fr, "open .bin", self._open_file).pack(side="left")
+        tk.Label(fr, textvariable=self._cal_path,
+                 fg=C["muted"], bg=C["surface"],
+                 font=("Menlo", 10)).pack(side="left", padx=10)
 
-    def _build(self):
-        body = tk.Frame(self, bg=C["bg"], padx=16, pady=12)
-        body.pack(fill="both", expand=True)
+        self._file_info = tk.Label(file_card, text="",
+                                   fg=C["muted"], bg=C["surface"],
+                                   font=("Menlo", 10), anchor="w")
+        self._file_info.pack(fill="x", pady=(4, 0))
 
-        section_label(body, "CAL block flash")
+        _section(self, "operations")
 
-        # File picker
-        file_row = tk.Frame(body, bg=C["bg"])
-        file_row.pack(fill="x", pady=(0, 8))
+        ops_card = _card(self, padx=12, pady=10)
+        ops_card.pack(fill="x", padx=14, pady=4)
 
-        self._file_var = tk.StringVar(value="no file selected")
-        file_display = card(file_row, padx=10, pady=6)
-        file_display.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        tk.Label(file_display, textvariable=self._file_var,
-                 fg=C["text_muted"], bg=C["surface"],
-                 font=("Menlo", 9), anchor="w").pack(fill="x")
+        op_row = _frame(ops_card, bg=C["surface"])
+        op_row.pack(fill="x", pady=(0, 8))
 
-        btn(file_row, "browse...", self._pick_file).pack(side="left")
+        self._read_btn = _btn(op_row, "read CAL from ECU",
+                              self._do_read_cal, state="disabled")
+        self._read_btn.pack(side="left", padx=(0, 8))
 
-        # Checksum auto-fix toggle
-        self._autofix_var = tk.BooleanVar(value=True)
-        chk = tk.Checkbutton(body, text="auto-fix checksums before flash",
-                              variable=self._autofix_var,
-                              fg=C["text_muted"], bg=C["bg"],
-                              selectcolor=C["btn"],
-                              activeforeground=C["text"],
-                              activebackground=C["bg"],
-                              font=("Menlo", 9))
-        chk.pack(anchor="w", pady=(0, 8))
+        self._write_btn = _btn(op_row, "write CAL to ECU",
+                               self._do_write_cal, primary=True,
+                               state="disabled")
+        self._write_btn.pack(side="left", padx=(0, 8))
+
+        self._verify_btn = _btn(op_row, "verify checksum",
+                                self._do_verify, state="disabled")
+        self._verify_btn.pack(side="left")
 
         # Dry run toggle
-        self._dryrun_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(body, text="dry run (go through the motions, don't write)",
-                       variable=self._dryrun_var,
-                       fg=C["text_muted"], bg=C["bg"],
-                       selectcolor=C["btn"],
+        self._dry_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(ops_card, text="dry run (no write)",
+                       variable=self._dry_var,
+                       fg=C["muted"], bg=C["surface"],
+                       selectcolor=C["bg"],
+                       activebackground=C["surface"],
                        activeforeground=C["text"],
-                       activebackground=C["bg"],
-                       font=("Menlo", 9)).pack(anchor="w", pady=(0, 12))
+                       font=("Menlo", 10)).pack(anchor="w")
 
-        # Action buttons
-        action_row = tk.Frame(body, bg=C["bg"])
-        action_row.pack(fill="x", pady=(0, 12))
-        btn(action_row, "flash CAL", self._do_flash, primary=True).pack(side="left", padx=(0, 8))
-        btn(action_row, "verify only", self._do_verify).pack(side="left", padx=(0, 8))
-        self._abort_btn = btn(action_row, "abort", self._do_abort)
-        self._abort_btn.pack(side="left")
-        self._abort_btn.config(state="disabled")
+        _section(self, "progress")
 
-        sep(body).pack(fill="x", pady=8)
+        prog_card = _card(self, padx=12, pady=10)
+        prog_card.pack(fill="x", padx=14, pady=4)
 
-        # Progress
-        section_label(body, "progress")
+        self._prog_label = tk.Label(prog_card, text="idle",
+                                    fg=C["muted"], bg=C["surface"],
+                                    font=("Menlo", 10), anchor="w")
+        self._prog_label.pack(fill="x")
 
-        # Step indicators
-        step_row = tk.Frame(body, bg=C["bg"])
-        step_row.pack(fill="x", pady=(0, 8))
-        self._step_vars: Dict[str, tk.StringVar] = {}
-        for step in ["CONNECT", "ERASE", "TRANSFER", "VERIFY"]:
-            col = tk.Frame(step_row, bg=C["bg"])
-            col.pack(side="left", expand=True)
-            dot_var = tk.StringVar(value="○")
-            tk.Label(col, textvariable=dot_var,
-                     fg=C["text_dim"], bg=C["bg"],
-                     font=("Menlo", 14)).pack()
-            tk.Label(col, text=step.lower(),
-                     fg=C["text_dim"], bg=C["bg"],
-                     font=("Menlo", 8)).pack()
-            self._step_vars[step] = dot_var
-
-        # Progress bar
-        self._progress_var = tk.IntVar(value=0)
-        self._pbar = ttk.Progressbar(body, variable=self._progress_var,
-                                      maximum=100, length=400)
-        self._pbar.pack(fill="x", pady=(0, 6))
-
-        self._progress_msg = tk.StringVar(value="idle")
-        tk.Label(body, textvariable=self._progress_msg,
-                 fg=C["text_muted"], bg=C["bg"],
-                 font=("Menlo", 9), anchor="w").pack(fill="x")
-
-        sep(body).pack(fill="x", pady=8)
+        self._prog_bar_frame = tk.Frame(prog_card, bg=C["border"],
+                                        height=6)
+        self._prog_bar_frame.pack(fill="x", pady=(6, 0))
+        self._prog_bar = tk.Frame(self._prog_bar_frame,
+                                  bg=C["progress"], height=6, width=0)
+        self._prog_bar.place(x=0, y=0, relheight=1.0)
 
         # Log
-        section_label(body, "log")
-        self._log_text = tk.Text(body, bg=C["surface"],
-                                  fg=C["text_muted"], font=("Menlo", 9),
-                                  height=8, bd=0,
-                                  highlightbackground=C["border"],
-                                  highlightthickness=1,
-                                  state="disabled")
-        self._log_text.pack(fill="both", expand=True)
+        _section(self, "log")
+        log_outer, self._log = _scrolled_text(self, height=6)
+        log_outer.pack(fill="both", expand=True, padx=14, pady=4)
+        self._log.tag_config("ok",  foreground=C["green"])
+        self._log.tag_config("err", foreground=C["red"])
+        self._log.tag_config("dim", foreground=C["muted"])
 
-    def _pick_file(self):
+    def on_connect(self):
+        self._read_btn.config(state="normal")
+        if self._cal_bytes:
+            self._write_btn.config(state="normal")
+            self._verify_btn.config(state="normal")
+
+    def on_disconnect(self):
+        for b in (self._read_btn, self._write_btn, self._verify_btn):
+            b.config(state="disabled")
+
+    def _open_file(self):
         path = filedialog.askopenfilename(
-            title="Select CAL .bin file",
-            filetypes=[("Binary files", "*.bin"), ("All files", "*.*")],
-        )
-        if path:
-            self._cal_path = path
-            self._file_var.set(os.path.basename(path))
-
-    def _log(self, msg: str):
-        self._log_text.config(state="normal")
-        self._log_text.insert("end", msg + "\n")
-        self._log_text.see("end")
-        self._log_text.config(state="disabled")
-
-    def _reset_steps(self):
-        for var in self._step_vars.values():
-            var.set("○")
-
-    def _set_step(self, step: str, state: str):
-        """state: 'active' | 'done' | 'error'"""
-        icons = {"active": "◉", "done": "●", "error": "✗"}
-        colors = {"active": C["amber"], "done": C["green"], "error": C["red"]}
-        var = self._step_vars.get(step)
-        if var:
-            var.set(icons.get(state, "○"))
-
-    def _on_progress(self, p):
-        """Called from flash thread — schedule UI update on main thread."""
-        self.after(0, lambda: self._apply_progress(p))
-
-    def _apply_progress(self, p):
-        from flasher.uds_flash import FlashProgress
-        self._progress_var.set(p.pct)
-        self._progress_msg.set(p.message)
-        self._log(f"[{p.step}] {p.message}")
-        if p.step in self._step_vars:
-            if p.step == "ERROR":
-                for s in ["CONNECT", "ERASE", "TRANSFER", "VERIFY"]:
-                    if self._step_vars[s].get() == "◉":
-                        self._set_step(s, "error")
-            else:
-                # Mark previous steps done
-                order = ["CONNECT", "ERASE", "TRANSFER", "VERIFY"]
-                idx = order.index(p.step) if p.step in order else -1
-                for i, s in enumerate(order):
-                    if i < idx:
-                        self._set_step(s, "done")
-                    elif i == idx:
-                        self._set_step(s, "active")
-        if p.step == "DONE":
-            for s in ["CONNECT", "ERASE", "TRANSFER", "VERIFY"]:
-                self._set_step(s, "done")
-            self._abort_btn.config(state="disabled")
-        elif p.step == "ERROR":
-            self._abort_btn.config(state="disabled")
-
-    def _do_flash(self):
-        if not self._app.connected:
-            messagebox.showwarning("Not connected",
-                                   "Connect a hardware interface first.")
-            return
-        if not self._cal_path:
-            messagebox.showwarning("No file", "Select a CAL .bin file first.")
-            return
-
-        self._reset_steps()
-        self._progress_var.set(0)
-        self._log_text.config(state="normal")
-        self._log_text.delete("1.0", "end")
-        self._log_text.config(state="disabled")
-        self._abort_btn.config(state="normal")
-
-        cal_bytes = open(self._cal_path, "rb").read()
-
-        if self._autofix_var.get():
-            try:
-                from tuner.cal_parser import CalParser
-                parser = CalParser(self._app.ecu, cal_bytes)
-                parser.decode()
-                parser.fix_checksums()
-                cal_bytes = parser.to_bytes()
-                self._log("[CHECKSUM] auto-fix applied")
-            except Exception as e:
-                self._log(f"[CHECKSUM] warning: {e}")
-
-        def _task(cb=cal_bytes):
-            try:
-                from flasher.uds_flash import flash_cal
-                flash_cal(
-                    ecu            = self._app.ecu,
-                    cal_bytes      = cb,
-                    interface      = self._app.interface,
-                    interface_path = self._app.iface_path or None,
-                    callback       = self._on_progress,
-                    dry_run        = self._dryrun_var.get(),
-                )
-            except Exception as e:
-                self.after(0, lambda: self._log(f"[ERROR] {e}"))
-
-        threading.Thread(target=_task, daemon=True).start()
-
-    def _do_verify(self):
-        if not self._app.connected:
-            messagebox.showwarning("Not connected",
-                                   "Connect a hardware interface first.")
-            return
-        self._log("[VERIFY] verify-only mode — connecting...")
-
-        def _task():
-            try:
-                from flasher.uds_flash import flash_cal
-                flash_cal(
-                    ecu            = self._app.ecu,
-                    cal_bytes      = b"",   # not used in verify_only
-                    interface      = self._app.interface,
-                    interface_path = self._app.iface_path or None,
-                    callback       = self._on_progress,
-                    verify_only    = True,
-                )
-            except Exception as e:
-                self.after(0, lambda: self._log(f"[ERROR] {e}"))
-
-        threading.Thread(target=_task, daemon=True).start()
-
-    def _do_abort(self):
-        self._log("[ABORT] abort requested — will stop after current transfer block")
-        self._abort_btn.config(state="disabled")
-        # TODO: wire abort signal into flash_cal via threading.Event
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TuneTab(tk.Frame):
-    """Calibration table editor — select table, edit cells, write back."""
-
-    def __init__(self, parent, app: "MainWindow"):
-        super().__init__(parent, bg=C["bg"])
-        self._app = app
-        self._parser = None
-        self._current_table: Optional[str] = None
-        self._build()
-
-    def _build(self):
-        body = tk.Frame(self, bg=C["bg"], padx=16, pady=12)
-        body.pack(fill="both", expand=True)
-
-        section_label(body, "calibration tables")
-
-        # Top controls
-        ctrl = tk.Frame(body, bg=C["bg"])
-        ctrl.pack(fill="x", pady=(0, 10))
-
-        btn(ctrl, "load .bin", self._load_bin).pack(side="left", padx=(0, 8))
-
-        self._table_var = tk.StringVar()
-        self._table_menu = ttk.Combobox(ctrl, textvariable=self._table_var,
-                                         state="readonly", width=40,
-                                         font=("Menlo", 10))
-        self._table_menu.pack(side="left", padx=(0, 8))
-        self._table_menu.bind("<<ComboboxSelected>>", lambda e: self._load_table())
-
-        btn(ctrl, "save .bin", self._save_bin).pack(side="left", padx=(0, 8))
-        btn(ctrl, "fix checksums", self._fix_checksums).pack(side="left")
-
-        sep(body).pack(fill="x", pady=6)
-
-        # Meta row
-        self._meta_var = tk.StringVar(value="load a .bin file to begin")
-        tk.Label(body, textvariable=self._meta_var,
-                 fg=C["text_muted"], bg=C["bg"],
-                 font=("Menlo", 9), anchor="w").pack(fill="x", pady=(0, 6))
-
-        # Table editor (grid of Entry widgets)
-        self._grid_frame = card(body)
-        self._grid_frame.pack(fill="both", expand=True)
-
-        self._status_var = tk.StringVar(value="idle")
-        tk.Label(body, textvariable=self._status_var,
-                 fg=C["text_muted"], bg=C["bg"],
-                 font=("Menlo", 9), anchor="w").pack(fill="x", pady=(6, 0))
-
-    def _load_bin(self):
-        path = filedialog.askopenfilename(
-            title="Select CAL .bin file",
+            title="Open CAL .bin",
             filetypes=[("Binary files", "*.bin"), ("All files", "*.*")],
         )
         if not path:
             return
         try:
-            from tuner.cal_parser import CalParser
-            cal_bytes = open(path, "rb").read()
-            self._parser = CalParser(self._app.ecu, cal_bytes)
-            self._parser.decode()
-            tables = list(self._parser.tables.keys())
-            self._table_menu["values"] = tables
-            if tables:
-                self._table_var.set(tables[0])
-                self._load_table()
-            self._status_var.set(f"loaded {os.path.basename(path)} — {len(tables)} tables")
+            with open(path, "rb") as f:
+                self._cal_bytes = f.read()
+            fname = os.path.basename(path)
+            self._cal_path.set(fname)
+            sz = len(self._cal_bytes)
+            self._file_info.config(
+                text=f"{sz:,} bytes  ({sz/1024:.1f} KB)",
+                fg=C["green"])
+            if self.mw.connected:
+                self._write_btn.config(state="normal")
+                self._verify_btn.config(state="normal")
+            self._log_line(f"loaded {fname}  ({sz:,} bytes)\n", "ok")
         except Exception as e:
-            messagebox.showerror("Load error", str(e))
+            messagebox.showerror("File error", str(e))
 
-    def _load_table(self):
-        if not self._parser:
+    def _do_read_cal(self):
+        self._log_line("read CAL: not yet implemented in backend\n", "dim")
+
+    def _do_write_cal(self):
+        if not self._cal_bytes:
+            messagebox.showwarning("No file", "Load a CAL .bin first.")
             return
-        name = self._table_var.get()
-        if not name:
+        if not messagebox.askyesno(
+                "Confirm flash",
+                f"Write CAL to {self.mw.ecu.name if self.mw.ecu else 'ECU'}?\n\n"
+                "This will erase and reprogram the calibration block.\n"
+                "Ensure the vehicle is on a battery charger."):
             return
-        self._current_table = name
+        self._set_buttons(False)
+        self._run(self._write_task)
+
+    def _write_task(self):
+        def cb(p: "FlashProgress"):
+            self._ui(self._update_progress, p)
 
         try:
-            arr = self._parser.table(name)
-            meta = self._parser.table_meta(name)
+            ok = flash_cal(
+                ecu           = self.mw.ecu,
+                cal_bytes     = self._cal_bytes,
+                interface     = self.mw.interface,
+                interface_path= self.mw.iface_path,
+                callback      = cb,
+                dry_run       = self._dry_var.get(),
+            )
+            self._ui(self._flash_done, ok)
         except Exception as e:
-            self._status_var.set(f"error: {e}")
-            return
+            self._ui(self._flash_error, str(e))
 
-        # Clear grid
-        for w in self._grid_frame.winfo_children():
-            w.destroy()
+    def _do_verify(self):
+        self._set_buttons(False)
+        self._run(self._verify_task)
 
-        self._meta_var.set(
-            f"{meta.name}  |  {meta.rows}×{meta.cols}  |  "
-            f"scale×{meta.scale}  |  unit: {meta.unit}"
+    def _verify_task(self):
+        def cb(p: "FlashProgress"):
+            self._ui(self._update_progress, p)
+        try:
+            ok = flash_cal(
+                ecu           = self.mw.ecu,
+                cal_bytes     = self._cal_bytes or b"",
+                interface     = self.mw.interface,
+                interface_path= self.mw.iface_path,
+                callback      = cb,
+                verify_only   = True,
+            )
+            self._ui(self._flash_done, ok)
+        except Exception as e:
+            self._ui(self._flash_error, str(e))
+
+    def _update_progress(self, p: "FlashProgress"):
+        color = {"DONE": C["green"], "ERROR": C["red"],
+                 "CONNECT": C["blue"]}.get(p.step, C["amber"])
+        self._prog_label.config(
+            text=f"[{p.step}] {p.message}", fg=color)
+        # Resize bar
+        total = self._prog_bar_frame.winfo_width()
+        w = max(0, int(total * p.pct / 100))
+        self._prog_bar.config(width=w)
+        self._log_line(f"[{p.step}] {p.message}\n",
+                       "ok" if p.step == "DONE" else
+                       "err" if p.step == "ERROR" else "dim")
+
+    def _flash_done(self, ok: bool):
+        self._set_buttons(True)
+        if ok:
+            self._prog_label.config(text="done", fg=C["green"])
+        else:
+            self._prog_label.config(text="failed", fg=C["red"])
+
+    def _flash_error(self, msg: str):
+        self._set_buttons(True)
+        self._log_line(f"exception: {msg}\n", "err")
+        self._prog_label.config(text=f"error: {msg[:50]}", fg=C["red"])
+
+    def _set_buttons(self, enabled: bool):
+        s = "normal" if enabled else "disabled"
+        if self.mw.connected:
+            self._read_btn.config(state=s)
+        if self._cal_bytes and self.mw.connected:
+            self._write_btn.config(state=s)
+            self._verify_btn.config(state=s)
+
+    def _log_line(self, text: str, tag: str = ""):
+        self._append_log(self._log, text, tag)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 4 — Tune
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TuneTab(_Tab):
+    def __init__(self, parent, mw):
+        super().__init__(parent, mw)
+        self._parser: Optional["CalParser"] = None
+        self._table_name = tk.StringVar()
+
+        _section(self, "calibration file")
+
+        file_row = _frame(self)
+        file_row.pack(fill="x", padx=14, pady=4)
+        _btn(file_row, "open CAL .bin", self._open_cal).pack(side="left")
+        self._file_lbl = tk.Label(file_row, text="no file loaded",
+                                  fg=C["muted"], bg=C["bg"],
+                                  font=("Menlo", 10))
+        self._file_lbl.pack(side="left", padx=10)
+
+        _section(self, "table selector")
+
+        sel_row = _frame(self)
+        sel_row.pack(fill="x", padx=14, pady=4)
+        self._table_combo = ttk.Combobox(sel_row, textvariable=self._table_name,
+                                          state="disabled", font=("Menlo", 11),
+                                          width=42)
+        self._table_combo.pack(side="left")
+        self._table_combo.bind("<<ComboboxSelected>>", self._show_table)
+        _btn(sel_row, "fix checksums + save",
+             self._save_cal, state="disabled").pack(side="right")
+        self._save_btn = sel_row.winfo_children()[-1]
+
+        _section(self, "table editor")
+
+        # Grid canvas in a scrollable frame
+        canvas_frame = _frame(self)
+        canvas_frame.pack(fill="both", expand=True, padx=14, pady=4)
+
+        self._canvas = tk.Canvas(canvas_frame, bg=C["bg"],
+                                 highlightthickness=0)
+        sx = ttk.Scrollbar(canvas_frame, orient="horizontal",
+                            command=self._canvas.xview)
+        sy = ttk.Scrollbar(canvas_frame, orient="vertical",
+                            command=self._canvas.yview)
+        self._canvas.config(xscrollcommand=sx.set, yscrollcommand=sy.set)
+        sy.pack(side="right", fill="y")
+        sx.pack(side="bottom", fill="x")
+        self._canvas.pack(fill="both", expand=True)
+
+        self._info_lbl = tk.Label(self, text="open a CAL .bin to begin",
+                                  fg=C["dim"], bg=C["bg"],
+                                  font=("Menlo", 10))
+        self._info_lbl.pack(pady=8)
+
+    def _open_cal(self):
+        path = filedialog.askopenfilename(
+            title="Open CAL .bin",
+            filetypes=[("Binary files", "*.bin"), ("All files", "*.*")],
         )
+        if not path:
+            return
+        try:
+            raw = open(path, "rb").read()
+            self._parser = CalParser(self.mw.ecu or SIMOS85, raw)
+            self._parser.decode()
+            names = [f"{t.name}  —  {meta.name}"
+                     for t, meta in self._parser.tables_decoded().items()] \
+                    if hasattr(self._parser, "tables_decoded") else \
+                    list(self._parser._decoded.keys()) \
+                    if hasattr(self._parser, "_decoded") else \
+                    ["maf_transfer", "lambda_setpoint", "inj_scaling",
+                     "boost_setpoint", "ign_advance", "timing_correction"]
 
-        # Header row (col axis labels — just indices for now)
-        cols = arr.shape[1] if arr.ndim == 2 else len(arr)
-        rows = arr.shape[0] if arr.ndim == 2 else 1
+            self._table_combo.config(values=names, state="readonly")
+            self._table_combo.current(0)
+            self._file_lbl.config(
+                text=os.path.basename(path), fg=C["green"])
+            self._save_btn.config(state="normal")
+            self._show_table()
+        except Exception as e:
+            messagebox.showerror("Parse error", str(e))
 
-        header = tk.Frame(self._grid_frame, bg=C["surface"])
-        header.pack(fill="x")
-        tk.Label(header, text="", bg=C["surface"],
-                 font=("Menlo", 8), width=5).grid(row=0, column=0)
+    def _show_table(self, *_):
+        if not self._parser:
+            return
+        name = self._table_name.get().split("  —  ")[0].strip()
+        try:
+            arr = self._parser.table(name)
+            self._draw_table(name, arr)
+        except Exception as e:
+            self._info_lbl.config(text=str(e), fg=C["red"])
+
+    def _draw_table(self, name: str, arr):
+        """Render a numpy 2D (or 1D) array as an editable grid on the canvas."""
+        import numpy as np
+        self._canvas.delete("all")
+        self._entry_widgets: Dict[Tuple[int,int], tk.Entry] = {}
+
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+
+        rows, cols = arr.shape
+        CW, RH = 70, 26    # cell width, row height
+
+        # Column headers
         for c in range(cols):
-            tk.Label(header, text=str(c),
-                     fg=C["text_dim"], bg=C["surface"],
-                     font=("Menlo", 8), width=7).grid(row=0, column=c+1)
+            self._canvas.create_text(
+                80 + c * CW + CW//2, 14,
+                text=str(c), fill=C["dim"],
+                font=("Menlo", 9))
 
-        # Data rows
-        self._cell_vars: list[list[tk.StringVar]] = []
-        data_frame = tk.Frame(self._grid_frame, bg=C["surface"])
-        data_frame.pack(fill="both", expand=True)
-
-        flat = arr.flatten() if arr.ndim == 1 else None
+        # Row headers + cells
+        vmin, vmax = float(arr.min()), float(arr.max())
 
         for r in range(rows):
-            row_vars = []
-            tk.Label(data_frame, text=str(r),
-                     fg=C["text_dim"], bg=C["surface"],
-                     font=("Menlo", 8), width=5).grid(row=r, column=0)
+            y = 28 + r * RH
+            self._canvas.create_text(
+                36, y + RH//2, text=str(r),
+                fill=C["dim"], font=("Menlo", 9))
+
             for c in range(cols):
-                val = float(flat[c]) if flat is not None else float(arr[r][c])
-                physical = val * meta.scale + meta.offset_val
-                var = tk.StringVar(value=f"{physical:.3f}")
-                entry = tk.Entry(data_frame, textvariable=var,
-                                  bg=C["btn"], fg=C["text"],
-                                  insertbackground=C["text"],
-                                  font=("Menlo", 9), width=7, bd=0,
-                                  highlightbackground=C["border"],
-                                  highlightthickness=1)
-                entry.grid(row=r, column=c+1, padx=1, pady=1)
-                row_vars.append(var)
-            self._cell_vars.append(row_vars)
+                x = 80 + c * CW
+                val = float(arr[r, c])
+                # Heat-map fill: blue→green→amber→red
+                t = (val - vmin) / (vmax - vmin) if vmax > vmin else 0.5
+                fill = self._heat_color(t)
+                self._canvas.create_rectangle(
+                    x, y, x + CW - 1, y + RH - 1,
+                    fill=fill, outline=C["border"])
+                # Editable entry overlay
+                e = tk.Entry(self._canvas, width=7,
+                             bg=fill, fg=C["text"],
+                             insertbackground=C["text"],
+                             font=("Menlo", 9), bd=0,
+                             highlightthickness=0,
+                             justify="center")
+                e.insert(0, f"{val:.3f}")
+                e.bind("<FocusOut>", lambda ev, rr=r, cc=c: self._cell_edit(ev, rr, cc))
+                e.bind("<Return>",   lambda ev, rr=r, cc=c: self._cell_edit(ev, rr, cc))
+                win = self._canvas.create_window(
+                    x + CW//2, y + RH//2,
+                    window=e, width=CW-2, height=RH-2)
+                self._entry_widgets[(r, c)] = e
 
-        self._status_var.set(f"table: {name}  ({rows}×{cols})")
+        total_w = 80 + cols * CW + 20
+        total_h = 28 + rows * RH + 20
+        self._canvas.config(scrollregion=(0, 0, total_w, total_h))
+        self._info_lbl.config(
+            text=f"{name}   {rows}×{cols}   min={vmin:.3f}  max={vmax:.3f}",
+            fg=C["muted"])
 
-    def _fix_checksums(self):
+    def _cell_edit(self, event, r: int, c: int):
+        e = self._entry_widgets.get((r, c))
+        if not e or not self._parser:
+            return
+        try:
+            new_val = float(e.get())
+            name = self._table_name.get().split("  —  ")[0].strip()
+            self._parser.table(name)[r, c] = new_val
+            # recolor
+            arr = self._parser.table(name)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            vmin, vmax = float(arr.min()), float(arr.max())
+            t = (new_val - vmin) / (vmax - vmin) if vmax > vmin else 0.5
+            fill = self._heat_color(t)
+            e.config(bg=fill)
+        except ValueError:
+            e.config(fg=C["red"])
+
+    def _heat_color(self, t: float) -> str:
+        """Map 0–1 to blue→teal→green→amber (hex)."""
+        t = max(0.0, min(1.0, t))
+        if t < 0.33:
+            r, g, b = 13, 45 + int(t/0.33*100), 120
+        elif t < 0.66:
+            s = (t - 0.33) / 0.33
+            r, g, b = int(s*160), 130 + int(s*50), 60
+        else:
+            s = (t - 0.66) / 0.34
+            r, g, b = 160 + int(s*95), 160 - int(s*60), 10
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _save_cal(self):
         if not self._parser:
-            self._status_var.set("no file loaded")
             return
         try:
             self._parser.fix_checksums()
-            self._status_var.set("checksums fixed")
+            out = self._parser.to_bytes()
+            path = filedialog.asksaveasfilename(
+                title="Save modified CAL .bin",
+                defaultextension=".bin",
+                filetypes=[("Binary files", "*.bin")],
+            )
+            if path:
+                with open(path, "wb") as f:
+                    f.write(out)
+                messagebox.showinfo("Saved",
+                    f"CAL saved ({len(out):,} bytes)\n{os.path.basename(path)}")
         except Exception as e:
-            self._status_var.set(f"error: {e}")
+            messagebox.showerror("Save error", str(e))
 
-    def _save_bin(self):
-        if not self._parser:
-            messagebox.showwarning("No file", "Load a .bin file first.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 5 — Logger
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LoggerTab(_Tab):
+    DIDS = [
+        (0xF190, "VIN"),
+        (0x295A, "Mileage km"),
+        (0x295B, "Module km"),
+        (0xF442, "Battery V"),
+        (0x2000, "RPM"),
+        (0x2001, "Boost kPa"),
+        (0x2002, "MAF g/s"),
+        (0x2003, "IAT °C"),
+        (0x2004, "Lambda"),
+        (0x2005, "Inj pw ms"),
+        (0x2006, "Throttle %"),
+        (0x2007, "Torque Nm"),
+    ]
+
+    def __init__(self, parent, mw):
+        super().__init__(parent, mw)
+        self._running = False
+        self._values: Dict[int, tk.StringVar] = {}
+
+        _section(self, "live channels")
+
+        gauges = _card(self, padx=12, pady=10)
+        gauges.pack(fill="x", padx=14, pady=4)
+
+        # 3-column gauge grid
+        grid = _frame(gauges, bg=C["surface"])
+        grid.pack(fill="x")
+
+        for i, (did, name) in enumerate(self.DIDS):
+            col_frame = _frame(grid, bg=C["surface"])
+            col_frame.grid(row=i // 3, column=i % 3, padx=6, pady=4,
+                           sticky="w")
+            tk.Label(col_frame, text=f"{name:<14}", fg=C["muted"],
+                     bg=C["surface"], font=("Menlo", 9)).pack(side="left")
+            var = tk.StringVar(value="—")
+            self._values[did] = var
+            tk.Label(col_frame, textvariable=var, fg=C["blue"],
+                     bg=C["surface"], font=("Menlo", 10, "bold"),
+                     width=10, anchor="e").pack(side="left")
+
+        _section(self, "poll settings")
+
+        cfg_row = _frame(self)
+        cfg_row.pack(fill="x", padx=14, pady=4)
+        tk.Label(cfg_row, text="interval ms", fg=C["muted"],
+                 bg=C["bg"], font=("Menlo", 10)).pack(side="left")
+        self._interval_var = tk.IntVar(value=200)
+        tk.Spinbox(cfg_row, from_=50, to=5000, increment=50,
+                   textvariable=self._interval_var, width=6,
+                   bg=C["surface"], fg=C["text"],
+                   font=("Menlo", 10), bd=0).pack(side="left", padx=8)
+
+        _section(self, "log output")
+        log_outer, self._log = _scrolled_text(self, height=8)
+        log_outer.pack(fill="both", expand=True, padx=14, pady=4)
+        self._log.tag_config("val", foreground=C["blue"])
+        self._log.tag_config("err", foreground=C["red"])
+        self._log.tag_config("dim", foreground=C["muted"])
+
+        # Controls
+        bot = _frame(self)
+        bot.pack(fill="x", padx=14, pady=6)
+        self._start_btn = _btn(bot, "start logging",
+                               self._toggle_log, primary=True,
+                               state="disabled")
+        self._start_btn.pack(side="left")
+        _btn(bot, "clear log", lambda: self._clear_log(self._log)
+             ).pack(side="left", padx=8)
+        _btn(bot, "save CSV", self._save_csv).pack(side="left")
+
+        self._csv_rows: List[str] = []
+
+    def on_connect(self):
+        self._start_btn.config(state="normal")
+
+    def on_disconnect(self):
+        self._running = False
+        self._start_btn.config(text="start logging", state="disabled",
+                               fg="#0d1117", bg=C["blue"])
+        for v in self._values.values():
+            v.set("—")
+
+    def _toggle_log(self):
+        if self._running:
+            self._running = False
+            self._start_btn.config(text="start logging",
+                                   fg="#0d1117", bg=C["blue"])
+        else:
+            self._running = True
+            self._start_btn.config(text="stop logging",
+                                   fg=C["text"], bg=C["btn"])
+            self._csv_rows = ["timestamp," + ",".join(n for _, n in self.DIDS)]
+            self._run(self._poll_loop)
+
+    def _poll_loop(self):
+        """
+        Poll configured DIDs in a loop.
+        In production this connects via _make_connection() and uses
+        udsoncan client.read_data_by_identifier().
+        Simulated here until live logger module is built.
+        """
+        import random, math
+        t0 = time.time()
+        while self._running and self.mw.connected:
+            t = time.time() - t0
+            row = {}
+            for did, name in self.DIDS:
+                # Simulated values — replace with real UDS reads
+                if "RPM" in name:
+                    v = 800 + 3200 * abs(math.sin(t * 0.3))
+                elif "Boost" in name:
+                    v = 101 + 120 * max(0, math.sin(t * 0.3))
+                elif "MAF" in name:
+                    v = 5 + 80 * max(0, math.sin(t * 0.3))
+                elif "Lambda" in name:
+                    v = 1.0 + 0.05 * math.sin(t * 1.2)
+                elif "Battery" in name:
+                    v = 13.8 + 0.2 * math.sin(t)
+                elif "IAT" in name:
+                    v = 25 + 5 * math.sin(t * 0.1)
+                elif "Throttle" in name:
+                    v = 10 + 70 * max(0, math.sin(t * 0.3))
+                else:
+                    v = random.uniform(0, 100)
+                row[did] = v
+                self._ui(self._values[did].set, f"{v:.2f}")
+
+            ts = time.strftime("%H:%M:%S")
+            vals = ",".join(f"{row[did]:.3f}" for did, _ in self.DIDS)
+            self._csv_rows.append(f"{ts},{vals}")
+            self._ui(self._append_log, self._log,
+                     f"{ts}  " + "  ".join(
+                         f"{n[:6]}={row[d]:.1f}" for d, n in self.DIDS[:6]
+                     ) + "\n", "val")
+
+            interval = self._interval_var.get() / 1000
+            time.sleep(interval)
+
+        self._ui(self._start_btn.config, text="start logging",
+                 fg="#0d1117", bg=C["blue"])
+        self._running = False
+
+    def _save_csv(self):
+        if not self._csv_rows:
+            messagebox.showinfo("Nothing to save", "Start logging first.")
             return
-        # Write edited cell values back to parser
-        if self._current_table and self._cell_vars:
-            try:
-                meta = self._parser.table_meta(self._current_table)
-                arr = self._parser.table(self._current_table)
-                for r, row in enumerate(self._cell_vars):
-                    for c, var in enumerate(row):
-                        physical = float(var.get())
-                        raw = (physical - meta.offset_val) / meta.scale
-                        if arr.ndim == 2:
-                            arr[r][c] = raw
-                        else:
-                            arr[c] = raw
-            except Exception as e:
-                messagebox.showerror("Save error", f"Could not write table: {e}")
-                return
-
         path = filedialog.asksaveasfilename(
-            title="Save modified CAL .bin",
-            defaultextension=".bin",
-            filetypes=[("Binary files", "*.bin")],
+            title="Save log CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
         )
         if path:
+            with open(path, "w") as f:
+                f.write("\n".join(self._csv_rows))
+            messagebox.showinfo("Saved", f"Log saved: {os.path.basename(path)}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 6 — CP Tools
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CPToolsTab(_Tab):
+    def __init__(self, parent, mw):
+        super().__init__(parent, mw)
+
+        _section(self, "J533 probe")
+
+        info = _card(self, padx=12, pady=8)
+        info.pack(fill="x", padx=14, pady=4)
+        tk.Label(info, text=(
+            "Connects to J533 gateway (TX=0x710, RX=0x77A) and reads every accessible DID.\n"
+            "Run alongside an ODIS session in raw sniff mode to capture CP removal sequence."
+        ), fg=C["muted"], bg=C["surface"], font=("Menlo", 10),
+            justify="left", wraplength=580).pack(anchor="w")
+
+        op_row = _frame(self)
+        op_row.pack(fill="x", padx=14, pady=6)
+        self._probe_btn = _btn(op_row, "run full probe",
+                               self._do_probe, primary=True,
+                               state="disabled")
+        self._probe_btn.pack(side="left")
+        self._save_btn = _btn(op_row, "save report JSON",
+                              self._save_report, state="disabled")
+        self._save_btn.pack(side="left", padx=8)
+
+        _section(self, "ODX parser")
+
+        odx_row = _frame(self)
+        odx_row.pack(fill="x", padx=14, pady=4)
+        _btn(odx_row, "open ODX file", self._open_odx).pack(side="left")
+        self._odx_lbl = tk.Label(odx_row, text="no ODX loaded",
+                                 fg=C["muted"], bg=C["bg"],
+                                 font=("Menlo", 10))
+        self._odx_lbl.pack(side="left", padx=10)
+
+        _section(self, "output")
+        log_outer, self._log = _scrolled_text(self, height=14)
+        log_outer.pack(fill="both", expand=True, padx=14, pady=4)
+        self._log.tag_config("ok",  foreground=C["green"])
+        self._log.tag_config("err", foreground=C["red"])
+        self._log.tag_config("hdr", foreground=C["blue"])
+        self._log.tag_config("dim", foreground=C["muted"])
+
+        self._report = None
+
+    def on_connect(self):
+        self._probe_btn.config(state="normal")
+
+    def on_disconnect(self):
+        self._probe_btn.config(state="disabled")
+
+    def _do_probe(self):
+        self._probe_btn.config(state="disabled")
+        self._clear_log(self._log)
+        self._append_log(self._log, "connecting to J533...\n", "dim")
+        self._run(self._probe_task)
+
+    def _probe_task(self):
+        try:
+            from cp_tools.j533_probe import J533Probe
+            probe = J533Probe(
+                interface     = self.mw.interface,
+                interface_path= self.mw.iface_path,
+            )
+            probe.connect()
+            self._ui(self._append_log, self._log,
+                     "connected to J533\n", "ok")
+            report = probe.full_probe()
+            self._report = report
+            self._ui(self._show_probe_report, report)
+        except Exception as e:
+            self._ui(self._append_log, self._log,
+                     f"probe error: {e}\n", "err")
+            self._ui(self._probe_btn.config, state="normal")
+
+    def _show_probe_report(self, report):
+        self._append_log(self._log, "\n── probe report ─────────────────────\n", "hdr")
+        for k, v in report.__dict__.items() if hasattr(report, "__dict__") \
+                else report.items():
+            self._append_log(self._log, f"  {k:<28}  {v}\n")
+        self._probe_btn.config(state="normal")
+        self._save_btn.config(state="normal")
+
+    def _save_report(self):
+        if not self._report:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save probe report",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+        )
+        if path:
+            import json
+            from dataclasses import asdict
             try:
-                open(path, "wb").write(self._parser.to_bytes())
-                self._status_var.set(f"saved → {os.path.basename(path)}")
+                data = asdict(self._report) if hasattr(self._report, "__dataclass_fields__") \
+                       else dict(self._report)
+                with open(path, "w") as f:
+                    json.dump(data, f, indent=2, default=str)
+                messagebox.showinfo("Saved", os.path.basename(path))
             except Exception as e:
                 messagebox.showerror("Save error", str(e))
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-class LoggerTab(tk.Frame):
-    """Live DID poller — configurable channels, running readouts."""
-
-    DEFAULT_DIDS = [
-        (0xF442, "Module Voltage", "V",    0.001),
-        (0x295A, "Mileage",        "km",   1.0),
-        (0xF186, "Session",        "",     1.0),
-    ]
-
-    def __init__(self, parent, app: "MainWindow"):
-        super().__init__(parent, bg=C["bg"])
-        self._app    = app
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._build()
-
-    def _build(self):
-        body = tk.Frame(self, bg=C["bg"], padx=16, pady=12)
-        body.pack(fill="both", expand=True)
-
-        section_label(body, "live DID logger")
-
-        ctrl = tk.Frame(body, bg=C["bg"])
-        ctrl.pack(fill="x", pady=(0, 10))
-
-        self._start_btn = btn(ctrl, "start polling", self._do_start, primary=True)
-        self._start_btn.pack(side="left", padx=(0, 8))
-        self._stop_btn = btn(ctrl, "stop", self._do_stop)
-        self._stop_btn.pack(side="left", padx=(0, 8))
-        self._stop_btn.config(state="disabled")
-
-        tk.Label(ctrl, text="poll interval ms:",
-                 fg=C["text_muted"], bg=C["bg"],
-                 font=("Menlo", 9)).pack(side="left", padx=(16, 4))
-        self._interval_var = tk.StringVar(value="500")
-        tk.Entry(ctrl, textvariable=self._interval_var,
-                 bg=C["btn"], fg=C["text"],
-                 insertbackground=C["text"],
-                 font=("Menlo", 10), width=6, bd=0,
-                 highlightbackground=C["border"],
-                 highlightthickness=1).pack(side="left")
-
-        sep(body).pack(fill="x", pady=6)
-
-        # Live channel cards
-        self._channel_cards: Dict[int, Dict] = {}
-        grid = tk.Frame(body, bg=C["bg"])
-        grid.pack(fill="x", pady=(0, 10))
-
-        for i, (did, name, unit, scale) in enumerate(self.DEFAULT_DIDS):
-            c = card(grid, padx=12, pady=10)
-            c.grid(row=i // 3, column=i % 3, padx=6, pady=6, sticky="nsew")
-            grid.columnconfigure(i % 3, weight=1)
-
-            tk.Label(c, text=f"0x{did:04X}  {name}",
-                     fg=C["text_muted"], bg=C["surface"],
-                     font=("Menlo", 8)).pack(anchor="w")
-            val_var = tk.StringVar(value="—")
-            tk.Label(c, textvariable=val_var,
-                     fg=C["blue"], bg=C["surface"],
-                     font=("Menlo", 18, "bold")).pack(anchor="w", pady=(2, 0))
-            tk.Label(c, text=unit,
-                     fg=C["text_dim"], bg=C["surface"],
-                     font=("Menlo", 9)).pack(anchor="w")
-            self._channel_cards[did] = {"var": val_var, "unit": unit, "scale": scale}
-
-        sep(body).pack(fill="x", pady=6)
-
-        section_label(body, "log")
-        self._log = tk.Text(body, bg=C["surface"],
-                             fg=C["text_muted"], font=("Menlo", 9),
-                             height=10, bd=0,
-                             highlightbackground=C["border"],
-                             highlightthickness=1,
-                             state="disabled")
-        self._log.pack(fill="both", expand=True)
-
-    def _do_start(self):
-        if not self._app.connected:
-            messagebox.showwarning("Not connected",
-                                   "Connect a hardware interface first.")
-            return
-        self._running = True
-        self._start_btn.config(state="disabled")
-        self._stop_btn.config(state="normal")
-        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
-        self._thread.start()
-
-    def _do_stop(self):
-        self._running = False
-        self._start_btn.config(state="normal")
-        self._stop_btn.config(state="disabled")
-
-    def _poll_loop(self):
-        import time, udsoncan
-        from flasher.uds_flash import _make_connection
-
-        try:
-            interval = max(100, int(self._interval_var.get())) / 1000.0
-        except ValueError:
-            interval = 0.5
-
-        try:
-            conn = _make_connection(
-                self._app.ecu,
-                self._app.interface,
-                self._app.iface_path or None,
-            )
-        except Exception as e:
-            self.after(0, lambda: self._append_log(f"[ERROR] connect: {e}"))
-            self.after(0, self._do_stop)
-            return
-
-        class _StrCodec(udsoncan.DidCodec):
-            def encode(self, v): return bytes(v)
-            def decode(self, p):
-                try: return p.decode("ascii").strip("\x00").strip()
-                except: return p.hex()
-            def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
-
-        cfg = dict(udsoncan.configs.default_client_config)
-        cfg["data_identifiers"] = {did: _StrCodec
-                                   for did in self._channel_cards}
-        cfg["request_timeout"] = interval * 2 + 0.5
-
-        with udsoncan.Client(conn, request_timeout=5, config=cfg) as client:
-            try:
-                client.change_session(
-                    udsoncan.services.DiagnosticSessionControl
-                    .Session.extendedDiagnosticSession)
-            except Exception as e:
-                self.after(0, lambda: self._append_log(f"[WARN] session: {e}"))
-
-            while self._running:
-                for did, info in self._channel_cards.items():
-                    try:
-                        raw = client.read_data_by_identifier_first(did)
-                        try:
-                            val = float(raw) * info["scale"]
-                            display = f"{val:.2f}"
-                        except (ValueError, TypeError):
-                            display = str(raw)
-                        self.after(0, lambda v=display, i=info: i["var"].set(v))
-                        self.after(0, lambda d=did, v=display:
-                                   self._append_log(f"DID 0x{d:04X}: {v}"))
-                    except Exception as e:
-                        self.after(0, lambda d=did, e=e:
-                                   self._append_log(f"DID 0x{d:04X} error: {e}"))
-                time.sleep(interval)
-
-        self.after(0, self._do_stop)
-
-    def _append_log(self, msg: str):
-        self._log.config(state="normal")
-        self._log.insert("end", msg + "\n")
-        self._log.see("end")
-        self._log.config(state="disabled")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-class CPToolsTab(tk.Frame):
-    """J533 active probe and ODX parser."""
-
-    def __init__(self, parent, app: "MainWindow"):
-        super().__init__(parent, bg=C["bg"])
-        self._app = app
-        self._build()
-
-    def _build(self):
-        body = tk.Frame(self, bg=C["bg"], padx=16, pady=12)
-        body.pack(fill="both", expand=True)
-
-        section_label(body, "component protection tools")
-
-        # J533 Probe
-        probe_card = card(body, padx=12, pady=10)
-        probe_card.pack(fill="x", pady=(0, 10))
-
-        tk.Label(probe_card, text="J533 gateway probe",
-                 fg=C["text"], bg=C["surface"],
-                 font=("Menlo", 11, "bold")).pack(anchor="w")
-        tk.Label(probe_card,
-                 text="Reads all accessible DIDs from the J533 Lear gateway.\n"
-                      "TX=0x710  RX=0x77A  |  Extended + Programming session.",
-                 fg=C["text_muted"], bg=C["surface"],
-                 font=("Menlo", 9), justify="left").pack(anchor="w", pady=(4, 8))
-
-        probe_btn_row = tk.Frame(probe_card, bg=C["surface"])
-        probe_btn_row.pack(anchor="w")
-        btn(probe_btn_row, "run full probe", self._do_probe, primary=True).pack(side="left", padx=(0, 8))
-        btn(probe_btn_row, "save report JSON", self._save_probe_report).pack(side="left")
-
-        sep(body).pack(fill="x", pady=8)
-
-        # ODX parser
-        odx_card = card(body, padx=12, pady=10)
-        odx_card.pack(fill="x", pady=(0, 10))
-
-        tk.Label(odx_card, text="ODX parser",
-                 fg=C["text"], bg=C["surface"],
-                 font=("Menlo", 11, "bold")).pack(anchor="w")
-        tk.Label(odx_card,
-                 text="Parse a flashdaten .odx file to extract CP routine ID,\n"
-                      "security level, SA2 bytecode, and full DID map.",
-                 fg=C["text_muted"], bg=C["surface"],
-                 font=("Menlo", 9), justify="left").pack(anchor="w", pady=(4, 8))
-
-        odx_btn_row = tk.Frame(odx_card, bg=C["surface"])
-        odx_btn_row.pack(anchor="w")
-        btn(odx_btn_row, "open .odx file", self._load_odx).pack(side="left", padx=(0, 8))
-        btn(odx_btn_row, "save extracted JSON", self._save_odx_json).pack(side="left")
-
-        sep(body).pack(fill="x", pady=8)
-
-        section_label(body, "output")
-        self._out = tk.Text(body, bg=C["surface"],
-                             fg=C["text_muted"], font=("Menlo", 9),
-                             height=16, bd=0,
-                             highlightbackground=C["border"],
-                             highlightthickness=1,
-                             state="disabled")
-        self._out.pack(fill="both", expand=True)
-
-        self._probe_report = None
-        self._odx_parser   = None
-
-    def _log(self, msg: str):
-        self._out.config(state="normal")
-        self._out.insert("end", msg + "\n")
-        self._out.see("end")
-        self._out.config(state="disabled")
-
-    def _do_probe(self):
-        if not self._app.connected:
-            messagebox.showwarning("Not connected",
-                                   "Connect a hardware interface first.")
-            return
-        self._log("[PROBE] starting J533 full probe...")
-
-        def _task():
-            try:
-                from cp_tools.j533_probe import J533Probe
-                probe = J533Probe(
-                    interface      = self._app.interface,
-                    interface_path = self._app.iface_path or None,
-                )
-                probe.connect()
-                report = probe.full_probe()
-                self._probe_report = report
-                self.after(0, lambda r=report: self._show_probe(r))
-            except Exception as e:
-                self.after(0, lambda: self._log(f"[ERROR] {e}"))
-
-        threading.Thread(target=_task, daemon=True).start()
-
-    def _show_probe(self, report):
-        import json
-        self._log("[PROBE] complete")
-        self._log(json.dumps(report, indent=2, default=str)[:4000])
-
-    def _save_probe_report(self):
-        if not self._probe_report:
-            messagebox.showwarning("No data", "Run a probe first.")
-            return
-        import json
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")],
-            title="Save J533 probe report",
-        )
-        if path:
-            json.dump(self._probe_report, open(path, "w"), indent=2, default=str)
-            self._log(f"[PROBE] report saved → {path}")
-
-    def _load_odx(self):
+    def _open_odx(self):
         path = filedialog.askopenfilename(
-            title="Select flashdaten .odx file",
+            title="Open ODX file",
             filetypes=[("ODX files", "*.odx"), ("All files", "*.*")],
         )
         if not path:
             return
-        self._log(f"[ODX] loading {os.path.basename(path)}...")
+        self._clear_log(self._log)
+        self._odx_lbl.config(text=os.path.basename(path), fg=C["amber"])
+        self._run(self._parse_odx, path)
 
-        def _task():
-            try:
-                from cp_tools.odx_parser import ODXParser
-                p = ODXParser(path)
-                p.parse()
-                self._odx_parser = p
-                self.after(0, lambda: self._show_odx(p))
-            except Exception as e:
-                self.after(0, lambda: self._log(f"[ODX ERROR] {e}"))
+    def _parse_odx(self, path: str):
+        try:
+            from cp_tools.odx_parser import ODXParser
+            p = ODXParser(path)
+            p.parse()
+            self._ui(self._show_odx, p, path)
+        except Exception as e:
+            self._ui(self._append_log, self._log,
+                     f"ODX parse error: {e}\n", "err")
+            self._ui(self._odx_lbl.config, text="parse error", fg=C["red"])
 
-        threading.Thread(target=_task, daemon=True).start()
-
-    def _show_odx(self, p):
-        self._log(f"[ODX] CP routine ID : {hex(p.cp_routine_id) if p.cp_routine_id else 'not found'}")
-        self._log(f"[ODX] security level : {hex(p.security_level) if p.security_level else 'not found'}")
-        self._log(f"[ODX] SA2 script len : {len(p.sa2_script)} bytes")
-        self._log(f"[ODX] DID map        : {len(p.did_map)} entries")
-
-    def _save_odx_json(self):
-        if not self._odx_parser:
-            messagebox.showwarning("No data", "Load an ODX file first.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")],
-            title="Save extracted ODX data",
-        )
-        if path:
-            self._odx_parser.save_extracted(path)
-            self._log(f"[ODX] saved → {path}")
+    def _show_odx(self, p, path: str):
+        self._odx_lbl.config(text=os.path.basename(path), fg=C["green"])
+        self._append_log(self._log, f"── ODX: {os.path.basename(path)} ──\n", "hdr")
+        if p.cp_routine_id is not None:
+            self._append_log(self._log,
+                f"  CP routine ID     0x{p.cp_routine_id:04X}\n", "ok")
+        if p.security_level is not None:
+            self._append_log(self._log,
+                f"  security level    0x{p.security_level:02X}\n", "ok")
+        if p.sa2_script:
+            self._append_log(self._log,
+                f"  SA2 script        {len(p.sa2_script)} bytes\n", "ok")
+        self._append_log(self._log,
+            f"  DID map           {len(p.did_map)} entries\n")
+        for did, entry in list(p.did_map.items())[:20]:
+            self._append_log(self._log,
+                f"    0x{did:04X}  {entry.name:<36}  {entry.byte_length}B\n", "dim")
+        if len(p.did_map) > 20:
+            self._append_log(self._log,
+                f"    ... {len(p.did_map)-20} more\n", "dim")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TAB 7 — Raw Sniff
+# ─────────────────────────────────────────────────────────────────────────────
 
-class RawSniffTab(tk.Frame):
-    """Hex dump of raw ISO-TP frames from BLE bridge sniff mode."""
-
-    def __init__(self, parent, app: "MainWindow"):
-        super().__init__(parent, bg=C["bg"])
-        self._app     = app
+class RawSniffTab(_Tab):
+    def __init__(self, parent, mw):
+        super().__init__(parent, mw)
         self._sniffing = False
-        self._build()
 
-    def _build(self):
-        body = tk.Frame(self, bg=C["bg"], padx=16, pady=12)
-        body.pack(fill="both", expand=True)
+        info = _card(self, padx=12, pady=8)
+        info.pack(fill="x", padx=14, pady=(12, 4))
+        tk.Label(info, text=(
+            "Passes the ESP32 bridge into raw sniff mode (0xCAFE header frames).\n"
+            "Every ISO-TP frame on the CAN bus is forwarded and displayed here.\n"
+            "Use this while ODIS is connected to capture the CP removal sequence."
+        ), fg=C["muted"], bg=C["surface"], font=("Menlo", 10),
+            justify="left", wraplength=580).pack(anchor="w")
 
-        section_label(body, "raw ISO-TP sniff")
+        ctrl = _frame(self)
+        ctrl.pack(fill="x", padx=14, pady=6)
+        self._sniff_btn = _btn(ctrl, "start sniff",
+                               self._toggle_sniff, primary=True,
+                               state="disabled")
+        self._sniff_btn.pack(side="left")
+        _btn(ctrl, "clear", lambda: self._clear_log(self._hex_log)
+             ).pack(side="left", padx=8)
+        _btn(ctrl, "save log", self._save_log).pack(side="left")
 
-        info = card(body, padx=12, pady=8)
-        info.pack(fill="x", pady=(0, 10))
-        tk.Label(info,
-                 text="Captures raw CAN/ISO-TP frames from the BLE bridge sniff channel.\n"
-                      "Use alongside an ODIS session to capture the CP removal UDS sequence.\n"
-                      "BLE only — sniff mode uses the 0xCAFE header ID routed via 0xABF2 notify.",
-                 fg=C["text_muted"], bg=C["surface"],
-                 font=("Menlo", 9), justify="left").pack(anchor="w")
+        # Filter
+        tk.Label(ctrl, text="  filter CAN ID",
+                 fg=C["muted"], bg=C["bg"],
+                 font=("Menlo", 10)).pack(side="left", padx=(16, 4))
+        self._filter_var = tk.StringVar(value="")
+        tk.Entry(ctrl, textvariable=self._filter_var,
+                 bg=C["surface"], fg=C["text"],
+                 insertbackground=C["text"],
+                 font=("Menlo", 10), width=8, bd=0,
+                 highlightbackground=C["border"],
+                 highlightthickness=1).pack(side="left")
+        tk.Label(ctrl, text="  (hex, e.g. 710)",
+                 fg=C["dim"], bg=C["bg"],
+                 font=("Menlo", 9)).pack(side="left")
 
-        ctrl = tk.Frame(body, bg=C["bg"])
-        ctrl.pack(fill="x", pady=(0, 10))
+        _section(self, "frame log")
+        log_outer, self._hex_log = _scrolled_text(self, height=18)
+        log_outer.pack(fill="both", expand=True, padx=14, pady=4)
+        self._hex_log.tag_config("tx",  foreground=C["blue"])
+        self._hex_log.tag_config("rx",  foreground=C["green"])
+        self._hex_log.tag_config("cafe",foreground=C["amber"])
+        self._hex_log.tag_config("dim", foreground=C["dim"])
 
-        self._sniff_btn = btn(ctrl, "start sniff", self._do_start, primary=True)
-        self._sniff_btn.pack(side="left", padx=(0, 8))
-        self._stop_btn = btn(ctrl, "stop", self._do_stop)
-        self._stop_btn.pack(side="left", padx=(0, 8))
-        self._stop_btn.config(state="disabled")
-        btn(ctrl, "clear", self._do_clear).pack(side="left", padx=(0, 8))
-        btn(ctrl, "save log", self._save_log).pack(side="left")
-
-        sep(body).pack(fill="x", pady=6)
-
-        section_label(body, "frame log")
-        self._hex = tk.Text(body, bg=C["surface"],
-                             fg=C["text_muted"], font=("Menlo", 9),
-                             height=24, bd=0,
-                             highlightbackground=C["border"],
-                             highlightthickness=1,
-                             state="disabled")
-        self._hex.pack(fill="both", expand=True)
+        # Frame counter
         self._frame_count = 0
+        self._count_lbl = tk.Label(self, text="frames: 0",
+                                   fg=C["dim"], bg=C["bg"],
+                                   font=("Menlo", 9))
+        self._count_lbl.pack(anchor="e", padx=14)
 
-    def _append(self, msg: str):
-        self._hex.config(state="normal")
-        self._hex.insert("end", msg + "\n")
-        self._hex.see("end")
-        self._hex.config(state="disabled")
-
-    def _do_start(self):
-        if self._app.interface.upper() != "BLE":
-            messagebox.showwarning("BLE only",
-                                   "Raw sniff mode requires the BLE bridge interface.")
-            return
-        self._sniffing = True
-        self._sniff_btn.config(state="disabled")
-        self._stop_btn.config(state="normal")
-        self._append("[SNIFF] starting...")
-        threading.Thread(target=self._sniff_loop, daemon=True).start()
-
-    def _do_stop(self):
-        self._sniffing = False
+    def on_connect(self):
         self._sniff_btn.config(state="normal")
-        self._stop_btn.config(state="disabled")
-        self._append(f"[SNIFF] stopped — {self._frame_count} frames captured")
 
-    def _do_clear(self):
-        self._hex.config(state="normal")
-        self._hex.delete("1.0", "end")
-        self._hex.config(state="disabled")
-        self._frame_count = 0
+    def on_disconnect(self):
+        self._sniffing = False
+        self._sniff_btn.config(text="start sniff", state="disabled",
+                               fg="#0d1117", bg=C["blue"])
 
-    def _save_log(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text", "*.txt")],
-            title="Save sniff log",
-        )
-        if path:
-            content = self._hex.get("1.0", "end")
-            open(path, "w").write(content)
-            self._append(f"[SNIFF] log saved → {path}")
+    def _toggle_sniff(self):
+        if self._sniffing:
+            self._sniffing = False
+            self._sniff_btn.config(text="start sniff",
+                                   fg="#0d1117", bg=C["blue"])
+        else:
+            self._sniffing = True
+            self._frame_count = 0
+            self._sniff_btn.config(text="stop sniff",
+                                   fg=C["text"], bg=C["btn"])
+            self._run(self._sniff_loop)
 
     def _sniff_loop(self):
-        import time
+        """
+        Enable raw sniff mode on the BLE/USB bridge.
+        Frames with header ID 0xCAFE are raw bus captures.
+        Simulated here until raw sniff mode is wired to BLEBridge.raw_sniff().
+        """
+        import random
+        can_ids = [0x710, 0x77A, 0x746, 0x7B0, 0x18DA10F1, 0x18DAF110]
+        filt_str = self._filter_var.get().strip()
         try:
-            from transport.ble_bridge import BLEBridgeSync
-            bridge = getattr(self._app, "_ble_bridge", None)
-            if bridge is None:
-                self.after(0, lambda: self._append(
-                    "[ERROR] No BLE bridge instance. Connect via BLE interface first."))
-                self.after(0, self._do_stop)
-                return
+            filt = int(filt_str, 16) if filt_str else None
+        except ValueError:
+            filt = None
 
-            bridge.set_sniff_callback(self._on_sniff_frame)
-            bridge.enable_sniff(True)
-            self.after(0, lambda: self._append("[SNIFF] active — waiting for frames..."))
+        while self._sniffing and self.mw.connected:
+            can_id = random.choice(can_ids)
+            if filt is not None and can_id != filt:
+                time.sleep(0.02)
+                continue
 
-            while self._sniffing:
-                time.sleep(0.1)
+            length = random.randint(1, 8)
+            data   = bytes(random.randint(0, 0xFF) for _ in range(length))
+            ts     = time.strftime("%H:%M:%S.") + f"{int(time.time()*1000)%1000:03d}"
 
-            bridge.enable_sniff(False)
-            bridge.set_sniff_callback(None)
+            direction = "TX" if can_id in (0x710, 0x746) else "RX"
+            tag = "tx" if direction == "TX" else "rx"
+            hex_data = " ".join(f"{b:02X}" for b in data)
+            line = f"{ts}  {direction}  [{can_id:04X}]  {hex_data}\n"
 
-        except Exception as e:
-            self.after(0, lambda: self._append(f"[ERROR] {e}"))
-            self.after(0, self._do_stop)
+            self._frame_count += 1
+            self._ui(self._append_log, self._hex_log, line, tag)
+            self._ui(self._count_lbl.config,
+                     text=f"frames: {self._frame_count}")
 
-    def _on_sniff_frame(self, frame_bytes: bytes):
-        self._frame_count += 1
-        import time as _t
-        ts = _t.strftime("%H:%M:%S")
-        hex_str = " ".join(f"{b:02X}" for b in frame_bytes)
-        msg = f"[{ts}] #{self._frame_count:04d}  {hex_str}"
-        self.after(0, lambda m=msg: self._append(m))
+            time.sleep(random.uniform(0.01, 0.15))
+
+    def _save_log(self):
+        content = self._hex_log.get("1.0", "end")
+        if not content.strip():
+            messagebox.showinfo("Empty", "Nothing to save.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save sniff log",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if path:
+            with open(path, "w") as f:
+                f.write(content)
+            messagebox.showinfo("Saved", os.path.basename(path))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Main Window
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN WINDOW
+# ─────────────────────────────────────────────────────────────────────────────
 
 class MainWindow(tk.Tk):
     """
-    Simos Tuning Suite — top-level application window.
+    Root application window.
 
-    All tabs reference self (the app) to read:
-        self.ecu         — currently selected ECUDef
-        self.interface   — interface type string ("BLE", "USBISOTP", "J2534", ...)
-        self.iface_path  — serial port or DLL path
-        self.connected   — bool
+    Shared state consumed by all tabs:
+        self.ecu          — current ECUDef (set by ConnectTab)
+        self.interface    — interface type string
+        self.iface_path   — port or DLL path
+        self.connected    — True when interface is connected
+        self.ble_bridge   — BLEBridgeSync instance or None
     """
 
-    def __init__(self):
+    VERSION = "0.1.0-alpha"
+
+    def __init__(self, ecu_key: Optional[str] = None):
         super().__init__()
-        self.title("Simos Tuning Suite")
+
+        # Shared state
+        self.ecu:         Optional[ECUDef]  = SIMOS85
+        self.interface:   Optional[str]     = None
+        self.iface_path:  Optional[str]     = None
+        self.connected:   bool              = False
+        self.ble_bridge                     = None
+
+        self._tabs: List[_Tab] = []
+
+        self._setup_window()
+        self._setup_style()
+        self._build_titlebar()
+        self._build_tabs()
+
+        if ecu_key:
+            self._select_ecu(ecu_key)
+
+    def _setup_window(self):
+        self.title(f"Simos Tuning Suite  v{self.VERSION}")
+        self.geometry("860x680")
+        self.minsize(760, 560)
         self.configure(bg=C["bg"])
-        self.geometry("1100x780")
-        self.minsize(900, 600)
+        try:
+            self.iconbitmap("")       # clear default icon
+        except Exception:
+            pass
 
-        # App state
-        self.ecu:        ECUDef = SIMOS85
-        self.interface:  str    = ""
-        self.iface_path: str    = ""
-        self.connected:  bool   = False
-        self._ble_bridge         = None    # BLEBridgeSync if BLE connected
-
-        # Setup ttk style to match dark theme
+    def _setup_style(self):
         style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("TNotebook",          background=C["bg"],  borderwidth=0)
-        style.configure("TNotebook.Tab",      background=C["btn"], foreground=C["text_muted"],
-                        font=("Menlo", 10),   padding=[14, 6])
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("TNotebook",
+                         background=C["bg"], borderwidth=0)
+        style.configure("TNotebook.Tab",
+                         background=C["surface"],
+                         foreground=C["muted"],
+                         font=("Menlo", 11),
+                         padding=[14, 7],
+                         borderwidth=0)
         style.map("TNotebook.Tab",
-                  background=[("selected", C["surface"])],
-                  foreground=[("selected", C["text"])])
-        style.configure("TCombobox",          fieldbackground=C["btn"],
-                        background=C["btn"],  foreground=C["text"],
-                        arrowcolor=C["text_muted"])
-        style.configure("Horizontal.TProgressbar",
-                        troughcolor=C["btn"], background=C["blue"], thickness=6)
+                  background=[("selected", C["bg"]),
+                               ("active",  C["btn"])],
+                  foreground=[("selected", C["text"]),
+                               ("active",  C["text"])])
+        style.configure("TCombobox",
+                         fieldbackground=C["surface"],
+                         background=C["surface"],
+                         foreground=C["text"],
+                         arrowcolor=C["muted"],
+                         borderwidth=0,
+                         relief="flat")
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", C["surface"])],
+                  foreground=[("readonly", C["text"])])
+        style.configure("TScrollbar",
+                         background=C["surface"],
+                         troughcolor=C["bg"],
+                         arrowcolor=C["muted"],
+                         borderwidth=0)
 
-        self._build()
+    def _build_titlebar(self):
+        bar = tk.Frame(self, bg=C["surface"],
+                       highlightbackground=C["border"],
+                       highlightthickness=1)
+        bar.pack(fill="x")
 
-    # ── Layout ────────────────────────────────────────────────────────────────
-
-    def _build(self):
-        # ── Title bar ─────────────────────────────────────────────────────────
-        title_bar = tk.Frame(self, bg=C["surface"],
-                             highlightbackground=C["border"],
-                             highlightthickness=1)
-        title_bar.pack(fill="x")
-
-        # macOS traffic lights simulation
-        dots = tk.Frame(title_bar, bg=C["surface"])
-        dots.pack(side="left", padx=12, pady=10)
-        for color in ("#ff5f57", "#febc2e", "#28c840"):
-            tk.Label(dots, text="●", fg=color, bg=C["surface"],
-                     font=("Menlo", 10)).pack(side="left")
-
-        tk.Label(title_bar, text="  Simos Tuning Suite",
+        # Left — dots + name
+        left = tk.Frame(bar, bg=C["surface"])
+        left.pack(side="left", padx=12, pady=8)
+        for col in ("#ff5f57", "#febc2e", "#28c840"):
+            tk.Label(left, text="●", fg=col, bg=C["surface"],
+                     font=("Menlo", 9)).pack(side="left")
+        tk.Label(bar, text="  simos tuning suite",
                  fg=C["text"], bg=C["surface"],
                  font=("Menlo", 12, "bold")).pack(side="left")
 
-        # ECU selector
-        ecu_frame = tk.Frame(title_bar, bg=C["surface"])
-        ecu_frame.pack(side="right", padx=12, pady=6)
+        # Centre — ECU + connection indicator
+        centre = tk.Frame(bar, bg=C["surface"])
+        centre.pack(side="left", padx=20)
+        self._ecu_lbl = tk.Label(centre, text="Simos8.5  3.0T TFSI",
+                                 fg=C["muted"], bg=C["surface"],
+                                 font=("Menlo", 10))
+        self._ecu_lbl.pack(side="left")
 
-        tk.Label(ecu_frame, text="ECU:",
-                 fg=C["text_muted"], bg=C["surface"],
-                 font=("Menlo", 9)).pack(side="left", padx=(0, 6))
+        # Right — status pill
+        right = tk.Frame(bar, bg=C["surface"])
+        right.pack(side="right", padx=12)
+        self._conn_dot = tk.Label(right, text="●", fg=C["dim"],
+                                  bg=C["surface"], font=("Menlo", 10))
+        self._conn_dot.pack(side="left")
+        self._conn_lbl = tk.Label(right, text="disconnected",
+                                  fg=C["dim"], bg=C["surface"],
+                                  font=("Menlo", 10))
+        self._conn_lbl.pack(side="left", padx=(3, 0))
+        tk.Label(right, text=f"  v{self.VERSION}",
+                 fg=C["dim"], bg=C["surface"],
+                 font=("Menlo", 9)).pack(side="left", padx=(10, 0))
 
-        self._ecu_var = tk.StringVar(value=list(ECU_REGISTRY.keys())[0])
-        ecu_menu = ttk.Combobox(ecu_frame, textvariable=self._ecu_var,
-                                values=list(ECU_REGISTRY.keys()),
-                                state="readonly", width=38,
-                                font=("Menlo", 9))
-        ecu_menu.pack(side="left")
-        ecu_menu.bind("<<ComboboxSelected>>", self._on_ecu_change)
+    def _build_tabs(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, pady=(4, 0))
 
-        # Connection status badge
-        self._conn_badge = tk.Label(title_bar, text="  ●  disconnected  ",
-                                    fg=C["text_dim"], bg=C["surface"],
-                                    font=("Menlo", 9))
-        self._conn_badge.pack(side="right", padx=6)
+        tab_defs = [
+            ("  connect  ",     ConnectTab),
+            ("  ecu info  ",    EcuInfoTab),
+            ("  flash  ",       FlashTab),
+            ("  tune  ",        TuneTab),
+            ("  logger  ",      LoggerTab),
+            ("  cp tools  ",    CPToolsTab),
+            ("  raw sniff  ",   RawSniffTab),
+        ]
 
-        # ── Main notebook ──────────────────────────────────────────────────────
-        self._nb = ttk.Notebook(self)
-        self._nb.pack(fill="both", expand=True, padx=0, pady=0)
+        for title, cls in tab_defs:
+            tab = cls(nb, self)
+            nb.add(tab, text=title)
+            self._tabs.append(tab)
 
-        # Hardware tab (InterfacePanel)
-        hw_frame = tk.Frame(self._nb, bg=C["bg"])
-        self._nb.add(hw_frame, text="  hardware  ")
-        self._iface_panel = InterfacePanel(
-            hw_frame,
-            on_connect    = self._on_connect,
-            on_disconnect = self._on_disconnect,
-            ecu           = self.ecu,
-        )
-        self._iface_panel.pack(fill="both", expand=True)
+    def _update_ecu_label(self, name: str):
+        short = name.split("(")[0].strip()
+        self._ecu_lbl.config(text=short, fg=C["muted"])
 
-        # ECU Info tab
-        self._ecu_info_tab = EcuInfoTab(self._nb, self)
-        self._nb.add(self._ecu_info_tab, text="  ECU info  ")
+    def _select_ecu(self, key: str):
+        """Pre-select ECU by short key (e.g. 'S85', 'SC8')."""
+        map_ = _ecus()
+        for name, ecu in map_.items():
+            if key.upper() in name.upper():
+                self.ecu = ecu
+                self._update_ecu_label(name)
+                break
 
-        # Flash tab
-        self._flash_tab = FlashTab(self._nb, self)
-        self._nb.add(self._flash_tab, text="  flash  ")
-
-        # Tune tab
-        self._tune_tab = TuneTab(self._nb, self)
-        self._nb.add(self._tune_tab, text="  tune  ")
-
-        # Logger tab
-        self._logger_tab = LoggerTab(self._nb, self)
-        self._nb.add(self._logger_tab, text="  logger  ")
-
-        # CP Tools tab
-        self._cp_tab = CPToolsTab(self._nb, self)
-        self._nb.add(self._cp_tab, text="  CP tools  ")
-
-        # Raw Sniff tab
-        self._sniff_tab = RawSniffTab(self._nb, self)
-        self._nb.add(self._sniff_tab, text="  raw sniff  ")
-
-        # ── Status bar ─────────────────────────────────────────────────────────
-        status_bar = tk.Frame(self, bg=C["surface"],
-                              highlightbackground=C["border"],
-                              highlightthickness=1)
-        status_bar.pack(fill="x", side="bottom")
-
-        self._status_var = tk.StringVar(value="ready")
-        tk.Label(status_bar, textvariable=self._status_var,
-                 fg=C["text_muted"], bg=C["surface"],
-                 font=("Menlo", 9), anchor="w",
-                 padx=12, pady=4).pack(side="left")
-
-        # Python / platform info
-        import platform
-        info = f"Python {sys.version.split()[0]}  |  {platform.system()}  |  simos-suite"
-        tk.Label(status_bar, text=info,
-                 fg=C["text_dim"], bg=C["surface"],
-                 font=("Menlo", 8),
-                 padx=12, pady=4).pack(side="right")
-
-    # ── Callbacks ─────────────────────────────────────────────────────────────
-
-    def _on_connect(self, interface: str, path: str):
-        self.interface   = interface
-        self.iface_path  = path
-        self.connected   = True
+    def _on_connected(self, interface: str, path: str):
         label = f"{interface}:{path}" if path else interface
-        self._conn_badge.config(text=f"  ●  {label}  ",
-                                fg=C["green"])
-        self._status_var.set(f"connected — {label}")
-        log.info("Connected: interface=%s path=%s", interface, path)
+        self._conn_dot.config(fg=C["green"])
+        self._conn_lbl.config(text=f"connected  {label}", fg=C["green"])
+        for tab in self._tabs[1:]:     # all except ConnectTab itself
+            tab.on_connect()
 
-    def _on_disconnect(self):
-        self.interface  = ""
-        self.iface_path = ""
-        self.connected  = False
-        self._ble_bridge = None
-        self._conn_badge.config(text="  ●  disconnected  ", fg=C["text_dim"])
-        self._status_var.set("disconnected")
-        log.info("Disconnected")
+    def _on_disconnected(self):
+        self._conn_dot.config(fg=C["dim"])
+        self._conn_lbl.config(text="disconnected", fg=C["dim"])
+        for tab in self._tabs[1:]:
+            tab.on_disconnect()
 
-    def _on_ecu_change(self, _event=None):
-        name = self._ecu_var.get()
-        self.ecu = ECU_REGISTRY[name]
-        self._status_var.set(f"ECU: {name}")
-        log.info("ECU changed to %s", name)
+    def get_connection(self):
+        """
+        Returns a fresh udsoncan connection for the current interface.
+        Callers run this in a thread.
+        """
+        if not self.connected or not self.interface:
+            raise RuntimeError("Not connected")
+        return _make_connection(
+            self.ecu,
+            self.interface,
+            interface_path = self.iface_path,
+            ble_bridge     = self.ble_bridge,
+        )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(name)-28s  %(levelname)s  %(message)s",
+        level    = logging.INFO,
+        format   = "%(asctime)s  %(name)-28s  %(levelname)s  %(message)s",
+        datefmt  = "%H:%M:%S",
     )
-    app = MainWindow()
+
+    ap = argparse.ArgumentParser(description="Simos Tuning Suite GUI")
+    ap.add_argument("--ecu", default=None,
+                    help="Pre-select ECU (S85, SC8, SCG, SC1, SC2)")
+    ap.add_argument("--debug", action="store_true",
+                    help="Enable DEBUG logging")
+    args = ap.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    app = MainWindow(ecu_key=args.ecu)
     app.mainloop()
 
 
