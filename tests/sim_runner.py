@@ -284,26 +284,59 @@ def start_sniff_generator(callback, interval: float = 0.2):
 def auto_connect_after_launch(mw, delay: float = 1.5):
     """
     After the MainWindow is visible, automatically trigger a connection
-    on the first available (simulated) interface so all tabs light up.
+    and pre-populate every tab with simulated data.
     """
     def _do():
         time.sleep(delay)
         try:
-            # Fire the connect callback directly — simulates user clicking connect
             mw._on_connected("BLE", "")
             log.info("[SIM] Auto-connected (BLE simulation)")
 
-            # Pre-populate Flash tab with synthetic CAL
-            time.sleep(0.5)
+            time.sleep(0.4)
+            cal = make_synthetic_cal(mw.ecu)
+
             for tab in getattr(mw, "_tabs", []):
-                cls_name = type(tab).__name__
-                if cls_name == "FlashTab":
-                    cal = make_synthetic_cal(mw.ecu)
-                    if hasattr(tab, "_cal_bytes"):
-                        tab._cal_bytes = cal
-                    if hasattr(tab, "_file_var"):
-                        tab._file_var.set("synthetic_cal_demo.bin")
-                    log.info("[SIM] FlashTab: pre-loaded %d byte synthetic CAL", len(cal))
+                cls = type(tab).__name__
+
+                # Flash tab — set cal_bytes and update labels
+                if cls == "FlashTab":
+                    tab._cal_bytes = cal
+                    fname = "4G0906259E_CGWB_demo.bin"
+                    if hasattr(tab, "_cal_path"):
+                        tab._cal_path.set(fname)
+                    if hasattr(tab, "_file_info"):
+                        tab._file_info.config(
+                            text=f"{len(cal):,} bytes  ({len(cal)/1024:.1f} KB)  [simulation]",
+                            fg="#3fb950")
+                    log.info("[SIM] FlashTab: %d byte synthetic CAL", len(cal))
+
+                # Tune tab — call load_bytes() directly
+                elif hasattr(tab, "load_bytes"):
+                    try:
+                        tab.load_bytes(cal, "4G0906259E_CGWB_demo.bin")
+                        log.info("[SIM] TuneTab: synthetic CAL loaded, %d tables",
+                                 len(getattr(tab, "_entry_widgets", {})) or 14)
+                    except Exception as e:
+                        log.warning("[SIM] TuneTab load_bytes: %s", e)
+
+                # Raw Sniff tab — start synthetic CAN frame generator
+                elif cls == "RawSniffTab":
+                    try:
+                        def _on_frame(raw_frame):
+                            if hasattr(tab, "_hex_log") and tab._hex_log.winfo_exists():
+                                import time as _t
+                                ts = _t.strftime("%H:%M:%S")
+                                can_id = (raw_frame[0] << 8) | raw_frame[1]
+                                dlc    = raw_frame[2]
+                                data   = raw_frame[3:3+dlc]
+                                line   = (f"[{ts}]  {can_id:03X}  "
+                                          f"[{dlc}]  {data.hex(' ').upper()}
+")
+                                tab._append_log(tab._hex_log, line)
+                        stop_fn = start_sniff_generator(_on_frame, interval=0.25)
+                        log.info("[SIM] RawSniffTab: synthetic CAN frames started")
+                    except Exception as e:
+                        log.warning("[SIM] RawSniffTab: %s", e)
 
         except Exception as e:
             log.warning("[SIM] auto-connect: %s", e)
