@@ -1,0 +1,65 @@
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
+
+ Copyright (C) 2024-2025 dspl1236 and contributors
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+
+ You should have received a copy of the GNU General Public License
+ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+───────────────────────────────────────────────────────────────────────────────
+
+INTENT
+
+This software was built for vehicle owners — specifically the right to service,
+diagnose, and modify the electronic systems in their own property.
+
+If you are a dealership, independent repair shop, or any person or entity
+intending to use this tool commercially (including charging others for CP
+removal, ECU tuning, or related services), this license does not prohibit that
+— but know that this tool was not built for you. It was built for the people
+sitting in the waiting room of your service department while you charge them
+$400 to do a 10-minute software operation.
+
+The GPL v3 ensures that any modified version of this tool must also be free and
+open. You cannot take this code, make it proprietary, and sell it. That is the
+only commercial restriction. The full license text follows.
+
+───────────────────────────────────────────────────────────────────────────────
+
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
+
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+                            Preamble
+
+  The GNU General Public License is a free, copyleft license for
+software and other kinds of works.
+
+  When we speak of free software, we are referring to freedom, not
+price. Our General Public Licenses are designed to make sure that you
+have the freedom to share and change all versions of a program--to
+make sure it remains free software for all its users.
+
+  When you distribute copies of such a program, whether gratis or for
+a fee, you must pass on to the recipients the same freedoms that you
+received. You must make sure that they, too, receive or can get the
+source code. And you must show them these terms so they know their
+rights.
+
+  Developers that use the GNU GPL protect your rights with two steps:
+(1) assert copyright on the software, and (2) offer you this License
+giving you legal permission to copy, distribute and/or modify it.
+
+  For the full license text see: https://www.gnu.org/licenses/gpl-3.0.txt
