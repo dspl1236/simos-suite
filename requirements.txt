@@ -1,0 +1,34 @@
+# Simos Tuning Suite — Python dependencies
+#
+# Install:
+#   pip install -r requirements.txt
+#   pip install git+https://github.com/bri3d/sa2_seed_key.git
+#
+# Windows note: J2534 PassThru DLL requires 32-bit Python.
+# Use 64-bit Python for BLE/USB/SocketCAN interfaces.
+
+# UDS protocol client
+udsoncan >= 1.21
+
+# CAN bus support (SocketCAN backend)
+python-can >= 4.0
+
+# BLE transport for ESP32 bridge
+bleak >= 0.21
+
+# Serial port (USB ISO-TP bridge)
+pyserial >= 3.5
+
+# Calibration table math
+numpy >= 1.24
+
+# AES crypto for Simos12/18 flash encryption
+pycryptodome >= 3.18
+
+# SA2 seed/key bytecode interpreter
+# Install separately:
+#   pip install git+https://github.com/bri3d/sa2_seed_key.git
+# sa2_seed_key
+
+# Optional: faster CRC32 (falls back to pure Python if not available)
+# fastcrc >= 0.3
