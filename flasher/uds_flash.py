@@ -100,7 +100,18 @@ def _make_connection(ecu: ECUDef, interface: str, interface_path: Optional[str] 
         return conn
 
     elif interface.upper() == "J2534":
-        # J2534 DLL — Tactrix OpenPort 2.0, VNCI 6154A, etc.
+        # J2534 PassThru DLL — Windows only, 32-bit DLL
+        #
+        # Tested hardware (in order of recommendation):
+        #   Tactrix OpenPort 2.0  — most reliable for large block flashes
+        #   Mongoose J2534        — legacy Drew Tech / Bosch cable, works fine
+        #                           DLL: C:/Program Files (x86)/Drew Technologies, Inc/Mongoose/monj2534.dll
+        #   VNCI 6154A            — clone ODIS cable, reliable for UDS/read
+        #                           DLL: C:/Program Files (x86)/OpenShell/vcdc.dll
+        #
+        # interface_path: full path to the J2534 DLL.
+        # If None, uses the Tactrix default (same as VW_Flash default).
+        # Use transport.interfaces.detect_j2534_dll() to auto-detect.
         from lib.connections.j2534_connection import J2534Connection
         import math
         def _us_to_stmin(us):
@@ -108,17 +119,52 @@ def _make_connection(ecu: ECUDef, interface: str, interface_path: Optional[str] 
                 return math.ceil(us / 1_000_000)
             return 0xF0 + math.ceil(us / 100_000)
 
+        dll = interface_path or (
+            "C:/Program Files (x86)/OpenECU/OpenPort 2.0/drivers/openport 2.0/op20pt32.dll"
+        )
         return J2534Connection(
-            windll=interface_path,
+            windll=dll,
             rxid=ecu.can_rx,
             txid=ecu.can_tx,
             st_min=_us_to_stmin(st_min_us),
         )
 
+    elif interface.upper().startswith("USBISOTP"):
+        # ESP32 ISO-TP bridge over USB serial (same hardware as BLE mode,
+        # but plugged in via USB-C cable instead of Bluetooth).
+        # Packet format is identical to BLE (0xF1 header + rxID/txID/size/payload)
+        # but transported over pyserial at 250000 baud instead of GATT.
+        #
+        # interface_path: serial port, e.g. "COM3" (Windows) or "/dev/ttyUSB0" (Linux)
+        # If not provided, uses the port suffix from interface string,
+        # e.g. "USBISOTP_COM3" → COM3
+        #
+        # Note: DTR/RTS must NOT be toggled on connect — the firmware comment
+        # in usb_isotp_connection.py explains this avoids putting the ESP32
+        # into programming mode. The connection class handles this automatically.
+        from lib.connections.usb_isotp_connection import USBISOTPConnection
+
+        if interface_path:
+            port = interface_path
+        elif "_" in interface:
+            port = interface.split("_", 1)[1]
+        else:
+            raise ValueError(
+                "USBISOTP requires a port. "
+                "Use interface='USBISOTP_COM3' or interface_path='COM3'."
+            )
+
+        return USBISOTPConnection(
+            interface_name = port,
+            rxid           = ecu.can_rx,
+            txid           = ecu.can_tx,
+            tx_stmin       = max(1, st_min_us // 1000),   # convert µs → ms
+        )
+
     else:
         raise ValueError(
             f"Unknown interface: '{interface}'. "
-            f"Use 'BLE', 'J2534', or 'SocketCAN_can0'."
+            f"Use 'BLE', 'USBISOTP_COM3', 'J2534', or 'SocketCAN_can0'."
         )
 
 

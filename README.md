@@ -186,9 +186,47 @@ sa2_seed_key       # SA2 seed/key (bri3d/sa2_seed_key)
 
 Install:
 ```bash
-pip install udsoncan python-can bleak numpy pycryptodome
+pip install udsoncan python-can bleak pyserial numpy pycryptodome
 pip install git+https://github.com/bri3d/sa2_seed_key.git
 ```
+
+---
+
+## Hardware Interface Support
+
+| Interface | Type string | OS | Notes |
+|---|---|---|---|
+| **ESP32 BLE bridge** | `"BLE"` | Win/Mac/Linux | Wireless. BLEBridge.scan() → connect() |
+| **ESP32 USB bridge** | `"USBISOTP_COM3"` | Win/Mac/Linux | Same hardware, USB-C cable. 250kbaud |
+| **Tactrix OpenPort 2.0** | `"J2534"` | Windows | Most reliable for large block flashes |
+| **Mongoose J2534** | `"J2534"` | Windows | Drew Tech / Bosch legacy cable. Works well |
+| **VNCI 6154A** | `"J2534"` | Windows | Clone ODIS cable. Good for UDS read/probe |
+| **SocketCAN** | `"SocketCAN_can0"` | Linux | Requires iso-tp kernel module |
+
+Auto-detect all available interfaces:
+```python
+from transport.interfaces import InterfaceRegistry
+reg = InterfaceRegistry()
+for iface in reg.available():
+    print(iface)
+```
+
+### Mongoose J2534 — known DLL paths
+
+Drew Technologies / Bosch legacy cable — installs 32-bit DLL. InterfaceRegistry
+scans these automatically plus the Windows PassThru registry:
+
+```
+C:/Program Files (x86)/Drew Technologies, Inc/Mongoose/monj2534.dll  # pre-2014
+C:/Program Files (x86)/Drew Technologies/Mongoose/monj2534.dll
+C:/Program Files (x86)/Bosch/Mongoose/monj2534.dll                   # post-2014
+C:/Windows/SysWOW64/monj2534.dll                                      # fallback
+```
+
+If not auto-detected: Device Manager → Mongoose J2534 → Properties → Details
+→ Hardware Ids, then search SysWOW64 for monj2534.dll.
+
+**Note:** J2534 DLL is 32-bit — use 32-bit Python on Windows (same as VW_Flash).
 
 ### BLE bridge — device identification and protocol
 
