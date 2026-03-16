@@ -1,23 +1,30 @@
 """
-tests/ — Simos Suite test and simulation package
+tests/ — Simos Suite test suite
 
-Modules
-───────
-  mock_connection.py   — udsoncan-compatible MockConnection + SimulatedECU/TCU
-  sim_runner.py        — Full GUI simulation harness + headless smoke test
+Run all simulations without hardware:
+    python -m tests.sim_ecu       ECU + flash + DID tests
+    python -m tests.sim_trans     TCU live data + decode tests
+    python -m tests               Run everything
 
-Quick start
-───────────
-  # Headless smoke test (no tkinter needed):
-  python -m tests.sim_runner --headless
-
-  # Full GUI in simulation mode (no hardware needed):
-  python -m tests.sim_runner
-  python -m tests.sim_runner --ecu SC8 --trans DQ250
-  python -m tests.sim_runner --ecu DL501
-
-  # Just the mock connection in your own code:
-  from tests.mock_connection import MockConnection, SimulatedECU, SimulatedTCU
-  from core.ecu_defs import SIMOS85
-  conn = MockConnection(SimulatedECU(SIMOS85))
+No hardware required. No network. No filesystem writes.
 """
+from __future__ import annotations
+import sys
+import os
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+
+def run_all() -> bool:
+    """Run all simulation test suites. Returns True if everything passes."""
+    from tests import sim_ecu, sim_trans
+    ok_ecu   = sim_ecu._print_results()
+    ok_trans = sim_trans._print_results()
+    return ok_ecu and ok_trans
+
+
+if __name__ == "__main__":
+    ok = run_all()
+    sys.exit(0 if ok else 1)
