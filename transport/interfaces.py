@@ -45,10 +45,10 @@ J2534       Any J2534 PassThru DLL (Windows only — DLL is 32-bit).
              or: C:/Windows/SysWOW64/RP1210/drewlinq.dll  (some variants)
              or: search registry: HKLM/SOFTWARE/WOW6432Node/PassThruSupport.04.04/
 
-    Ross-Tech HEX-NET / HEX-V2 (if J2534 mode enabled)
-        These are VCDS cables, not primarily flashing tools.
-        J2534 mode is available but rate-limited and not recommended for
-        large block flashes.
+    Ross-Tech HEX-NET / HEX-V2 — NOT SUPPORTED.
+        These are proprietary VCDS-only devices with no J2534 PassThru DLL.
+        Ross-Tech explicitly states they cannot emulate a pass-through interface
+        and are incompatible with any software other than VCDS.
 
 SocketCAN   Linux only. Requires a SocketCAN-compatible USB-CAN adapter
             (Peak PCAN, Kvaser, or similar) and the kernel iso-tp module.
@@ -113,11 +113,10 @@ J2534_DLL_CANDIDATES = [
         "VNCI 6154A (drewlinq variant)",
         r"C:\Windows\SysWOW64\RP1210\drewlinq.dll",
     ),
-    # Ross-Tech HEX-NET / HEX-V2 (J2534 mode)
-    (
-        "Ross-Tech HEX-NET/HEX-V2 J2534",
-        r"C:\Program Files (x86)\Ross-Tech\VCDS\J2534\rt_j2534.dll",
-    ),
+    # Ross-Tech HEX-NET and HEX-V2 are NOT J2534 compatible.
+    # They are proprietary VCDS-only devices. Ross-Tech explicitly states
+    # the HEX-NET cannot emulate a PassThru interface and is unlikely to
+    # work with any software other than VCDS. No DLL entry here.
 ]
 
 
