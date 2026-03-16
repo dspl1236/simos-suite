@@ -319,3 +319,23 @@ class LogSession:
                 time.sleep(sleep_time)
 
         log.info("LogSession loop exited")
+
+# ── Channel preset re-exports ─────────────────────────────────────────────────
+# Import these directly for convenience:
+#   from logger import PRESETS, CHANNELS_FUEL, CHANNELS_BOOST
+
+try:
+    from logger.channels_s85 import (
+        CHANNELS_ESSENTIAL,
+        CHANNELS_FUEL,
+        CHANNELS_BOOST,
+        CHANNELS_IGNITION,
+        CHANNELS_LEAN_DIAG,
+        CHANNELS_FULL,
+        PRESETS,
+    )
+except ImportError:
+    # channels_s85 not yet available — degrade gracefully
+    CHANNELS_ESSENTIAL = CHANNELS_FUEL = CHANNELS_BOOST = []
+    CHANNELS_IGNITION  = CHANNELS_LEAN_DIAG = CHANNELS_FULL = []
+    PRESETS = {}
