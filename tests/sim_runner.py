@@ -46,12 +46,33 @@ def _install_mock_patch(ecu_key: str = "S85", trans_key: str = "ZF8HP"):
     a MockConnection. Must be called before importing ui.main_window.
     """
     import flasher.uds_flash as flash_mod
-    from tests.mock_connection import (
-        MockConnection, SimulatedECU, SimulatedTCU,
-        make_mock_ecu_connection, make_mock_tcu_connection,
-    )
-    from core.trans_defs import TRANS_REGISTRY, TCU_REGISTRY, TCU_REGISTRY
-    from core.ecu_defs import ECU_REGISTRY
+    from tests.mock_connection import MockConnection, MockECU
+
+    _ECU_MAP = {
+        "S85": MockECU.SIMOS85, "SC1": MockECU.SIMOS85,
+        "SC2": MockECU.SIMOS85, "SC8": MockECU.SIMOS85,
+    }
+    _TCU_MAP = {
+        "ZF8HP": MockECU.ZF8HP,  "DL501": MockECU.ZF8HP,
+        "DQ250": MockECU.DQ250,  "DQ381": MockECU.DQ250,
+    }
+
+    def _mock_make(ecu_or_proxy, interface, interface_path=None,
+                   st_min_us=350_000, ble_bridge=None):
+        can_tx = getattr(ecu_or_proxy, "can_tx", 0)
+        if can_tx == 0x7E1:
+            variant = _TCU_MAP.get(trans_key.upper(), MockECU.ZF8HP)
+            log.info("[SIM] TCU MockConnection → %s (%s)", trans_key, variant.name)
+        else:
+            variant = _ECU_MAP.get(ecu_key.upper(), MockECU.SIMOS85)
+            log.info("[SIM] ECU MockConnection → %s (%s)", ecu_key, variant.name)
+        conn = MockConnection(variant, latency=0.012)
+        conn.open()
+        return conn
+
+    flash_mod._make_connection = _mock_make
+    log.info("[SIM] _make_connection patched with MockConnection")
+
 
     _real_make = flash_mod._make_connection
 
@@ -308,14 +329,12 @@ def run_headless(ecu_key: str = "S85", trans_key: str = "ZF8HP") -> bool:
     if trans is None:
         from core.ecu_defs import ZF8HP; trans = ZF8HP
 
-    # 2. Mock connection — ECU
+    # 2. Mock connection — ECU extended session
     try:
-        from tests.mock_connection import SimulatedECU, MockConnection
-        sim  = SimulatedECU(ecu)
-        conn = MockConnection(sim, latency_ms=0)
+        from tests.mock_connection import MockConnection, MockECU
+        conn = MockConnection(MockECU.SIMOS85, latency=0)
         conn.open()
-        req  = bytes([0x10, 0x03])   # extend session
-        conn.specific_send(req)
+        conn.specific_send(bytes([0x10, 0x03]))
         resp = conn.specific_wait_frame(timeout=2.0)
         assert resp[0] == 0x50, f"Expected 0x50, got {resp[0]:#04x}"
         conn.close()
@@ -323,30 +342,32 @@ def run_headless(ecu_key: str = "S85", trans_key: str = "ZF8HP") -> bool:
     except Exception as e:
         print(f"  FAIL mock ECU  — {e}"); ok = False
 
-    # 3. Mock connection — read DID F190 (VIN)
+    # 3. Mock connection — read VIN DID
     try:
-        from tests.mock_connection import SimulatedECU, MockConnection
-        conn = MockConnection(SimulatedECU(ecu), latency_ms=0)
+        from tests.mock_connection import MockConnection, MockECU
+        conn = MockConnection(MockECU.SIMOS85, latency=0)
         conn.open()
         conn.specific_send(bytes([0x22, 0xF1, 0x90]))
         resp = conn.specific_wait_frame(timeout=2.0)
-        assert resp[0] == 0x62, f"Expected 0x62 ReadDID response, got {resp[0]:#04x}"
+        assert resp[0] == 0x62, f"Expected 0x62, got {resp[0]:#04x}"
         vin = resp[3:20].decode("ascii", errors="replace").strip()
         print(f"  OK  mock DID   — VIN: {vin}")
         conn.close()
     except Exception as e:
         print(f"  FAIL mock DID  — {e}"); ok = False
 
-    # 4. Mock connection — TCU
+    # 4. Mock connection — TCU gear DID
     try:
-        from tests.mock_connection import SimulatedTCU, MockConnection
-        conn = MockConnection(SimulatedTCU(trans), latency_ms=0)
+        from tests.mock_connection import MockConnection, MockECU
+        tcu_v = MockECU.DQ250 if "DQ" in trans_key.upper() else MockECU.ZF8HP
+        conn = MockConnection(tcu_v, latency=0)
         conn.open()
-        conn.specific_send(bytes([0x22, 0x01, 0x80]))  # gear DID
+        conn.specific_send(bytes([0x22, 0x01, 0x80]))  # current gear
         resp = conn.specific_wait_frame(timeout=2.0)
         assert resp[0] == 0x62, f"Expected 0x62, got {resp[0]:#04x}"
-        gear = resp[3]
-        print(f"  OK  mock TCU   — gear DID 0x0180: {gear}")
+        g = resp[3]
+        gstr = {0xFF:"P",0xFE:"R",0xFD:"N",0xFC:"D"}.get(g, str(g))
+        print(f"  OK  mock TCU   — gear 0x0180: {gstr} ({g:#04x})")
         conn.close()
     except Exception as e:
         print(f"  FAIL mock TCU  — {e}"); ok = False
