@@ -51,11 +51,40 @@ def _noop(p: FlashProgress):
 # ─── Connection setup ─────────────────────────────────────────────────────────
 
 def _make_connection(ecu: ECUDef, interface: str, interface_path: Optional[str] = None,
-                     st_min_us: int = 350_000):
-    """Create a udsoncan connection for the given interface."""
+                     st_min_us: int = 350_000, ble_bridge=None):
+    """
+    Create a udsoncan connection for the given interface.
+
+    interface options:
+        "BLE"            — ESP32 BLE bridge (pass ble_bridge= a connected BLEBridge instance)
+        "J2534"          — J2534 DLL (Tactrix, VNCI, etc.)
+        "SocketCAN_can0" — Linux SocketCAN (replace can0 with your interface name)
+    """
     params = {"tx_padding": 0x55}
 
-    if interface.upper().startswith("SOCKETCAN"):
+    if interface.upper() == "BLE":
+        # ESP32 ISO-TP BLE bridge (esp32-isotp-ble-bridge-c7vag)
+        # ble_bridge must be a connected BLEBridge instance.
+        # Device name: "BLE_TO_ISOTP20" (configurable via BRG_SETTING_GAP)
+        # Service UUID: 0xABF0
+        # The bridge handles ISO-TP framing — we just send raw UDS frames.
+        if ble_bridge is None:
+            raise ValueError(
+                "interface='BLE' requires ble_bridge=<connected BLEBridge instance>. "
+                "Call BLEBridge.scan() + BLEBridge.connect() first."
+            )
+        from transport.ble_bridge import BLEBridgeConnection
+        # STmin: convert microseconds to ms for the bridge setting
+        stmin_ms = max(1, st_min_us // 1000)
+        ble_bridge.set_stmin(stmin_ms)
+        return BLEBridgeConnection(
+            bridge  = ble_bridge,
+            tx_id   = ecu.can_tx,
+            rx_id   = ecu.can_rx,
+            timeout = 5.0,
+        )
+
+    elif interface.upper().startswith("SOCKETCAN"):
         from udsoncan.connections import IsoTPSocketConnection
         iface = interface_path or interface.split("_", 1)[-1]
         conn = IsoTPSocketConnection(iface, rxid=ecu.can_rx, txid=ecu.can_tx, params=params)
@@ -63,7 +92,7 @@ def _make_connection(ecu: ECUDef, interface: str, interface_path: Optional[str] 
         return conn
 
     elif interface.upper() == "J2534":
-        # Uses the BridgeLEG ESP32 (or Tactrix / VNCI) via J2534 DLL
+        # J2534 DLL — Tactrix OpenPort 2.0, VNCI 6154A, etc.
         from lib.connections.j2534_connection import J2534Connection
         import math
         def _us_to_stmin(us):
@@ -79,7 +108,10 @@ def _make_connection(ecu: ECUDef, interface: str, interface_path: Optional[str] 
         )
 
     else:
-        raise ValueError(f"Unknown interface: '{interface}'. Use 'J2534' or 'SocketCAN_can0'.")
+        raise ValueError(
+            f"Unknown interface: '{interface}'. "
+            f"Use 'BLE', 'J2534', or 'SocketCAN_can0'."
+        )
 
 
 # ─── Security access ─────────────────────────────────────────────────────────

@@ -19,13 +19,24 @@ simos-suite/
 │   └── ecu_defs.py          ECU registry — FlashInfo, block layout, crypto,
 │                             SA2 scripts, CAN IDs for every supported ECU
 │
+├── transport/
+│   └── ble_bridge.py        BLE transport layer — connects to the ESP32
+│                             iso-tp-ble-bridge-c7vag over Bluetooth LE.
+│                             BLEBridge: scan, connect, disconnect, send,
+│                             raw sniff mode. BLEBridgeConnection: udsoncan-
+│                             compatible connection object, drop-in for J2534
+│                             or SocketCAN. GUI calls BLEBridge directly for
+│                             the connect/disconnect button.
+│
 ├── tuner/
 │   └── cal_parser.py        CAL block parser — decode/edit calibration tables,
 │                             checksum validation/fix, lean diagnosis helper
 │
 ├── flasher/
 │   └── uds_flash.py         UDS flash layer — connect, security access (SA2),
-│                             erase, download, transfer, verify
+│                             erase, download, transfer, verify.
+│                             _make_connection() now accepts interface="BLE",
+│                             "J2534", or "SocketCAN_can0"
 │
 ├── cp_tools/
 │   ├── j533_probe.py        J533 active DID probe — reads constellation data,
@@ -127,6 +138,11 @@ Once the ODX is parsed, `cp_tools/odx_parser.py` extracts:
 - [x] J533 active probe (`cp_tools/j533_probe.py`)
 - [x] ODX parser for CP protocol extraction (`cp_tools/odx_parser.py`)
 - [x] ESP32 BLE bridge fork with C7 VAG profile
+- [x] BLE transport layer with udsoncan connection interface (`transport/ble_bridge.py`)
+  - Scan, connect, disconnect with callbacks for GUI button state
+  - Packet framing matches firmware `ble_header_t` exactly (header ID 0xF1,
+    split packet reassembly, raw sniff frame routing via 0xCAFE)
+  - `_make_connection()` now accepts `interface="BLE"` alongside J2534/SocketCAN
 
 ### Phase 2 — Data capture
 - [ ] Live logger with configurable YAML channels (`logger/`)
@@ -162,10 +178,43 @@ Once the ODX is parsed, `cp_tools/odx_parser.py` extracts:
 ```
 udsoncan>=1.21
 python-can>=4.0
-bleak>=0.21       # BLE (for ESP32 bridge)
+bleak>=0.21        # BLE — ESP32 bridge client (transport/ble_bridge.py)
 numpy>=1.24
-pycryptodome      # AES for Simos12/18
-sa2_seed_key      # SA2 seed/key (bri3d/sa2_seed_key)
+pycryptodome       # AES for Simos12/18
+sa2_seed_key       # SA2 seed/key (bri3d/sa2_seed_key)
+```
+
+Install:
+```bash
+pip install udsoncan python-can bleak numpy pycryptodome
+pip install git+https://github.com/bri3d/sa2_seed_key.git
+```
+
+### BLE device identification
+
+The ESP32 bridge advertises as:
+- **Device name:** `BLE_TO_ISOTP20` (default — user-configurable via the
+  `BRG_SETTING_GAP` command, stored in NVS flash)
+- **Service UUID:** `0000ABF0-0000-1000-8000-00805F9B34FB`
+- **Data write characteristic:** `0xABF1` — tester sends UDS frames here
+- **Data notify characteristic:** `0xABF2` — ECU responses arrive here
+
+The Simos Tools app on the Play Store uses the same bridge firmware and
+advertises discovery by service UUID (`0xABF0`) rather than device name,
+which is more reliable if the GAP name has been customised. `BLEBridge.scan()`
+filters by name by default (`name_filter="BLE_TO_ISOTP20"`) but you can pass
+`name_filter=None` to return all BLE devices and identify by UUID manually,
+or scan for UUID directly:
+
+```python
+bridge = BLEBridge()
+# Scan by name (default)
+devices = bridge.scan(timeout=5.0)
+
+# Or scan everything and filter by service UUID yourself
+devices = bridge.scan(timeout=5.0, name_filter=None)
+devices = [d for d in devices
+           if "abf0" in str(d.device.metadata.get("uuids", [])).lower()]
 ```
 
 ---
