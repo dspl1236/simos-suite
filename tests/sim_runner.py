@@ -200,7 +200,18 @@ def simulate_flash_sequence(callback, total_bytes: int = 0x3C000,
     Run a simulated flash sequence that fires real FlashProgress callbacks
     at the same rate as a real flash, but 10× faster by default.
     """
-    from flasher.uds_flash import FlashProgress
+    try:
+        from flasher.uds_flash import FlashProgress
+    except ImportError:
+        # udsoncan not installed — use local stub
+        from dataclasses import dataclass
+        from typing import Optional as _Opt
+        @dataclass
+        class FlashProgress:
+            step: str
+            message: str
+            pct: int
+            block: _Opt[str] = None
 
     def _run():
         steps = [
