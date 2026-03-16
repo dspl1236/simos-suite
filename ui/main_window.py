@@ -456,7 +456,100 @@ class FlashTab(_Tab):
             messagebox.showerror("File error", str(e))
 
     def _do_read_cal(self):
-        self._log_line("read CAL: not yet implemented in backend\n", "dim")
+        """
+        Read the CAL block from the ECU via UDS ReadMemoryByAddress,
+        then hand the bytes to the Tune tab automatically.
+        """
+        if not self.mw.connected:
+            messagebox.showwarning("Not connected", "Connect an interface first.")
+            return
+        ecu = self.mw.ecu
+        if not ecu or not ecu.cal_block:
+            messagebox.showwarning("No ECU", "Select an ECU with a CAL block first.")
+            return
+
+        self._set_buttons(False)
+        self._log_line("reading CAL block from ECU...\n", "dim")
+        self._run(self._read_task)
+
+    def _read_task(self):
+        from flasher.uds_flash import _make_connection, FlashProgress
+        import udsoncan
+
+        def cb(p):
+            self._ui(self._update_progress, p)
+
+        ecu      = self.mw.ecu
+        blk      = ecu.cal_block
+        conn     = None
+
+        try:
+            conn = _make_connection(
+                ecu,
+                self.mw.interface,
+                interface_path = self.mw.iface_path,
+                ble_bridge     = self.mw.ble_bridge,
+            )
+
+            cfg = dict(udsoncan.configs.default_client_config)
+            cfg["request_timeout"] = 30
+
+            with udsoncan.Client(conn, request_timeout=30, config=cfg) as client:
+                cb(FlashProgress("CONNECT", "Opening extended session...", 5))
+                client.change_session(
+                    udsoncan.services.DiagnosticSessionControl
+                    .Session.extendedDiagnosticSession)
+
+                cb(FlashProgress("CONNECT", f"Reading CAL block {blk.number} "
+                                            f"({blk.length:#x} bytes)...", 10))
+
+                # Read in chunks via ReadMemoryByAddress (0x23)
+                CHUNK   = 0x7F0
+                cal     = bytearray()
+                addr    = blk.base_addr
+                remain  = blk.length
+
+                while remain > 0:
+                    size   = min(CHUNK, remain)
+                    pct    = 10 + int(85 * (blk.length - remain) / blk.length)
+                    cb(FlashProgress("TRANSFER",
+                                     f"0x{addr:08X}  {blk.length-remain:#x}/{blk.length:#x}",
+                                     pct, "CAL"))
+
+                    resp = client.read_memory_by_address(
+                        udsoncan.MemoryLocation(addr, size, 32, 32))
+                    chunk_bytes = resp.service_data.memory_block
+                    cal.extend(chunk_bytes)
+                    addr   += len(chunk_bytes)
+                    remain -= len(chunk_bytes)
+
+                cal_bytes = bytes(cal)
+                cb(FlashProgress("DONE", f"Read {len(cal_bytes):,} bytes", 100, "CAL"))
+
+            # Hand off to Tune tab
+            self._ui(self._read_done, cal_bytes, ecu.name)
+
+        except Exception as e:
+            self._ui(self._flash_error, str(e))
+
+    def _read_done(self, cal_bytes: bytes, ecu_name: str):
+        self._set_buttons(True)
+        self._cal_bytes = cal_bytes
+        sz = len(cal_bytes)
+        self._cal_path.set(f"ECU read  ({sz:,} bytes)")
+        self._file_info.config(
+            text=f"read from {ecu_name}  ({sz/1024:.1f} KB)",
+            fg=C["green"])
+        if self.mw.connected:
+            self._write_btn.config(state="normal")
+            self._verify_btn.config(state="normal")
+        self._log_line(f"read OK — {sz:,} bytes\n", "ok")
+        # Hand to Tune tab
+        for tab in self.mw._tabs:
+            if hasattr(tab, "load_bytes"):
+                tab.load_bytes(cal_bytes, f"ECU-read_{ecu_name}.bin")
+                self._log_line("loaded into Tune tab automatically\n", "ok")
+                break
 
     def _do_write_cal(self):
         if not self._cal_bytes:
@@ -1584,6 +1677,8 @@ class MainWindow(tk.Tk):
         self._conn_lbl.config(text=f"connected  {label}", fg=C["green"])
         for tab in self._tabs[1:]:     # all except ConnectTab itself
             tab.on_connect()
+        # If Tune tab has no data yet and we have a synthetic CAL (sim mode),
+        # the sim_runner will call load_bytes() directly after connect.
 
     def _on_disconnected(self):
         self._conn_dot.config(fg=C["dim"])
