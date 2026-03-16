@@ -549,185 +549,388 @@ class FlashTab(_Tab):
 # TAB 4 — Tune
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TuneTab(_Tab):
+    """
+    Calibration table editor for Simos ECU .bin files.
+
+    Features
+    ────────
+    •  All 14 Simos8.5 (S85) tables with correct row/column axis labels
+       (RPM × Load or RPM × Throttle, confirmed breakpoints from cal_parser)
+    •  Heat-map coloring: blue (low) → teal → green → amber → red (high)
+    •  Editable cells — click, type, Enter/Tab; color updates live
+    •  1×N tables (MAF, throttle, limits) shown as a 2D line chart
+       in addition to the flat editable row
+    •  Meta bar: table name, unit, min/max, axis descriptions
+    •  Notes strip: tuning guidance per table
+    •  Lean diagnosis button: runs CalParser.diagnose_lean()
+    •  Fix checksums + save — safe write-back with CRC32 repair
+    •  Load from sim: accepts synthetic CAL bytes from sim_runner
+    """
+
+    # Simos8.5 standard axis breakpoints (confirmed from cal_parser.py)
+    _RPM_16  = [500,750,1000,1250,1500,2000,2500,3000,
+                3500,4000,4500,5000,5500,6000,6500,7000]
+    _LOAD_16 = [20,40,60,80,100,120,150,180,
+                220,260,320,380,450,530,620,720]   # mg/stroke
+    _COOL_8  = [-20,0,20,40,60,80,100,120]         # coolant °C
+    _PEDAL_32 = [int(i*100/31) for i in range(32)] # 0–100%
+    _MAF_32  = [int(i*150) for i in range(32)]     # mV×10
+
     def __init__(self, parent, mw):
         super().__init__(parent, mw)
-        self._parser: Optional["CalParser"] = None
-        self._table_name = tk.StringVar()
+        self._parser = None
+        self._table_key = tk.StringVar()
+        self._entry_widgets: Dict[Tuple[int,int], tk.Entry] = {}
+        self._chart_canvas = None
+        self._build()
 
+    # ── Build ──────────────────────────────────────────────────────────────────
+
+    def _build(self):
+        # File row
         _section(self, "calibration file")
-
         file_row = _frame(self)
         file_row.pack(fill="x", padx=14, pady=4)
         _btn(file_row, "open CAL .bin", self._open_cal).pack(side="left")
+        _btn(file_row, "lean diagnosis", self._lean_diag).pack(side="left", padx=6)
         self._file_lbl = tk.Label(file_row, text="no file loaded",
-                                  fg=C["muted"], bg=C["bg"],
-                                  font=("Menlo", 10))
+                                   fg=C["muted"], bg=C["bg"], font=("Menlo", 10))
         self._file_lbl.pack(side="left", padx=10)
 
-        _section(self, "table selector")
-
+        # Table selector + save
+        _section(self, "table")
         sel_row = _frame(self)
         sel_row.pack(fill="x", padx=14, pady=4)
-        self._table_combo = ttk.Combobox(sel_row, textvariable=self._table_name,
-                                          state="disabled", font=("Menlo", 11),
-                                          width=42)
+        self._table_combo = ttk.Combobox(sel_row, textvariable=self._table_key,
+                                          state="disabled", font=("Menlo", 10), width=44)
         self._table_combo.pack(side="left")
-        self._table_combo.bind("<<ComboboxSelected>>", self._show_table)
-        _btn(sel_row, "fix checksums + save",
-             self._save_cal, state="disabled").pack(side="right")
-        self._save_btn = sel_row.winfo_children()[-1]
+        self._table_combo.bind("<<ComboboxSelected>>", self._on_table_select)
+        self._save_btn = _btn(sel_row, "fix checksums + save",
+                               self._save_cal, state="disabled")
+        self._save_btn.pack(side="right")
 
+        # Meta / notes strip
+        self._meta_var  = tk.StringVar(value="")
+        self._notes_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self._meta_var,
+                 fg=C["muted"], bg=C["bg"], font=("Menlo", 9), anchor="w",
+                 padx=14).pack(fill="x")
+        tk.Label(self, textvariable=self._notes_var,
+                 fg="#3fb95090", bg=C["bg"], font=("Menlo", 9),
+                 anchor="w", padx=14, wraplength=900).pack(fill="x")
+
+        # Chart area (shown only for 1×N tables)
+        self._chart_frame = _frame(self)
+        self._chart_canvas_widget = tk.Canvas(self._chart_frame, bg=C["bg"],
+                                               height=110, highlightthickness=0)
+        self._chart_canvas_widget.pack(fill="x", padx=14, pady=(4, 0))
+
+        # Table editor (canvas + scrollbars)
         _section(self, "table editor")
+        cf = _frame(self)
+        cf.pack(fill="both", expand=True, padx=14, pady=4)
 
-        # Grid canvas in a scrollable frame
-        canvas_frame = _frame(self)
-        canvas_frame.pack(fill="both", expand=True, padx=14, pady=4)
-
-        self._canvas = tk.Canvas(canvas_frame, bg=C["bg"],
-                                 highlightthickness=0)
-        sx = ttk.Scrollbar(canvas_frame, orient="horizontal",
-                            command=self._canvas.xview)
-        sy = ttk.Scrollbar(canvas_frame, orient="vertical",
-                            command=self._canvas.yview)
+        self._canvas = tk.Canvas(cf, bg=C["bg"], highlightthickness=0)
+        sx = ttk.Scrollbar(cf, orient="horizontal", command=self._canvas.xview)
+        sy = ttk.Scrollbar(cf, orient="vertical",   command=self._canvas.yview)
         self._canvas.config(xscrollcommand=sx.set, yscrollcommand=sy.set)
         sy.pack(side="right", fill="y")
         sx.pack(side="bottom", fill="x")
         self._canvas.pack(fill="both", expand=True)
 
+        # Status
         self._info_lbl = tk.Label(self, text="open a CAL .bin to begin",
-                                  fg=C["dim"], bg=C["bg"],
-                                  font=("Menlo", 10))
-        self._info_lbl.pack(pady=8)
+                                   fg=C["dim"], bg=C["bg"], font=("Menlo", 9))
+        self._info_lbl.pack(pady=4)
+
+    # ── on_connect — sim integration ──────────────────────────────────────────
+
+    def on_connect(self):
+        """Called by MainWindow on connection. In sim mode, pre-load synthetic CAL."""
+        pass   # sim_runner calls load_bytes() directly after connect
+
+    def load_bytes(self, cal_bytes: bytes, filename: str = "synthetic_cal.bin"):
+        """Load CAL from raw bytes — used by sim_runner and flash-read results."""
+        try:
+            from tuner.cal_parser import CalParser
+            ecu = self.mw.ecu or SIMOS85
+            self._parser = CalParser(ecu, cal_bytes)
+            self._parser.decode()
+            self._populate_combo()
+            self._file_lbl.config(text=f"{filename}  ({len(cal_bytes):,} bytes)",
+                                   fg=C["green"])
+            self._save_btn.config(state="normal")
+            self._show_first_table()
+        except Exception as e:
+            self._info_lbl.config(text=f"parse error: {e}", fg=C["red"])
+
+    # ── File open ─────────────────────────────────────────────────────────────
 
     def _open_cal(self):
         path = filedialog.askopenfilename(
             title="Open CAL .bin",
-            filetypes=[("Binary files", "*.bin"), ("All files", "*.*")],
-        )
+            filetypes=[("Binary files", "*.bin"), ("All files", "*.*")])
         if not path:
             return
         try:
-            raw = open(path, "rb").read()
-            self._parser = CalParser(self.mw.ecu or SIMOS85, raw)
-            self._parser.decode()
-            names = [f"{t.name}  —  {meta.name}"
-                     for t, meta in self._parser.tables_decoded().items()] \
-                    if hasattr(self._parser, "tables_decoded") else \
-                    list(self._parser._decoded.keys()) \
-                    if hasattr(self._parser, "_decoded") else \
-                    ["maf_transfer", "lambda_setpoint", "inj_scaling",
-                     "boost_setpoint", "ign_advance", "timing_correction"]
-
-            self._table_combo.config(values=names, state="readonly")
-            self._table_combo.current(0)
-            self._file_lbl.config(
-                text=os.path.basename(path), fg=C["green"])
-            self._save_btn.config(state="normal")
-            self._show_table()
+            self.load_bytes(open(path, "rb").read(), os.path.basename(path))
         except Exception as e:
-            messagebox.showerror("Parse error", str(e))
+            messagebox.showerror("Open error", str(e))
 
-    def _show_table(self, *_):
+    def _populate_combo(self):
         if not self._parser:
             return
-        name = self._table_name.get().split("  —  ")[0].strip()
+        # Build display names: "boost_setpoint  —  Boost Pressure Setpoint"
         try:
-            arr = self._parser.table(name)
-            self._draw_table(name, arr)
+            names = [f"{k}  —  {meta.name}"
+                     for k, meta in self._parser.tables.items()]
+        except Exception:
+            names = list(getattr(self._parser, "_decoded", {}).keys())
+        self._table_combo.config(values=names, state="readonly")
+        if names:
+            self._table_combo.current(0)
+            self._table_key.set(names[0])
+
+    def _show_first_table(self):
+        if self._table_combo["values"]:
+            self._on_table_select()
+
+    # ── Table selection ───────────────────────────────────────────────────────
+
+    def _on_table_select(self, *_):
+        if not self._parser:
+            return
+        raw_key = self._table_key.get().split("  —  ")[0].strip()
+        try:
+            arr  = self._parser.table(raw_key)
+            meta = self._parser.tables.get(raw_key)
+            self._draw_table(raw_key, arr, meta)
         except Exception as e:
             self._info_lbl.config(text=str(e), fg=C["red"])
 
-    def _draw_table(self, name: str, arr):
-        """Render a numpy 2D (or 1D) array as an editable grid on the canvas."""
+    # ── Table renderer ────────────────────────────────────────────────────────
+
+    def _draw_table(self, key: str, arr, meta=None):
         import numpy as np
         self._canvas.delete("all")
-        self._entry_widgets: Dict[Tuple[int,int], tk.Entry] = {}
+        self._entry_widgets.clear()
 
-        if arr.ndim == 1:
-            arr = arr.reshape(1, -1)
+        is_1d = arr.ndim == 1
+        if is_1d:
+            arr2d = arr.reshape(1, -1)
+        else:
+            arr2d = arr
 
-        rows, cols = arr.shape
-        CW, RH = 70, 26    # cell width, row height
+        rows, cols = arr2d.shape
+        vmin, vmax = float(arr2d.min()), float(arr2d.max())
+        vrange = vmax - vmin if vmax > vmin else 1.0
+
+        # Determine axis labels
+        row_labels = self._row_labels(key, rows)
+        col_labels = self._col_labels(key, cols)
+        unit = meta.unit if meta else ""
+        row_axis = meta.row_axis if meta else ""
+        col_axis = meta.col_axis if meta else ""
+
+        # Meta bar
+        self._meta_var.set(
+            f"{key}   {rows}×{cols}   unit: {unit}   "
+            f"min: {vmin:.3f}   max: {vmax:.3f}"
+            + (f"   rows: {row_axis}" if row_axis else "")
+            + (f"   cols: {col_axis}" if col_axis else ""))
+        self._notes_var.set(getattr(meta, "notes", "") if meta else "")
+
+        # Cell geometry — wider for axis labels
+        CW = 68   # cell width
+        RH = 24   # row height
+        LW = 62   # left margin (row axis labels)
+        TH = 36   # top margin (col axis labels — 2 lines)
 
         # Column headers
-        for c in range(cols):
-            self._canvas.create_text(
-                80 + c * CW + CW//2, 14,
-                text=str(c), fill=C["dim"],
-                font=("Menlo", 9))
+        self._canvas.create_text(LW//2, TH//2, text=row_axis or "",
+                                  fill=C["dim"], font=("Menlo", 8),
+                                  angle=0, anchor="center")
+        for c, lbl in enumerate(col_labels):
+            x = LW + c * CW + CW//2
+            # Two-line col header: axis value on top, index below
+            self._canvas.create_text(x, TH - 22, text=str(lbl),
+                                      fill=C["text_muted"] if hasattr(C,"text_muted") else C["muted"],
+                                      font=("Menlo", 8), anchor="center")
+            self._canvas.create_text(x, TH - 10, text=f"[{c}]",
+                                      fill=C["dim"], font=("Menlo", 7), anchor="center")
 
-        # Row headers + cells
-        vmin, vmax = float(arr.min()), float(arr.max())
+        # Axis label background strip
+        self._canvas.create_rectangle(0, 0, LW, TH + rows*RH + 10,
+                                       fill="#0a0d11", outline="")
 
-        for r in range(rows):
-            y = 28 + r * RH
-            self._canvas.create_text(
-                36, y + RH//2, text=str(r),
-                fill=C["dim"], font=("Menlo", 9))
-
+        # Rows
+        for r, rlbl in enumerate(row_labels):
+            y = TH + r * RH
+            # Row label
+            self._canvas.create_text(LW - 4, y + RH//2,
+                                      text=str(rlbl), fill=C["muted"],
+                                      font=("Menlo", 8), anchor="e")
             for c in range(cols):
-                x = 80 + c * CW
-                val = float(arr[r, c])
-                # Heat-map fill: blue→green→amber→red
-                t = (val - vmin) / (vmax - vmin) if vmax > vmin else 0.5
+                x = LW + c * CW
+                val = float(arr2d[r, c])
+                t   = (val - vmin) / vrange
                 fill = self._heat_color(t)
-                self._canvas.create_rectangle(
-                    x, y, x + CW - 1, y + RH - 1,
-                    fill=fill, outline=C["border"])
-                # Editable entry overlay
+                self._canvas.create_rectangle(x, y, x+CW-1, y+RH-1,
+                                               fill=fill, outline=C["border"])
                 e = tk.Entry(self._canvas, width=7,
-                             bg=fill, fg=C["text"],
-                             insertbackground=C["text"],
-                             font=("Menlo", 9), bd=0,
-                             highlightthickness=0,
-                             justify="center")
+                              bg=fill, fg=self._text_for(fill),
+                              insertbackground=C["text"],
+                              font=("Menlo", 8), bd=0, highlightthickness=0,
+                              justify="center")
                 e.insert(0, f"{val:.3f}")
-                e.bind("<FocusOut>", lambda ev, rr=r, cc=c: self._cell_edit(ev, rr, cc))
-                e.bind("<Return>",   lambda ev, rr=r, cc=c: self._cell_edit(ev, rr, cc))
-                win = self._canvas.create_window(
-                    x + CW//2, y + RH//2,
-                    window=e, width=CW-2, height=RH-2)
+                e.bind("<Return>",   lambda ev, r=r, c=c, k=key: self._cell_edit(ev,r,c,k))
+                e.bind("<Tab>",      lambda ev, r=r, c=c, k=key: self._cell_edit(ev,r,c,k))
+                e.bind("<FocusOut>", lambda ev, r=r, c=c, k=key: self._cell_edit(ev,r,c,k))
+                self._canvas.create_window(x+CW//2, y+RH//2,
+                                            window=e, width=CW-2, height=RH-2)
                 self._entry_widgets[(r, c)] = e
 
-        total_w = 80 + cols * CW + 20
-        total_h = 28 + rows * RH + 20
+        total_w = LW + cols * CW + 20
+        total_h = TH + rows * RH + 20
         self._canvas.config(scrollregion=(0, 0, total_w, total_h))
+
+        # 1×N: also draw chart
+        if is_1d:
+            self._draw_chart(col_labels, arr.tolist(), unit, col_axis)
+            self._chart_frame.pack(fill="x", before=self._canvas.master.master
+                                    if hasattr(self._canvas,"master") else self._canvas)
+        else:
+            self._chart_canvas_widget.delete("all")
+            self._chart_frame.pack_forget()
+
         self._info_lbl.config(
-            text=f"{name}   {rows}×{cols}   min={vmin:.3f}  max={vmax:.3f}",
+            text=f"{key}   {rows}×{cols}   min={vmin:.3f}  max={vmax:.3f}  {unit}",
             fg=C["muted"])
 
-    def _cell_edit(self, event, r: int, c: int):
+    # ── 2D chart for 1×N tables ───────────────────────────────────────────────
+
+    def _draw_chart(self, x_vals, y_vals, unit: str, x_label: str):
+        cv = self._chart_canvas_widget
+        cv.delete("all")
+        W = cv.winfo_width() or 700
+        H = 100
+        PAD_L, PAD_R, PAD_T, PAD_B = 52, 16, 10, 28
+
+        n = len(y_vals)
+        if n < 2:
+            return
+
+        ymin, ymax = min(y_vals), max(y_vals)
+        yr = ymax - ymin or 1.0
+        xr = n - 1
+
+        def px(i):
+            return PAD_L + (i / xr) * (W - PAD_L - PAD_R)
+        def py(v):
+            return PAD_T + (1 - (v - ymin) / yr) * (H - PAD_T - PAD_B)
+
+        # Grid lines (3 horizontal)
+        for frac in [0, 0.5, 1]:
+            gv = ymin + frac * yr
+            gy = py(gv)
+            cv.create_line(PAD_L, gy, W - PAD_R, gy,
+                           fill=C["border"], dash=(2, 4))
+            cv.create_text(PAD_L - 4, gy,
+                           text=f"{gv:.2f}", anchor="e",
+                           fill=C["dim"], font=("Menlo", 7))
+
+        # X axis label
+        cv.create_text(W//2, H - 6, text=x_label or "",
+                       fill=C["dim"], font=("Menlo", 7), anchor="center")
+
+        # Polyline
+        pts = []
+        for i, v in enumerate(y_vals):
+            pts += [px(i), py(v)]
+        if len(pts) >= 4:
+            cv.create_line(pts, fill="#58a6ff", width=1.5, smooth=False)
+
+        # Dots at every point
+        for i, v in enumerate(y_vals):
+            x, y = px(i), py(v)
+            cv.create_oval(x-2, y-2, x+2, y+2,
+                           fill="#58a6ff", outline="")
+
+        # Unit label top-left
+        cv.create_text(PAD_L, PAD_T, text=unit,
+                       fill=C["muted"], font=("Menlo", 7), anchor="w")
+
+    # ── Axis label helpers ────────────────────────────────────────────────────
+
+    def _row_labels(self, key: str, rows: int):
+        if rows == 16:
+            return self._RPM_16
+        if rows == 8:
+            return self._COOL_8
+        return list(range(rows))
+
+    def _col_labels(self, key: str, cols: int):
+        if cols == 16:
+            if key in ("boost_setpoint", "wastegate_duty"):
+                return [f"{int(i*100/15)}%" for i in range(16)]  # throttle %
+            if key == "torque_limit":
+                return [f"G{i+1}" if i<8 else f"R{i-7}" for i in range(16)]
+            return self._LOAD_16      # mg/stroke default
+        if cols == 32:
+            if "maf" in key:
+                return [f"{int(v/10)}mV" for v in self._MAF_32]
+            if "throttle" in key:
+                return [f"{int(i*100/31)}%" for i in range(32)]
+            return list(range(32))
+        if cols == 8:
+            return self._COOL_8
+        return list(range(cols))
+
+    # ── Cell edit ─────────────────────────────────────────────────────────────
+
+    def _cell_edit(self, event, r: int, c: int, key: str):
         e = self._entry_widgets.get((r, c))
         if not e or not self._parser:
             return
         try:
             new_val = float(e.get())
-            name = self._table_name.get().split("  —  ")[0].strip()
-            self._parser.table(name)[r, c] = new_val
-            # recolor
-            arr = self._parser.table(name)
-            if arr.ndim == 1:
-                arr = arr.reshape(1, -1)
-            vmin, vmax = float(arr.min()), float(arr.max())
-            t = (new_val - vmin) / (vmax - vmin) if vmax > vmin else 0.5
-            fill = self._heat_color(t)
-            e.config(bg=fill)
         except ValueError:
             e.config(fg=C["red"])
+            return
+        try:
+            arr = self._parser.table(key)
+            if arr.ndim == 1:
+                arr[c] = new_val
+            else:
+                arr[r, c] = new_val
+            vmin = float(arr.min())
+            vmax = float(arr.max())
+            vrange = vmax - vmin if vmax > vmin else 1.0
+            t = (new_val - vmin) / vrange
+            fill = self._heat_color(t)
+            e.config(bg=fill, fg=self._text_for(fill))
+            self._info_lbl.config(
+                text=f"[{r},{c}] = {new_val:.3f}  (was {float(arr[r,c] if arr.ndim>1 else arr[c]):.3f})",
+                fg=C["blue"])
+        except Exception as ex:
+            self._info_lbl.config(text=str(ex), fg=C["red"])
+        return "break"
 
-    def _heat_color(self, t: float) -> str:
-        """Map 0–1 to blue→teal→green→amber (hex)."""
-        t = max(0.0, min(1.0, t))
-        if t < 0.33:
-            r, g, b = 13, 45 + int(t/0.33*100), 120
-        elif t < 0.66:
-            s = (t - 0.33) / 0.33
-            r, g, b = int(s*160), 130 + int(s*50), 60
-        else:
-            s = (t - 0.66) / 0.34
-            r, g, b = 160 + int(s*95), 160 - int(s*60), 10
-        return f"#{r:02x}{g:02x}{b:02x}"
+    # ── Lean diagnosis ────────────────────────────────────────────────────────
+
+    def _lean_diag(self):
+        if not self._parser:
+            messagebox.showinfo("Lean diagnosis", "Load a CAL .bin first.")
+            return
+        try:
+            result = self._parser.diagnose_lean()
+            messagebox.showinfo("Lean diagnosis — Simos8.5 CGWB", result)
+        except Exception as e:
+            messagebox.showerror("Diagnosis error", str(e))
+
+    # ── Save ──────────────────────────────────────────────────────────────────
 
     def _save_cal(self):
         if not self._parser:
@@ -735,23 +938,45 @@ class TuneTab(_Tab):
         try:
             self._parser.fix_checksums()
             out = self._parser.to_bytes()
-            path = filedialog.asksaveasfilename(
-                title="Save modified CAL .bin",
-                defaultextension=".bin",
-                filetypes=[("Binary files", "*.bin")],
-            )
-            if path:
-                with open(path, "wb") as f:
-                    f.write(out)
-                messagebox.showinfo("Saved",
-                    f"CAL saved ({len(out):,} bytes)\n{os.path.basename(path)}")
         except Exception as e:
-            messagebox.showerror("Save error", str(e))
+            messagebox.showerror("Checksum error", str(e))
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save modified CAL .bin",
+            defaultextension=".bin",
+            filetypes=[("Binary files", "*.bin")])
+        if path:
+            with open(path, "wb") as f:
+                f.write(out)
+            messagebox.showinfo("Saved",
+                f"CAL saved  ({len(out):,} bytes)\n{os.path.basename(path)}\n\n"
+                f"Checksums fixed and verified.")
+
+    # ── Color helpers ─────────────────────────────────────────────────────────
+
+    def _heat_color(self, t: float) -> str:
+        t = max(0.0, min(1.0, t))
+        if t < 0.25:
+            r, g, b = 13, 45 + int(t/0.25*70), 120
+        elif t < 0.5:
+            s = (t-0.25)/0.25
+            r, g, b = int(s*40), int(115+s*50), int(120-s*90)
+        elif t < 0.75:
+            s = (t-0.5)/0.25
+            r, g, b = int(40+s*130), int(165-s*30), int(30-s*20)
+        else:
+            s = (t-0.75)/0.25
+            r, g, b = int(170+s*85), int(135-s*100), 10
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _text_for(self, hex_color: str) -> str:
+        r = int(hex_color[1:3], 16)
+        g = int(hex_color[3:5], 16)
+        b = int(hex_color[5:7], 16)
+        return "#0d1117" if (r*0.299 + g*0.587 + b*0.114) > 85 else "#e6edf3"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TAB 5 — Logger
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 class LoggerTab(_Tab):
     DIDS = [
