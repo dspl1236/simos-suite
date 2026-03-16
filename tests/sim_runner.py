@@ -50,7 +50,7 @@ def _install_mock_patch(ecu_key: str = "S85", trans_key: str = "ZF8HP"):
         MockConnection, SimulatedECU, SimulatedTCU,
         make_mock_ecu_connection, make_mock_tcu_connection,
     )
-    from core.trans_defs import TRANS_REGISTRY
+    from core.trans_defs import TRANS_REGISTRY, TCU_REGISTRY, TCU_REGISTRY
     from core.ecu_defs import ECU_REGISTRY
 
     _real_make = flash_mod._make_connection
@@ -292,6 +292,8 @@ def run_headless(ecu_key: str = "S85", trans_key: str = "ZF8HP") -> bool:
     ok = True
 
     # 1. Core definitions
+    ecu   = None
+    trans = None
     try:
         from core.ecu_defs import ECU_REGISTRY, get_ecu, SIMOS85
         from core.trans_defs import TRANS_REGISTRY, get_trans, ZF8HP
@@ -301,6 +303,10 @@ def run_headless(ecu_key: str = "S85", trans_key: str = "ZF8HP") -> bool:
         print(f"  OK  core defs  — TCU: {trans.name}")
     except Exception as e:
         print(f"  FAIL core defs — {e}"); ok = False
+    if ecu is None:
+        from core.ecu_defs import SIMOS85; ecu = SIMOS85
+    if trans is None:
+        from core.ecu_defs import ZF8HP; trans = ZF8HP
 
     # 2. Mock connection — ECU
     try:
