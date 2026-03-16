@@ -1168,54 +1168,79 @@ class LoggerTab(_Tab):
             self._run(self._poll_loop)
 
     def _poll_loop(self):
-        """
-        Poll configured DIDs in a loop.
-        In production this connects via _make_connection() and uses
-        udsoncan client.read_data_by_identifier().
-        Simulated here until live logger module is built.
-        """
-        import random, math
-        t0 = time.time()
-        while self._running and self.mw.connected:
-            t = time.time() - t0
-            row = {}
+        """Real LogSession-backed poll loop using logger.LogSession."""
+        from logger import LogSession, SIMOS85_CHANNELS, Channel
+
+        # Build channel list matching our gauge DIDs
+        did_map = {did: name for did, name in self.DIDS}
+        channels = [ch for ch in SIMOS85_CHANNELS if ch.did in did_map]
+        # Add any gauge DIDs not in SIMOS85_CHANNELS as raw channels
+        known_dids = {ch.did for ch in channels}
+        for did, name in self.DIDS:
+            if did not in known_dids:
+                channels.append(Channel(did, name, "", 1.0, 0.0, 2, False, "{:.2f}"))
+
+        session = LogSession(
+            ecu         = self.mw.ecu,
+            interface   = self.mw.interface,
+            iface_path  = self.mw.iface_path,
+            ble_bridge  = getattr(self.mw, "ble_bridge", None),
+            channels    = channels,
+            interval_ms = self._interval_var.get(),
+        )
+
+        self._log_session = session
+
+        def on_row(row):
+            if not self._running:
+                return
+            ts = row.wall_time
+            parts = []
             for did, name in self.DIDS:
-                # Simulated values — replace with real UDS reads
-                if "RPM" in name:
-                    v = 800 + 3200 * abs(math.sin(t * 0.3))
-                elif "Boost" in name:
-                    v = 101 + 120 * max(0, math.sin(t * 0.3))
-                elif "MAF" in name:
-                    v = 5 + 80 * max(0, math.sin(t * 0.3))
-                elif "Lambda" in name:
-                    v = 1.0 + 0.05 * math.sin(t * 1.2)
-                elif "Battery" in name:
-                    v = 13.8 + 0.2 * math.sin(t)
-                elif "IAT" in name:
-                    v = 25 + 5 * math.sin(t * 0.1)
-                elif "Throttle" in name:
-                    v = 10 + 70 * max(0, math.sin(t * 0.3))
-                else:
-                    v = random.uniform(0, 100)
-                row[did] = v
-                self._ui(self._values[did].set, f"{v:.2f}")
-
-            ts = time.strftime("%H:%M:%S")
-            vals = ",".join(f"{row[did]:.3f}" for did, _ in self.DIDS)
+                v = row.values.get(did)
+                ch = next((c for c in channels if c.did == did), None)
+                display = ch.format(v) if ch else ("—" if v is None else f"{v:.2f}")
+                self._ui(self._values[did].set, display)
+                if v is not None and len(parts) < 6:
+                    parts.append(f"{name[:7]}={display}")
+            line = f"{ts}  " + "  ".join(parts) + "
+"
+            self._ui(self._append_log, self._log, line, "val")
+            # Build CSV row
+            vals = ",".join(
+                ch.format(row.values.get(ch.did)) for ch in channels)
             self._csv_rows.append(f"{ts},{vals}")
-            self._ui(self._append_log, self._log,
-                     f"{ts}  " + "  ".join(
-                         f"{n[:6]}={row[d]:.1f}" for d, n in self.DIDS[:6]
-                     ) + "\n", "val")
 
-            interval = self._interval_var.get() / 1000
-            time.sleep(interval)
+        session.start(callback=on_row)
+
+        # Wait until stopped
+        while self._running and self.mw.connected and not session.error:
+            time.sleep(0.1)
+
+        session.stop()
+
+        if session.error:
+            self._ui(self._append_log, self._log,
+                     f"error: {session.error}
+", "err")
 
         self._ui(self._start_btn.config, text="start logging",
                  fg="#0d1117", bg=C["blue"])
         self._running = False
 
     def _save_csv(self):
+        session = getattr(self, "_log_session", None)
+        if session and session.rows():
+            path = filedialog.asksaveasfilename(
+                title="Save log CSV",
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv")],
+            )
+            if path:
+                n = session.save_csv(path)
+                messagebox.showinfo("Saved",
+                    f"{n:,} rows saved\n{os.path.basename(path)}")
+            return
         if not self._csv_rows:
             messagebox.showinfo("Nothing to save", "Start logging first.")
             return
