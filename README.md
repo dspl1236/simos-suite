@@ -190,31 +190,84 @@ pip install udsoncan python-can bleak numpy pycryptodome
 pip install git+https://github.com/bri3d/sa2_seed_key.git
 ```
 
-### BLE device identification
+### BLE bridge — device identification and protocol
 
-The ESP32 bridge advertises as:
-- **Device name:** `BLE_TO_ISOTP20` (default — user-configurable via the
-  `BRG_SETTING_GAP` command, stored in NVS flash)
-- **Service UUID:** `0000ABF0-0000-1000-8000-00805F9B34FB`
-- **Data write characteristic:** `0xABF1` — tester sends UDS frames here
-- **Data notify characteristic:** `0xABF2` — ECU responses arrive here
+**Confirmed from firmware source (`ble_server.c`, `ble_server.h`, `constants.h`):**
 
-The Simos Tools app on the Play Store uses the same bridge firmware and
-advertises discovery by service UUID (`0xABF0`) rather than device name,
-which is more reliable if the GAP name has been customised. `BLEBridge.scan()`
-filters by name by default (`name_filter="BLE_TO_ISOTP20"`) but you can pass
-`name_filter=None` to return all BLE devices and identify by UUID manually,
-or scan for UUID directly:
+| Item | Value |
+|---|---|
+| Service UUID | `0xABF0` |
+| Write characteristic (tester → ESP32) | `0xABF1` |
+| Notify characteristic (ESP32 → tester) | `0xABF2` |
+| Command characteristic (settings) | `0xABF3` |
+| Status characteristic | `0xABF4` |
+| Default GAP name | `BLE_TO_ISOTP20` (14 chars max) |
+
+The Simos Tools APK (Play Store) uses the same firmware. It identifies devices
+by service UUID `0xABF0`, not by name — this is more reliable when the GAP name
+has been changed. `BLEBridgeSync.scan()` does the same: UUID-first, name as a
+secondary filter.
+
+**Packet framing (8-byte header prepended to every ISO-TP frame):**
+
+```
+Offset  Size  Field
+0       1     0xF1 (normal frame) or 0xF2 (split continuation chunk)
+1       1     cmdFlags (0x08 = split packet, 0x80 = settings)
+2       2     rxID  — CAN RX ID, little-endian
+4       2     txID  — CAN TX ID, little-endian
+6       2     cmdSize — payload length, little-endian
+[8...]        ISO-TP payload bytes
+```
+
+Split packets and multi-frame notifications are handled automatically by
+`BLEBridgeConnection`. The firmware can pack multiple framed messages into
+a single BLE notification if they fit within the negotiated MTU window.
+
+**Connect/disconnect pattern for the GUI:**
 
 ```python
-bridge = BLEBridge()
-# Scan by name (default)
-devices = bridge.scan(timeout=5.0)
+from transport.ble_bridge import BLEBridgeSync, BridgeState
+from core.ecu_defs import J533_LEAR
 
-# Or scan everything and filter by service UUID yourself
-devices = bridge.scan(timeout=5.0, name_filter=None)
-devices = [d for d in devices
-           if "abf0" in str(d.device.metadata.get("uuids", [])).lower()]
+bridge = BLEBridgeSync()
+
+# Wire state changes to GUI indicator (called from BLE background thread)
+def on_state_change(state: BridgeState):
+    # Use Qt signals or tkinter .after() to update UI safely from other threads
+    color = {"CONNECTED": "green", "SCANNING": "yellow",
+             "CONNECTING": "yellow", "ERROR": "red"}.get(state.name, "gray")
+    status_dot.configure(bg=color)
+    connect_btn.configure(state="disabled" if state == BridgeState.CONNECTED else "normal")
+    disconnect_btn.configure(state="normal" if state == BridgeState.CONNECTED else "disabled")
+
+bridge.set_state_callback(on_state_change)
+bridge.set_error_callback(lambda msg: messagebox.showerror("BLE Error", msg))
+
+# Connect button handler
+def on_connect():
+    devices = bridge.scan(timeout=5.0)   # blocks ~5s
+    if not devices:
+        messagebox.showinfo("Scan", "No bridge found. Is the ESP32 powered and in range?")
+        return
+    ok = bridge.connect(devices[0])      # blocks until connected or failed
+    if ok:
+        status_label.configure(text=f"Connected: {devices[0]}")
+
+# Disconnect button handler
+def on_disconnect():
+    bridge.disconnect()
+    status_label.configure(text="Disconnected")
+
+# Get a udsoncan-compatible connection (pass to flash/probe functions)
+conn = bridge.make_connection(rx_id=J533_LEAR.can_rx, tx_id=J533_LEAR.can_tx)
+
+# Use with udsoncan directly, or pass to flash_cal() / J533Probe
+import udsoncan
+with udsoncan.Client(conn, request_timeout=10) as client:
+    client.change_session(
+        udsoncan.services.DiagnosticSessionControl.Session.extendedDiagnosticSession)
+    ...
 ```
 
 ---

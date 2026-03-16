@@ -63,22 +63,30 @@ def _make_connection(ecu: ECUDef, interface: str, interface_path: Optional[str] 
     params = {"tx_padding": 0x55}
 
     if interface.upper() == "BLE":
-        # ESP32 ISO-TP BLE bridge (esp32-isotp-ble-bridge-c7vag)
-        # ble_bridge must be a connected BLEBridge instance.
-        # Device name: "BLE_TO_ISOTP20" (configurable via BRG_SETTING_GAP)
-        # Service UUID: 0xABF0
-        # The bridge handles ISO-TP framing — we just send raw UDS frames.
+        # ESP32 ISO-TP BLE bridge (dspl1236/esp32-isotp-ble-bridge-c7vag)
+        # ble_bridge must be a connected BLEBridgeSync instance.
+        # Device identifies by service UUID 0xABF0, GAP name "BLE_TO_ISOTP20".
+        # Packet framing: 8-byte header (0xF1 + flags + rxID + txID + size).
         if ble_bridge is None:
             raise ValueError(
-                "interface='BLE' requires ble_bridge=<connected BLEBridge instance>. "
-                "Call BLEBridge.scan() + BLEBridge.connect() first."
+                "interface='BLE' requires ble_bridge= a connected BLEBridgeSync. "
+                "Example:\n"
+                "    from transport.ble_bridge import BLEBridgeSync\n"
+                "    bridge = BLEBridgeSync()\n"
+                "    bridge.connect(bridge.scan()[0])\n"
+                "    conn = _make_connection(ecu, 'BLE', ble_bridge=bridge)"
             )
-        from transport.ble_bridge import BLEBridgeConnection
-        # STmin: convert microseconds to ms for the bridge setting
-        stmin_ms = max(1, st_min_us // 1000)
-        ble_bridge.set_stmin(stmin_ms)
+        from transport.ble_bridge import BLEBridgeConnection, SETTING_ISOTP_STMIN
+        # Push STmin setting to firmware if non-zero
+        if st_min_us > 0:
+            stmin_ms = max(1, st_min_us // 1000)
+            try:
+                ble_bridge.send_settings(SETTING_ISOTP_STMIN,
+                                         stmin_ms.to_bytes(2, "little"))
+            except Exception:
+                pass  # non-fatal — bridge uses its stored default
         return BLEBridgeConnection(
-            bridge  = ble_bridge,
+            bridge  = ble_bridge._bridge,
             tx_id   = ecu.can_tx,
             rx_id   = ecu.can_rx,
             timeout = 5.0,

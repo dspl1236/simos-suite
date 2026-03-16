@@ -1,55 +1,59 @@
 """
-transport/ble_bridge.py — BLE client for the ESP32 ISO-TP BLE Bridge
+transport/ble_bridge.py — BLE connection layer for the ESP32 ISO-TP bridge
 
-Connects to the ESP32 running esp32-isotp-ble-bridge-c7vag firmware and
-presents a udsoncan-compatible connection interface to the rest of the suite.
+Connects to the dspl1236/esp32-isotp-ble-bridge-c7vag firmware via Bluetooth LE
+and exposes a udsoncan-compatible connection object so the rest of the suite
+can use it transparently — identical interface to J2534 or SocketCAN.
 
-───── Firmware protocol (from ble_server.c / ble_server.h) ─────────────────
+Protocol (confirmed from ble_server.c / ble_server.h in the firmware):
 
-BLE advertisement:
-  Device name:  "BLE_TO_ISOTP20"  (DEFAULT_GAP_NAME, user-configurable via
-                                   BRG_SETTING_GAP)
-  Service UUID: 0xABF0            (spp_service_uuid)
+  BLE GATT service UUID:    0xABF0
+  Write characteristic:     0xABF1  (tester → ESP32, write-without-response)
+  Notify characteristic:    0xABF2  (ESP32 → tester, notify)
+  Command characteristic:   0xABF3  (settings/command writes)
+  Status characteristic:    0xABF4  (status notifications)
 
-GATT characteristics:
-  0xABF1  DATA_RECEIVE  — write here to send data TO the bridge (tester→ECU)
-  0xABF2  DATA_NOTIFY   — subscribe here to receive data FROM the bridge (ECU→tester)
-  0xABF3  COMMAND       — write settings/commands to the bridge
-  0xABF4  STATUS        — bridge status notifications
+  Default advertised device name: "BLE_TO_ISOTP20"
+  (configurable via BRG_SETTING_GAP — check your firmware's stored GAP name)
 
-Packet format (ble_header_t):
-  Byte 0:     hdID      = 0xF1  (BLE_HEADER_ID)
-  Byte 1:     cmdFlags  — split packet flags, settings flags
-  Bytes 2–3:  rxID      — ISO-TP receive CAN ID (little-endian uint16)
-  Bytes 4–5:  txID      — ISO-TP transmit CAN ID (little-endian uint16)
-  Bytes 6–7:  cmdSize   — payload length (little-endian uint16)
-  Bytes 8+:   payload   — UDS frame bytes
+Packet framing (ble_header_t, 8 bytes, prepended to every payload):
 
-Split packets:
-  If BLE_COMMAND_FLAG_SPLIT_PK (0x08) is set in cmdFlags, more chunks follow.
-  Continuation chunks start with [0xF2][chunk_num] (BLE_PARTIAL_ID).
+    Offset  Size  Field
+    0       1     hdID     — 0xF1 for normal frame, 0xF2 for split continuation
+    1       1     cmdFlags — flag bits (see BLE_COMMAND_FLAG_* in constants.h)
+    2       2     rxID     — CAN RX ID (little-endian)
+    4       2     txID     — CAN TX ID (little-endian)
+    6       2     cmdSize  — payload length (little-endian)
+    [8...]        payload  — ISO-TP frame bytes
 
-Raw CAN sniff mode:
-  When BRG_SETTING_RAW_SNIFF=9 is set, all CAN frames are forwarded with
-  txID=rxID=0xCAFE (BLE_RAW_SNIFF_ID). These are filtered out of the UDS
-  receive path and dispatched to a separate sniff callback.
+Split packet reassembly:
+    If cmdFlags & 0x08 (BLE_COMMAND_FLAG_SPLIT_PK): first chunk, more follow.
+    Continuation chunks start with hdID=0xF2, chunk_number (1-indexed).
+    Reassemble until no more 0xF2 chunks arrive.
 
-─────────────────────────────────────────────────────────────────────────────
+Multiple frames per BLE notification:
+    A single BLE notification can carry multiple concatenated framed messages
+    (each with its own 8-byte header) if they fit within the MTU window.
+    The parser loops until all bytes are consumed.
+
+Device identification (Simos Tools APK behavior, reconstructed):
+    The APK scans for BLE devices advertising service UUID 0xABF0.
+    It matches by service UUID first, then optionally by GAP name prefix.
+    The firmware's default GAP name is "BLE_TO_ISOTP20" (14 chars max).
+    If you renamed your device via BRG_SETTING_GAP, scan by UUID instead of name.
 
 Usage:
-    from transport.ble_bridge import BLEBridge, BLEBridgeConnection
-    import asyncio
+    from transport.ble_bridge import BLEBridgeSync, BLEBridgeConnection
 
-    bridge = BLEBridge()
-    devices = asyncio.run(bridge.scan(timeout=5.0))
-    asyncio.run(bridge.connect(devices[0]))
+    bridge = BLEBridgeSync()
+    devices = bridge.scan(timeout=5.0)
+    ok = bridge.connect(devices[0])
+    conn = bridge.make_connection(rx_id=0x77A, tx_id=0x710)
 
-    # udsoncan connection — drop this into _make_connection()
-    conn = BLEBridgeConnection(bridge, tx_id=0x7E0, rx_id=0x7E8)
+    with udsoncan.Client(conn, ...) as client:
+        client.change_session(...)
 
-    # GUI usage:
-    bridge.on_connect    = lambda dev: update_status_bar("Connected", "green")
-    bridge.on_disconnect = lambda:     update_status_bar("Disconnected", "red")
+    bridge.disconnect()
 """
 
 from __future__ import annotations
@@ -58,494 +62,508 @@ import asyncio
 import logging
 import struct
 import threading
+import queue
 import time
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Callable, Dict, List, Optional, Tuple
 
-import bleak
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
+from bleak.backends.scanner import AdvertisementData
 
 log = logging.getLogger("SimosSuite.BLE")
 
-# ── Firmware-defined constants (from ble_server.h / constants.h) ─────────────
+# ─── UUIDs (confirmed from firmware ble_server.c) ────────────────────────────
 
-BLE_SERVICE_UUID       = "0000abf0-0000-1000-8000-00805f9b34fb"
-BLE_CHAR_DATA_RECV     = "0000abf1-0000-1000-8000-00805f9b34fb"  # write (tester→bridge)
-BLE_CHAR_DATA_NOTIFY   = "0000abf2-0000-1000-8000-00805f9b34fb"  # notify (bridge→tester)
-BLE_CHAR_CMD_RECV      = "0000abf3-0000-1000-8000-00805f9b34fb"  # write commands
-BLE_CHAR_CMD_NOTIFY    = "0000abf4-0000-1000-8000-00805f9b34fb"  # status notifications
+BLE_SERVICE_UUID      = "0000abf0-0000-1000-8000-00805f9b34fb"
+BLE_CHAR_WRITE_UUID   = "0000abf1-0000-1000-8000-00805f9b34fb"  # tester → ESP32
+BLE_CHAR_NOTIFY_UUID  = "0000abf2-0000-1000-8000-00805f9b34fb"  # ESP32 → tester
+BLE_CHAR_CMD_UUID     = "0000abf3-0000-1000-8000-00805f9b34fb"  # command writes
+BLE_CHAR_STATUS_UUID  = "0000abf4-0000-1000-8000-00805f9b34fb"  # status notify
 
-DEFAULT_DEVICE_NAME    = "BLE_TO_ISOTP20"   # DEFAULT_GAP_NAME in firmware
+# Default GAP name advertised by firmware
+BLE_DEFAULT_GAP_NAME  = "BLE_TO_ISOTP20"
 
-BLE_HEADER_ID          = 0xF1
-BLE_PARTIAL_ID         = 0xF2
-BLE_COMMAND_FLAG_SPLIT = 0x08
+# ─── Packet framing constants (from ble_server.h) ────────────────────────────
 
-# Settings command IDs (BRG_SETTING_* in constants.h)
-BRG_SETTING_ISOTP_STMIN    = 1
-BRG_SETTING_LED_COLOR      = 2
-BRG_SETTING_PERSIST_DELAY  = 3
-BRG_SETTING_PERSIST_Q_DELAY= 4
-BRG_SETTING_BLE_SEND_DELAY = 5
-BRG_SETTING_BLE_MULTI_DELAY= 6
-BRG_SETTING_PASSWORD       = 7
-BRG_SETTING_GAP            = 8
-BRG_SETTING_RAW_SNIFF      = 9
+BLE_HEADER_ID         = 0xF1   # normal frame header byte
+BLE_PARTIAL_ID        = 0xF2   # split packet continuation byte
+BLE_HEADER_SIZE       = 8      # sizeof(ble_header_t)
 
-BLE_RAW_SNIFF_ID           = 0xCAFE    # magic CAN ID used for raw sniff frames
+# cmdFlags bits
+FLAG_PER_ENABLE       = 0x01
+FLAG_PER_CLEAR        = 0x02
+FLAG_PER_ADD          = 0x04
+FLAG_SPLIT_PK         = 0x08   # this chunk is split, more follow
+FLAG_SETTINGS_GET     = 0x40
+FLAG_SETTINGS         = 0x80
 
-
-# ── BLE packet header (mirrors ble_header_t from ble_server.h) ───────────────
-
-_HDR_FMT  = "<BBHHHxx"     # hdID, cmdFlags, rxID, txID, cmdSize, 2 pad
-_HDR_SIZE = struct.calcsize(_HDR_FMT)   # = 10 bytes
-
-def _pack_header(tx_id: int, rx_id: int, payload: bytes, flags: int = 0) -> bytes:
-    hdr = struct.pack(_HDR_FMT,
-                      BLE_HEADER_ID,
-                      flags,
-                      rx_id,      # rxID — the CAN ID the ECU sends FROM
-                      tx_id,      # txID — the CAN ID we send TO the ECU
-                      len(payload))
-    return hdr + payload
-
-def _unpack_header(data: bytes) -> Optional[Tuple[int, int, int, int, bytes]]:
-    """
-    Returns (hd_id, flags, rx_id, tx_id, payload) or None if malformed.
-    hd_id will be BLE_HEADER_ID (0xF1) for normal frames,
-    BLE_PARTIAL_ID (0xF2) for split continuation chunks.
-    """
-    if len(data) < _HDR_SIZE:
-        return None
-    hd_id, flags, rx_id, tx_id, cmd_size = struct.unpack_from(_HDR_FMT, data)
-    payload = data[_HDR_SIZE:_HDR_SIZE + cmd_size]
-    return hd_id, flags, rx_id, tx_id, payload
+# Setting IDs (from constants.h BRG_SETTING_*)
+SETTING_ISOTP_STMIN    = 1
+SETTING_LED_COLOR      = 2
+SETTING_PERSIST_DELAY  = 3
+SETTING_PERSIST_QDELAY = 4
+SETTING_BLE_SEND_DELAY = 5
+SETTING_BLE_MULTI_DELAY= 6
+SETTING_PASSWORD       = 7
+SETTING_GAP            = 8
+SETTING_RAW_SNIFF      = 9
+RAW_SNIFF_CAN_ID       = 0xCAFE  # txID/rxID used for raw CAN sniff frames
 
 
-# ── Discovered device wrapper ─────────────────────────────────────────────────
+# ─── State ───────────────────────────────────────────────────────────────────
+
+class BridgeState(Enum):
+    DISCONNECTED  = auto()
+    SCANNING      = auto()
+    CONNECTING    = auto()
+    CONNECTED     = auto()
+    DISCONNECTING = auto()
+    ERROR         = auto()
+
 
 @dataclass
-class FoundDevice:
-    name:    str
-    address: str
-    rssi:    int
-    device:  BLEDevice
+class BLEDeviceInfo:
+    """A discovered BLE bridge device."""
+    device:   BLEDevice
+    adv_data: AdvertisementData
+    name:     str
+    address:  str
+    rssi:     int
 
-    def __str__(self):
-        return f"{self.name}  [{self.address}]  RSSI={self.rssi} dBm"
+    def __str__(self) -> str:
+        return f"{self.name}  [{self.address}]  RSSI={self.rssi}dBm"
 
 
-# ── Main bridge class ─────────────────────────────────────────────────────────
+# ─── BLEBridge (async core) ──────────────────────────────────────────────────
 
 class BLEBridge:
     """
     Manages the BLE connection to the ESP32 ISO-TP bridge.
-
-    Thread-safe: all asyncio work is run on a background event loop thread.
-    The public API (scan, connect, disconnect, send) can be called from any
-    thread, including the GUI main thread.
-
-    Callbacks (set these before connecting):
-        on_connect(device: FoundDevice)  — called when connection is established
-        on_disconnect()                  — called on unexpected or clean disconnect
-        on_sniff_frame(can_id, data)     — raw CAN sniff frames (if sniff enabled)
+    Runs an internal asyncio loop in a background daemon thread.
     """
 
     def __init__(self):
         self._client:    Optional[BleakClient] = None
-        self._device:    Optional[FoundDevice] = None
-        self._connected: bool = False
-        self._loop:      asyncio.AbstractEventLoop = asyncio.new_event_loop()
-        self._thread:    threading.Thread = threading.Thread(
-            target=self._run_loop, daemon=True, name="BLE-EventLoop")
-        self._thread.start()
+        self._state:     BridgeState = BridgeState.DISCONNECTED
+        self._loop:      Optional[asyncio.AbstractEventLoop] = None
+        self._thread:    Optional[threading.Thread] = None
 
-        # Per-channel receive queues: keyed by (tx_id, rx_id)
-        # BLEBridgeConnection registers its queue here
-        self._rx_queues: Dict[Tuple[int,int], asyncio.Queue] = {}
-        self._rx_lock    = threading.Lock()
+        # Per-channel receive queues keyed by (tx_id, rx_id)
+        self._rx_queues: Dict[Tuple[int,int], queue.Queue] = {}
+        self._raw_queue: Optional[queue.Queue] = None
 
-        # Reassembly buffer for split packets
-        self._split_buf: bytearray = bytearray()
-        self._split_header: Optional[Tuple] = None
+        # Split packet reassembly state
+        self._split_buf: bytes = b""
+        self._split_hdr: Optional[Tuple] = None
 
-        # Callbacks — set by owner
-        self.on_connect:    Optional[Callable[[FoundDevice], None]] = None
-        self.on_disconnect: Optional[Callable[[], None]] = None
-        self.on_sniff_frame:Optional[Callable[[int, bytes], None]] = None
+        # GUI callbacks
+        self._on_state_change: Optional[Callable[[BridgeState], None]] = None
+        self._on_error:        Optional[Callable[[str], None]] = None
 
-    # ── Event loop thread ─────────────────────────────────────────────────────
+        self._last_scan: List[BLEDeviceInfo] = []
 
-    def _run_loop(self):
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+    # ── Callbacks ─────────────────────────────────────────────────────────
 
-    def _run(self, coro):
-        """Submit a coroutine to the BLE event loop and block until done."""
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result(timeout=30)
+    def set_state_callback(self, cb: Callable[[BridgeState], None]):
+        self._on_state_change = cb
 
-    def _run_nowait(self, coro):
-        """Submit a coroutine to the BLE event loop without waiting."""
-        asyncio.run_coroutine_threadsafe(coro, self._loop)
+    def set_error_callback(self, cb: Callable[[str], None]):
+        self._on_error = cb
 
-    # ── Scan ──────────────────────────────────────────────────────────────────
+    def _set_state(self, state: BridgeState):
+        self._state = state
+        log.info("BLE → %s", state.name)
+        if self._on_state_change:
+            self._on_state_change(state)
 
-    def scan(self, timeout: float = 5.0,
-             name_filter: Optional[str] = DEFAULT_DEVICE_NAME) -> List[FoundDevice]:
-        """
-        Scan for BLE devices. Returns a list of FoundDevice objects.
-        name_filter: if set, only return devices whose name contains this string.
-                     Pass None to return all BLE devices in range.
-        """
-        return self._run(self._async_scan(timeout, name_filter))
-
-    async def _async_scan(self, timeout: float,
-                          name_filter: Optional[str]) -> List[FoundDevice]:
-        log.info("BLE scan (%.1fs, filter=%r)…", timeout, name_filter)
-        found = []
-        devices = await BleakScanner.discover(timeout=timeout,
-                                              return_adv=True)
-        for dev, adv in devices.values():
-            name = dev.name or adv.local_name or ""
-            if name_filter and name_filter.lower() not in name.lower():
-                continue
-            fd = FoundDevice(
-                name    = name or "(no name)",
-                address = dev.address,
-                rssi    = adv.rssi or 0,
-                device  = dev,
-            )
-            found.append(fd)
-            log.info("  Found: %s", fd)
-        log.info("Scan complete — %d device(s) found", len(found))
-        return found
-
-    # ── Connect ───────────────────────────────────────────────────────────────
-
-    def connect(self, device: FoundDevice) -> bool:
-        """Connect to a discovered device. Returns True on success."""
-        return self._run(self._async_connect(device))
-
-    async def _async_connect(self, device: FoundDevice) -> bool:
-        if self._connected:
-            log.warning("Already connected — disconnect first")
-            return False
-
-        log.info("Connecting to %s…", device)
-        try:
-            self._client = BleakClient(
-                device.device,
-                disconnected_callback=self._on_disconnected,
-            )
-            await self._client.connect(timeout=10.0)
-
-            # Validate the service is present
-            svcs = self._client.services
-            svc = svcs.get_service(BLE_SERVICE_UUID)
-            if svc is None:
-                log.error("Service 0xABF0 not found — wrong device?")
-                await self._client.disconnect()
-                return False
-
-            # Subscribe to data notifications
-            await self._client.start_notify(
-                BLE_CHAR_DATA_NOTIFY, self._on_data_notify)
-
-            # Subscribe to status/command notifications
-            await self._client.start_notify(
-                BLE_CHAR_CMD_NOTIFY, self._on_status_notify)
-
-            self._connected = True
-            self._device    = device
-            log.info("Connected to %s (MTU=%d)",
-                     device.name, self._client.mtu_size)
-
-            if self.on_connect:
-                self.on_connect(device)
-            return True
-
-        except Exception as e:
-            log.error("Connection failed: %s", e)
-            self._client = None
-            return False
-
-    # ── Disconnect ────────────────────────────────────────────────────────────
-
-    def disconnect(self):
-        """Cleanly disconnect from the bridge."""
-        self._run(self._async_disconnect())
-
-    async def _async_disconnect(self):
-        if not self._client:
-            return
-        try:
-            await self._client.disconnect()
-        except Exception as e:
-            log.warning("Disconnect error (ignored): %s", e)
-        finally:
-            self._connected = False
-            self._client    = None
-            self._device    = None
-            self._split_buf.clear()
-            self._split_header = None
-            log.info("Disconnected")
-
-    def _on_disconnected(self, client: BleakClient):
-        """Called by bleak when the connection drops unexpectedly."""
-        log.warning("BLE connection lost")
-        self._connected = False
-        self._client    = None
-        self._device    = None
-        self._split_buf.clear()
-        self._split_header = None
-        if self.on_disconnect:
-            self.on_disconnect()
-
-    # ── Send ──────────────────────────────────────────────────────────────────
-
-    def send(self, tx_id: int, rx_id: int, payload: bytes):
-        """
-        Send a UDS frame to the bridge.
-        tx_id: CAN ID we send TO the ECU (e.g. 0x7E0)
-        rx_id: CAN ID we expect the ECU to respond FROM (e.g. 0x7E8)
-        payload: raw UDS frame bytes (before ISO-TP framing — bridge handles that)
-        """
-        if not self._connected or not self._client:
-            raise ConnectionError("Not connected to BLE bridge")
-        self._run_nowait(self._async_send(tx_id, rx_id, payload))
-
-    async def _async_send(self, tx_id: int, rx_id: int, payload: bytes):
-        packet = _pack_header(tx_id, rx_id, payload)
-        mtu    = self._client.mtu_size - 3   # ATT overhead
-
-        if len(packet) <= mtu:
-            await self._client.write_gatt_char(
-                BLE_CHAR_DATA_RECV, packet, response=False)
-        else:
-            # Split across MTU-sized chunks — set SPLIT flag on first chunk
-            first  = bytearray(packet[:mtu])
-            first[1] |= BLE_COMMAND_FLAG_SPLIT  # set split flag in cmdFlags
-            await self._client.write_gatt_char(
-                BLE_CHAR_DATA_RECV, bytes(first), response=False)
-
-            offset = mtu
-            chunk_num = 1
-            while offset < len(packet):
-                chunk_data = packet[offset:offset + mtu - 2]
-                chunk = bytes([BLE_PARTIAL_ID, chunk_num]) + chunk_data
-                await self._client.write_gatt_char(
-                    BLE_CHAR_DATA_RECV, chunk, response=False)
-                offset += len(chunk_data)
-                chunk_num += 1
-
-    # ── Receive ───────────────────────────────────────────────────────────────
-
-    def _on_data_notify(self, _char, data: bytearray):
-        """Called by bleak for each DATA_NOTIFY packet from the bridge."""
-        data = bytes(data)
-
-        if not data:
-            return
-
-        hd_id = data[0]
-
-        # Continuation chunk for a split packet
-        if hd_id == BLE_PARTIAL_ID:
-            if len(data) > 2:
-                self._split_buf.extend(data[2:])
-            # Reassembly complete when no more split chunks expected —
-            # We detect end by trying to parse: if we have a full header + payload, dispatch.
-            self._try_dispatch_split()
-            return
-
-        # Normal or first-of-split packet
-        parsed = _unpack_header(data)
-        if parsed is None:
-            log.warning("Malformed BLE packet: %s", data.hex())
-            return
-
-        hd_id, flags, rx_id, tx_id, payload = parsed
-
-        if flags & BLE_COMMAND_FLAG_SPLIT:
-            # First chunk of a multi-chunk packet — store header and payload so far
-            self._split_header = (rx_id, tx_id)
-            self._split_buf    = bytearray(payload)
-            return
-
-        # Complete single packet — dispatch immediately
-        self._dispatch(rx_id, tx_id, payload)
-
-    def _try_dispatch_split(self):
-        """Attempt to dispatch a reassembled split packet."""
-        if self._split_header is None:
-            return
-        rx_id, tx_id = self._split_header
-        # For split packets the firmware sends all payload in the continuation
-        # chunks after the header chunk. Treat the accumulated buffer as the full payload.
-        self._dispatch(rx_id, tx_id, bytes(self._split_buf))
-        self._split_buf.clear()
-        self._split_header = None
-
-    def _dispatch(self, rx_id: int, tx_id: int, payload: bytes):
-        """Route a complete payload to the right queue or sniff callback."""
-        # Raw sniff frames
-        if rx_id == BLE_RAW_SNIFF_ID or tx_id == BLE_RAW_SNIFF_ID:
-            if self.on_sniff_frame and len(payload) >= 3:
-                can_id = (payload[0] << 8) | payload[1]
-                frame  = payload[3:]
-                self.on_sniff_frame(can_id, frame)
-            return
-
-        # UDS response — rx_id is what the ECU sent FROM, which corresponds to
-        # the rx_id the connection registered with.
-        key = (tx_id, rx_id)
-        with self._rx_lock:
-            q = self._rx_queues.get(key)
-        if q is None:
-            # Try reversed in case rx/tx are swapped in the response
-            key2 = (rx_id, tx_id)
-            with self._rx_lock:
-                q = self._rx_queues.get(key2)
-
-        if q is not None:
-            asyncio.run_coroutine_threadsafe(q.put(payload), self._loop)
-        else:
-            log.debug("No queue for CAN IDs tx=%#x rx=%#x — dropped", tx_id, rx_id)
-
-    def _on_status_notify(self, _char, data: bytearray):
-        """Status/command notifications from bridge (informational)."""
-        log.debug("Bridge status: %s", bytes(data).hex())
-
-    # ── Queue registration (used by BLEBridgeConnection) ─────────────────────
-
-    def register_channel(self, tx_id: int, rx_id: int) -> asyncio.Queue:
-        q = asyncio.Queue()
-        with self._rx_lock:
-            self._rx_queues[(tx_id, rx_id)] = q
-        return q
-
-    def unregister_channel(self, tx_id: int, rx_id: int):
-        with self._rx_lock:
-            self._rx_queues.pop((tx_id, rx_id), None)
-
-    # ── Settings commands ─────────────────────────────────────────────────────
-
-    def set_stmin(self, stmin_ms: int):
-        """Set ISO-TP STmin on the bridge (0–127 ms)."""
-        self._send_setting(BRG_SETTING_ISOTP_STMIN, stmin_ms)
-
-    def set_raw_sniff(self, enabled: bool):
-        """Enable/disable raw CAN sniff mode (all frames forwarded with ID 0xCAFE)."""
-        self._send_setting(BRG_SETTING_RAW_SNIFF, 1 if enabled else 0)
-
-    def set_led_color(self, r: int, g: int, b: int):
-        """Set the WS2812 LED color on the bridge."""
-        payload = bytes([BRG_SETTING_LED_COLOR, r, g, b])
-        self._run_nowait(self._async_write_cmd(payload))
-
-    def _send_setting(self, setting_id: int, value: int):
-        payload = struct.pack("<BB", setting_id, value)
-        self._run_nowait(self._async_write_cmd(payload))
-
-    async def _async_write_cmd(self, payload: bytes):
-        if self._client and self._connected:
-            await self._client.write_gatt_char(
-                BLE_CHAR_CMD_RECV, payload, response=False)
-
-    # ── Properties ───────────────────────────────────────────────────────────
+    @property
+    def state(self) -> BridgeState:
+        return self._state
 
     @property
     def is_connected(self) -> bool:
-        return self._connected
+        return self._state == BridgeState.CONNECTED
 
     @property
-    def connected_device(self) -> Optional[FoundDevice]:
-        return self._device
+    def connected_address(self) -> Optional[str]:
+        return self._client.address if self._client else None
+
+    # ── Loop management ───────────────────────────────────────────────────
+
+    def _ensure_loop(self):
+        if self._loop is None or not self._loop.is_running():
+            self._loop = asyncio.new_event_loop()
+            self._thread = threading.Thread(
+                target=self._loop.run_forever,
+                name="BLEBridge-loop",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _run(self, coro):
+        self._ensure_loop()
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=30)
+
+    # ── Scan ─────────────────────────────────────────────────────────────
+
+    def scan(self, timeout: float = 5.0,
+             name_filter: Optional[str] = None) -> List[BLEDeviceInfo]:
+        return self._run(self._scan(timeout, name_filter))
+
+    async def _scan(self, timeout: float,
+                    name_filter: Optional[str]) -> List[BLEDeviceInfo]:
+        self._set_state(BridgeState.SCANNING)
+        found: List[BLEDeviceInfo] = []
+
+        def _cb(device: BLEDevice, adv: AdvertisementData):
+            svc_uuids = [u.lower() for u in (adv.service_uuids or [])]
+            if not any("abf0" in u for u in svc_uuids):
+                return
+            name = device.name or adv.local_name or BLE_DEFAULT_GAP_NAME
+            if name_filter and not name.upper().startswith(name_filter.upper()):
+                return
+            if not any(d.address == device.address for d in found):
+                info = BLEDeviceInfo(device=device, adv_data=adv,
+                                     name=name, address=device.address,
+                                     rssi=adv.rssi or -999)
+                found.append(info)
+                log.info("Found: %s", info)
+
+        scanner = BleakScanner(detection_callback=_cb,
+                               service_uuids=[BLE_SERVICE_UUID])
+        await scanner.start()
+        await asyncio.sleep(timeout)
+        await scanner.stop()
+
+        found.sort(key=lambda d: d.rssi, reverse=True)
+        self._last_scan = found
+        self._set_state(BridgeState.DISCONNECTED)
+        return found
 
     @property
-    def mtu(self) -> int:
-        if self._client:
-            return self._client.mtu_size
-        return 23   # BLE default
+    def last_scan_results(self) -> List[BLEDeviceInfo]:
+        return self._last_scan
+
+    # ── Connect ───────────────────────────────────────────────────────────
+
+    def connect(self, device) -> bool:
+        address = device.address if isinstance(device, BLEDeviceInfo) else device
+        return self._run(self._connect(address))
+
+    async def _connect(self, address: str) -> bool:
+        if self._state == BridgeState.CONNECTED:
+            return True
+        self._set_state(BridgeState.CONNECTING)
+        try:
+            self._client = BleakClient(address,
+                                       disconnected_callback=self._on_disconnected)
+            await self._client.connect()
+            await self._client.start_notify(BLE_CHAR_NOTIFY_UUID, self._on_notify)
+            try:
+                await self._client.request_mtu(517)
+            except Exception:
+                pass
+            self._set_state(BridgeState.CONNECTED)
+            return True
+        except Exception as e:
+            msg = f"BLE connect failed: {e}"
+            log.error(msg)
+            self._set_state(BridgeState.ERROR)
+            if self._on_error:
+                self._on_error(msg)
+            return False
+
+    def _on_disconnected(self, client: BleakClient):
+        log.warning("BLE disconnected")
+        self._set_state(BridgeState.DISCONNECTED)
+        for q in self._rx_queues.values():
+            q.put(None)
+        if self._raw_queue:
+            self._raw_queue.put(None)
+
+    # ── Disconnect ────────────────────────────────────────────────────────
+
+    def disconnect(self):
+        self._run(self._disconnect())
+
+    async def _disconnect(self):
+        if self._client and self._client.is_connected:
+            self._set_state(BridgeState.DISCONNECTING)
+            try:
+                await self._client.stop_notify(BLE_CHAR_NOTIFY_UUID)
+                await self._client.disconnect()
+            except Exception as e:
+                log.warning("Disconnect error (ignored): %s", e)
+        self._set_state(BridgeState.DISCONNECTED)
+        self._client = None
+
+    # ── Send ─────────────────────────────────────────────────────────────
+
+    def send_frame(self, tx_id: int, rx_id: int, payload: bytes, flags: int = 0):
+        if not self.is_connected:
+            raise ConnectionError("BLE bridge not connected")
+        self._run(self._send_frame(tx_id, rx_id, payload, flags))
+
+    async def _send_frame(self, tx_id: int, rx_id: int,
+                           payload: bytes, flags: int):
+        header = struct.pack("<BBHHH",
+            BLE_HEADER_ID, flags, rx_id, tx_id, len(payload))
+        await self._client.write_gatt_char(
+            BLE_CHAR_WRITE_UUID, header + payload, response=False)
+        log.debug("TX tx=%#06x rx=%#06x len=%d", tx_id, rx_id, len(payload))
+
+    def send_settings(self, setting_id: int, value: bytes):
+        if not self.is_connected:
+            raise ConnectionError("BLE bridge not connected")
+        self._run(self._send_settings(setting_id, value))
+
+    async def _send_settings(self, setting_id: int, value: bytes):
+        payload = bytes([FLAG_SETTINGS, setting_id]) + value
+        await self._client.write_gatt_char(BLE_CHAR_CMD_UUID, payload,
+                                           response=False)
+
+    # ── Receive ───────────────────────────────────────────────────────────
+
+    def _on_notify(self, char_handle, data: bytearray):
+        raw = bytes(data)
+        log.debug("RX %d bytes: %s", len(raw), raw.hex())
+        offset = 0
+        while offset < len(raw):
+            hd_id = raw[offset]
+
+            if hd_id == BLE_PARTIAL_ID:
+                if len(raw) < offset + 2:
+                    break
+                chunk_num  = raw[offset + 1]
+                chunk_data = raw[offset + 2:]
+                self._split_buf += chunk_data
+                log.debug("Split chunk %d +%d bytes", chunk_num, len(chunk_data))
+                if self._split_hdr:
+                    _, _, rx_id, tx_id = self._split_hdr
+                    self._dispatch(tx_id, rx_id, self._split_buf)
+                    self._split_buf = b""
+                    self._split_hdr = None
+                break
+
+            if hd_id != BLE_HEADER_ID:
+                log.warning("Bad header byte %#04x at offset %d", hd_id, offset)
+                break
+            if offset + BLE_HEADER_SIZE > len(raw):
+                break
+
+            _, flags, rx_id, tx_id, cmd_size = struct.unpack_from(
+                "<BBHHH", raw, offset)
+            offset += BLE_HEADER_SIZE
+
+            if offset + cmd_size > len(raw):
+                break
+            payload = raw[offset:offset + cmd_size]
+            offset += cmd_size
+
+            if flags & FLAG_SPLIT_PK:
+                self._split_buf = payload
+                self._split_hdr = (hd_id, flags, rx_id, tx_id)
+            else:
+                self._dispatch(tx_id, rx_id, payload)
+
+    def _dispatch(self, tx_id: int, rx_id: int, payload: bytes):
+        log.debug("RX ← tx=%#06x rx=%#06x len=%d", tx_id, rx_id, len(payload))
+        key = (tx_id, rx_id)
+        if key in self._rx_queues:
+            self._rx_queues[key].put(payload)
+        if self._raw_queue is not None:
+            self._raw_queue.put((tx_id, rx_id, payload))
+
+    # ── Queue registration ────────────────────────────────────────────────
+
+    def register_channel(self, tx_id: int, rx_id: int) -> queue.Queue:
+        key = (tx_id, rx_id)
+        if key not in self._rx_queues:
+            self._rx_queues[key] = queue.Queue(maxsize=256)
+        return self._rx_queues[key]
+
+    def unregister_channel(self, tx_id: int, rx_id: int):
+        self._rx_queues.pop((tx_id, rx_id), None)
+
+    def enable_raw_queue(self) -> queue.Queue:
+        self._raw_queue = queue.Queue(maxsize=4096)
+        return self._raw_queue
+
+    def disable_raw_queue(self):
+        self._raw_queue = None
 
 
-# ── udsoncan-compatible connection class ──────────────────────────────────────
+# ─── BLEBridgeConnection — udsoncan interface ─────────────────────────────────
 
 class BLEBridgeConnection:
     """
-    Wraps BLEBridge as a udsoncan connection object.
-
-    This is what _make_connection() returns when interface="BLE".
-    udsoncan calls open(), send(), wait_frame(), close() on this.
-
-    Usage:
-        conn = BLEBridgeConnection(bridge, tx_id=0x7E0, rx_id=0x7E8)
-        # then pass conn to udsoncan.Client(conn, ...)
+    udsoncan-compatible connection backed by BLEBridge.
+    Drop-in for IsoTPSocketConnection or J2534Connection.
     """
 
-    def __init__(self, bridge: BLEBridge, tx_id: int, rx_id: int,
-                 timeout: float = 2.0):
+    def __init__(self, bridge: BLEBridge, rx_id: int, tx_id: int,
+                 timeout: float = 5.0):
         self._bridge  = bridge
-        self._tx_id   = tx_id
         self._rx_id   = rx_id
+        self._tx_id   = tx_id
         self._timeout = timeout
-        self._queue:  Optional[asyncio.Queue] = None
-
-    # ── udsoncan connection interface ─────────────────────────────────────────
+        self._queue:  Optional[queue.Queue] = None
 
     def open(self):
         if not self._bridge.is_connected:
-            raise ConnectionError(
-                "BLE bridge is not connected. Use BLEBridge.connect() first.")
+            raise ConnectionError("BLE bridge not connected — call bridge.connect() first")
         self._queue = self._bridge.register_channel(self._tx_id, self._rx_id)
-        log.debug("BLEBridgeConnection open: tx=%#x rx=%#x", self._tx_id, self._rx_id)
 
     def close(self):
         if self._queue is not None:
             self._bridge.unregister_channel(self._tx_id, self._rx_id)
             self._queue = None
-        log.debug("BLEBridgeConnection closed")
 
     def send(self, payload: bytes):
-        """Send a UDS request payload to the ECU via the bridge."""
-        self._bridge.send(self._tx_id, self._rx_id, payload)
+        self._bridge.send_frame(self._tx_id, self._rx_id, payload)
 
     def wait_frame(self, timeout: Optional[float] = None) -> bytes:
-        """
-        Block until a UDS response frame arrives or timeout expires.
-        Raises TimeoutError on timeout (udsoncan catches this).
-        """
+        t = timeout if timeout is not None else self._timeout
         if self._queue is None:
             raise ConnectionError("Connection not open")
+        try:
+            frame = self._queue.get(timeout=t)
+        except queue.Empty:
+            raise TimeoutError(
+                f"No BLE response within {t}s "
+                f"(tx={self._tx_id:#06x} rx={self._rx_id:#06x})")
+        if frame is None:
+            raise ConnectionError("BLE bridge disconnected mid-operation")
+        return frame
 
-        deadline = time.monotonic() + (timeout or self._timeout)
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"No response from ECU (tx={self._tx_id:#x} rx={self._rx_id:#x})")
-            try:
-                # Poll the asyncio queue from a sync thread
-                fut = asyncio.run_coroutine_threadsafe(
-                    asyncio.wait_for(self._queue.get(),
-                                     timeout=min(remaining, 0.1)),
-                    self._bridge._loop)
-                return fut.result(timeout=min(remaining + 0.5, 5.0))
-            except (asyncio.TimeoutError, TimeoutError):
-                continue
-            except Exception as e:
-                raise TimeoutError(f"BLE receive error: {e}") from e
+    def empty(self) -> bool:
+        return self._queue is None or self._queue.empty()
 
     def __enter__(self):
         self.open()
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, *args):
         self.close()
 
-    # ── Convenience ──────────────────────────────────────────────────────────
 
-    def set_timeout(self, timeout: float):
-        self._timeout = timeout
+# ─── Raw sniff frame ──────────────────────────────────────────────────────────
+
+@dataclass
+class RawCANFrame:
+    """Raw CAN frame from BRG_SETTING_RAW_SNIFF mode (txID=rxID=0xCAFE)."""
+    can_id:    int
+    dlc:       int
+    data:      bytes
+    timestamp: float = field(default_factory=time.monotonic)
+
+    def __str__(self) -> str:
+        return (f"CAN {self.can_id:#05x}  [{self.dlc}]  "
+                f"{self.data.hex(' ').upper()}")
+
+
+def parse_raw_sniff_frame(payload: bytes) -> Optional[RawCANFrame]:
+    """
+    Parse payload from raw sniff mode.
+    Format: [id_hi][id_lo][dlc][d0..d7]  (11-bit CAN ID, big-endian)
+    """
+    if len(payload) < 3:
+        return None
+    can_id = struct.unpack_from(">H", payload, 0)[0]
+    dlc    = payload[2]
+    data   = payload[3:3 + min(dlc, 8)]
+    return RawCANFrame(can_id=can_id, dlc=dlc, data=bytes(data))
+
+
+# ─── Sync wrapper for GUI ─────────────────────────────────────────────────────
+
+class BLEBridgeSync:
+    """
+    Synchronous wrapper for GUI use (Qt slots, tkinter callbacks, etc).
+    All calls block until completion. Background asyncio loop is managed internally.
+
+    Quick start:
+        bridge = BLEBridgeSync()
+        bridge.set_state_callback(my_gui_update_fn)   # optional
+        devices = bridge.scan()
+        ok = bridge.connect(devices[0])
+        conn = bridge.make_connection(rx_id=0x77A, tx_id=0x710)
+        # conn → pass to udsoncan.Client
+        bridge.disconnect()
+    """
+
+    def __init__(self):
+        self._bridge = BLEBridge()
+
+    def set_state_callback(self, cb: Callable[[BridgeState], None]):
+        """Hook for GUI — called on every state transition."""
+        self._bridge.set_state_callback(cb)
+
+    def set_error_callback(self, cb: Callable[[str], None]):
+        """Hook for GUI — called with error string on connection failure."""
+        self._bridge.set_error_callback(cb)
+
+    @property
+    def is_connected(self) -> bool:
+        return self._bridge.is_connected
+
+    @property
+    def state(self) -> BridgeState:
+        return self._bridge.state
+
+    @property
+    def connected_address(self) -> Optional[str]:
+        return self._bridge.connected_address
+
+    @property
+    def last_scan_results(self) -> List[BLEDeviceInfo]:
+        return self._bridge.last_scan_results
+
+    def scan(self, timeout: float = 5.0,
+             name_filter: Optional[str] = None) -> List[BLEDeviceInfo]:
+        """
+        Scan for bridge devices. Blocks for timeout seconds.
+        Returns list sorted by RSSI (strongest first).
+        Identifies devices by service UUID 0xABF0.
+        GAP name is "BLE_TO_ISOTP20" by default — pass name_filter to narrow down
+        if you have multiple BLE devices nearby.
+        """
+        return self._bridge.scan(timeout=timeout, name_filter=name_filter)
+
+    def connect(self, device) -> bool:
+        """Connect to device (BLEDeviceInfo or address string). Returns True on success."""
+        return self._bridge.connect(device)
+
+    def disconnect(self):
+        """Disconnect cleanly."""
+        self._bridge.disconnect()
+
+    def make_connection(self, rx_id: int, tx_id: int,
+                        timeout: float = 5.0) -> BLEBridgeConnection:
+        """
+        Return a udsoncan-compatible connection for a CAN channel.
+        Must be connected first.
+
+        Args:
+            rx_id: CAN ID we expect responses FROM (e.g. 0x77A for J533)
+            tx_id: CAN ID we send requests TO   (e.g. 0x710 for J533)
+        """
+        return BLEBridgeConnection(
+            self._bridge, rx_id=rx_id, tx_id=tx_id, timeout=timeout)
+
+    def enable_raw_sniff(self) -> queue.Queue:
+        """
+        Enable raw CAN frame capture (requires BRG_SETTING_RAW_SNIFF=1 on bridge).
+        Returns queue of (tx_id, rx_id, payload) tuples.
+        Use parse_raw_sniff_frame(payload) to decode.
+        """
+        return self._bridge.enable_raw_queue()
+
+    def disable_raw_sniff(self):
+        self._bridge.disable_raw_queue()
+
+    def send_settings(self, setting_id: int, value: bytes):
+        """Send a BRG_SETTING_* command to the bridge firmware."""
+        self._bridge.send_settings(setting_id, value)
