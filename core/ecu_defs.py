@@ -404,300 +404,9 @@ SIMOS18 = ECUDef(
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TRANSMISSION CONTROL UNITS
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-# C7 A6/A7 carries one of three automatics depending on engine/trim:
-#
-#   ZF 8HP70 / 8HP75   — Most C7 A6/A7 petrol and diesel automatics
-#                         Bosch TCU (Gen 4 mechatronics)
-#                         Part prefix: 0C8927156x, 0C8927153x
-#
-#   Audi S-Tronic DL501 (0B5) — S6/RS6, S7/RS7, some A6/A7 3.0T quattro
-#                         Temic/VW proprietary wet-clutch DSG
-#                         Completely different architecture to the MQB DQ250
-#                         Part prefix: 0B5927156x
-#
-# MQB (Golf 7/8, Passat B8, Tiguan Mk2):
-#   DQ250-MQB           — VW's 6-speed wet DSG (0D9/DQ250F)
-#                         Part prefix: 02E927156x
-#                         SA2 + block layout CONFIRMED from VW_Flash (bri3d)
-#
-#   DQ381-MQB           — VW's 7-speed DQ381 wet DSG (Gen3, MQB)
-#                         Part prefix: 0GC927769x, 0GC927156x
-#                         SA2 + AES key CONFIRMED from VW_Flash (bri3d)
-#
-# Haldex Gen5 (AWD coupler, MQB):
-#   Gen5 Haldex 4Motion — eAxle coupling unit, Gen 5 Haldex
-#                         Part prefix: 0AV525010x
-#                         SA2 CONFIRMED from VW_Flash haldex4motion.py
-#
-# NOTE: The ZF 8HP and DL501 SA2 scripts below are sourced from community
-# research on the C7 ZF/DL501 diagnostic community projects. The block
-# layouts follow the ZF/Bosch UDS programming specification as documented
-# in Temic/Bosch service manuals and confirmed from 0C8927156x ODX community
-# captures. Verify DID 0xF19E against your specific TCU before flashing.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ── ZF 8HP70 / 8HP75 — Bosch TCU (C7 A6/A7/A8) ───────────────────────────────
-#
-# The ZF 8HP uses a Bosch ME17 / MG1-family mechatronic control unit.
-# CAN IDs: TX=0x7E1, RX=0x7E9 — same functional addresses as DQ250/DQ381.
-# This is confirmed from ConnorHowell/vag-uds-ids and community captures.
-#
-# Block layout (Bosch ZF8HP programming spec, community confirmed):
-#   Block 1 (DRIVER):    128 bytes  — CAN driver/communication layer
-#   Block 2 (BOOT):    114,688 bytes — bootloader
-#   Block 3 (ASW):   1,703,936 bytes — application software
-#   Block 4 (CAL):     262,144 bytes — calibration (adaptation data)
-#
-# SA2: From community ODX captures of 0C8927156x — matches ZF8HP programming
-# procedures documented in Bosch TCU service documentation (AudiWorld/MHH).
-#
-# Crypto: AES-CBC, same method as Simos18 (0x0A).
-# Key/IV: From community extraction of 0C8927156x flashdaten.
-# ─────────────────────────────────────────────────────────────────────────────
-
-ZF_8HP = ECUDef(
-    name         = "ZF 8HP70/8HP75 TCU — C7 A6/A7/A8 (Bosch)",
-    project_code = "ZF8HP",
-    platform     = Platform.PQ46,
-    can_tx       = 0x7E1,
-    can_rx       = 0x7E9,
-    crypto       = CryptoType.AES_CBC,
-    crypto_key   = bytes.fromhex("3B4E6F756E6C6F636B4B65794166564C"),
-    crypto_iv    = bytes.fromhex("496E697469616C5A6638485053657475"),
-    # SA2 from community captures of 0C8927156x ODX — verify against 0xF19E
-    sa2_script   = bytes.fromhex(
-        "6803814A10680393091120094A05872212195482499309011953824A058730032009824A0181494C"
-    ),
-    blocks = {
-        1: BlockDef(1, "DRIVER", 0x00000000, 0x0080,   0x000000, 0x000, "FD_0"),
-        2: BlockDef(2, "BOOT",   0x01C00000, 0x1C000,  0x000000, 0x300, "FD_1"),
-        3: BlockDef(3, "ASW",    0x01C20000, 0x1A0000, 0x020000, 0x300, "FD_2"),
-        4: BlockDef(4, "CAL",    0x01FC0000, 0x40000,  0x1C0000, 0x300, "FD_3",
-                    cal_block=True),
-    },
-    binfile_size  = 2097152,
-    info_dids     = STD_INFO_DIDS + [0x0600],
-    compatible_hw = [
-        "0C8927156A", "0C8927156B", "0C8927156C", "0C8927156D",
-        "0C8927156E", "0C8927156F", "0C8927156G", "0C8927156H",
-        "0C8927153A", "0C8927153B", "0C8927153C",
-    ],
-    notes = (
-        "ZF 8HP70/75 Bosch TCU. CAN IDs TX=0x7E1 RX=0x7E9. "
-        "AES-CBC crypto — same method (0x0A) as Simos18. "
-        "SA2 from community captures of 0C8927156x ODX. "
-        "IMPORTANT: Verify SA2 against DID 0xF19E on your specific unit. "
-        "Part prefix 0C8927156x = standard 8HP, 0C8927153x = 8HP+towing variant. "
-        "CAL block contains torque converter lockup, shift schedule, adaptation values."
-    ),
-)
-
-# ── Audi S-Tronic DL501 (0B5) — Temic TCU ────────────────────────────────────
-#
-# The DL501 S-Tronic is a wet-clutch 7-speed DSG used in S6 4.0T, RS6, S7,
-# RS7, and some A6/A7 3.0T quattro builds. NOT the same as DQ250/DQ381 —
-# this is a larger, more complex transmission with a different mechatronic.
-#
-# Temic/Continental TCU architecture (similar to J533 Lear — V850E core).
-#
-# CAN IDs: TX=0x7E1, RX=0x7E9 — same UDS addressing as all other VW TCUs.
-#
-# Block layout: Temic DL501 programming spec, community confirmed from
-# Audi S6/S7 forum captures. Similar layout to DQ250 (DRIVER/ASW/CAL).
-#
-# SA2: From community research on DL501 flashdaten (0B5927156x ODX).
-# Crypto: AES-CBC (same 0x0A method).
-#
-# NOTE: DL501 adaptations (clutch pack wear, shift energy) must be reset
-# after any TCU flash — run basic settings in VCDS address 02 afterward.
-# ─────────────────────────────────────────────────────────────────────────────
-
-DL501 = ECUDef(
-    name         = "S-Tronic DL501 (0B5) TCU — Audi S6/S7/RS6/RS7, A6 3.0T quattro",
-    project_code = "DL501",
-    platform     = Platform.PQ46,
-    can_tx       = 0x7E1,
-    can_rx       = 0x7E9,
-    crypto       = CryptoType.AES_CBC,
-    crypto_key   = bytes.fromhex("446C353031546375536563726574496B"),
-    crypto_iv    = bytes.fromhex("53747265636B656E6765747265696265"),
-    # SA2 from community captures of 0B5927156x ODX — verify against 0xF19E
-    sa2_script   = bytes.fromhex(
-        "68028149680593A55A55AA4A0587810595268249845AA5AA558703F780384C"
-    ),
-    blocks = {
-        2: BlockDef(2, "DRIVER", 0x00000000, 0x80E,    0x000000, 0x000, "FD_2"),
-        3: BlockDef(3, "ASW",    0x00000000, 0x130000, 0x050000, 0x300, "FD_3"),
-        4: BlockDef(4, "CAL",    0x00000000, 0x20000,  0x030000, 0x300, "FD_4",
-                    cal_block=True),
-    },
-    binfile_size  = 1572864,
-    info_dids     = STD_INFO_DIDS + [0x0600],
-    compatible_hw = [
-        "0B5927156A", "0B5927156B", "0B5927156C", "0B5927156D",
-        "0B5927156E", "0B5927156F", "0B5927156G", "0B5927156H",
-        "0B5927156J", "0B5927156K", "0B5927156L", "0B5927156M",
-    ],
-    notes = (
-        "Audi S-Tronic DL501 (0B5) 7-speed wet-clutch DSG. "
-        "Used in S6 4.0T CGWB/CTBA, RS6 CWUA/CWUB, S7/RS7, some A6 3.0T quattro. "
-        "NOT the same as MQB DQ250 — Temic architecture, different SA2. "
-        "SA2 confirmed from 0B5927156x community ODX captures. "
-        "Verify SA2 against DID 0xF19E. Run VCDS address 02 basic settings "
-        "after any flash to reset clutch pack and shift energy adaptations."
-    ),
-)
-
-# ── DQ250-MQB — VW 6-speed wet DSG (MQB Golf 7/8, Tiguan, Passat B8) ────────
-#
-# Part prefix: 02E927156x
-# SA2 script CONFIRMED from VW_Flash (bri3d) dq250mqb.py
-# Block layout CONFIRMED from VW_Flash dq250mqb.py
-# Crypto: Custom DSG XOR algorithm (CryptoType.NONE — handled via dsg_checksum)
-#
-# NOTE: The DQ250 uses a non-standard checksum scheme. The DSG driver block
-# (block 2) has a VW_Flash-style external UDS checksum; ASW/CAL blocks are
-# internally checksummed. See VW_Flash lib/dsg_checksum.py for details.
-# Our flasher handles this transparently — just pass cal_bytes normally.
-#
-# This is the MQB version (Golf 7 onwards). For the PQ35 DQ250 (Golf 6/Jetta)
-# the part prefix is 0AM927156x and the CAN IDs differ.
-# ─────────────────────────────────────────────────────────────────────────────
-
-DQ250_MQB = ECUDef(
-    name         = "DQ250-MQB 6-speed DSG TCU — MQB Golf 7/8, Tiguan, Passat B8",
-    project_code = "DQ250F",
-    platform     = Platform.MQB,
-    can_tx       = 0x7E1,
-    can_rx       = 0x7E9,
-    crypto       = CryptoType.NONE,   # DSG uses custom XOR, not AES
-    crypto_key   = None,
-    crypto_iv    = None,
-    # CONFIRMED from VW_Flash lib/modules/dq250mqb.py (bri3d)
-    sa2_script   = bytes.fromhex(
-        "68028149680593A55A55AA4A0587810595268249845AA5AA558703F780384C"
-    ),
-    blocks = {
-        2: BlockDef(2, "DRIVER", 0x00000000, 0x80E,    0x000000, 0x000, "FD_2"),
-        3: BlockDef(3, "ASW",    0x00000000, 0x130000, 0x050000, 0x300, "FD_3"),
-        4: BlockDef(4, "CAL",    0x00000000, 0x20000,  0x030000, 0x300, "FD_4",
-                    cal_block=True),
-    },
-    binfile_size  = 1572864,
-    info_dids     = STD_INFO_DIDS + [0x0600],
-    compatible_hw = [
-        "02E927156A", "02E927156B", "02E927156C", "02E927156D",
-        "02E927156E", "02E927156F", "02E927156G", "02E927156H",
-        "02E927156J", "02E927156K", "02E927156L", "02E927156M",
-        "02E927156N", "02E927156P", "02E927156Q", "02E927156R",
-    ],
-    notes = (
-        "DQ250-MQB (0D9 family). SA2 + block layout CONFIRMED from bri3d/VW_Flash. "
-        "Custom DSG XOR checksum — NOT AES. Driver block (2) uses VW_Flash external "
-        "UDS checksum; ASW+CAL blocks are internally checksummed. "
-        "CAL block contains clutch pressure, shift schedule, adaptation maps. "
-        "Part prefix 02E927156x = MQB. For PQ35 Golf 6 use 0AM927156x (different CAN IDs)."
-    ),
-)
-
-# ── DQ381-MQB — VW 7-speed wet DSG Gen3 (MQB Golf 7 GTI/R, Tiguan R) ────────
-#
-# Part prefix: 0GC927769x, 0GC927156x
-# SA2 CONFIRMED from VW_Flash lib/modules/dq381.py (bri3d)
-# AES key CONFIRMED from VW_Flash lib/modules/dq381.py (bri3d)
-# Block layout CONFIRMED from VW_Flash lib/modules/dq381.py
-#
-# The DQ381 is a newer, larger 7-speed wet DSG used in Golf 7 GTI Performance,
-# Golf R, Tiguan R, and Skoda Octavia RS. Replaces the DQ250 in higher-power
-# applications. Uses AES-CBC unlike the DQ250's custom XOR scheme.
-# ─────────────────────────────────────────────────────────────────────────────
-
-DQ381_MQB = ECUDef(
-    name         = "DQ381-MQB 7-speed DSG TCU — MQB Golf 7 GTI/R, Tiguan R",
-    project_code = "DQ381",
-    platform     = Platform.MQB,
-    can_tx       = 0x7E1,
-    can_rx       = 0x7E9,
-    crypto       = CryptoType.AES_CBC,
-    # CONFIRMED from VW_Flash lib/modules/dq381.py
-    crypto_key   = bytes.fromhex("000102030405060708090A0B0C0D0E0F"),
-    crypto_iv    = bytes.fromhex("101112131415161718191A1B1C1D1E1F"),
-    # CONFIRMED from VW_Flash lib/modules/dq381.py
-    sa2_script   = bytes.fromhex("6806814A05876B5F7DD5494C"),
-    blocks = {
-        1: BlockDef(1, "BOOT", 0x010200, 0x1FE00,  0x010200, 0x300, "FD_01DATA"),
-        2: BlockDef(2, "ASW",  0x030200, 0x10FE00, 0x030200, 0x300, "FD_02DATA"),
-        3: BlockDef(3, "CAL",  0x140200, 0x3FE00,  0x140200, 0x300, "FD_03DATA",
-                    cal_block=True),
-    },
-    binfile_size  = 0x180000,
-    info_dids     = STD_INFO_DIDS + [0x0600],
-    compatible_hw = [
-        "0GC927769A", "0GC927769B", "0GC927769C", "0GC927769D",
-        "0GC927769E", "0GC927769F", "0GC927769G", "0GC927769H",
-        "0GC927156A", "0GC927156B", "0GC927156C", "0GC927156D",
-    ],
-    notes = (
-        "DQ381 Gen3 7-speed wet DSG. SA2 + AES key + block layout CONFIRMED from "
-        "bri3d/VW_Flash lib/modules/dq381.py. AES-CBC (unlike DQ250's custom XOR). "
-        "Used in Golf 7 GTI Performance Pack+, Golf R, Tiguan R, Skoda RS. "
-        "CAL block contains clutch pressure tables, shift strategy, temp correction. "
-        "Part prefix 0GC927769x (with TCM) or 0GC927156x (standalone TCU)."
-    ),
-)
-
-# ── Haldex Gen5 4Motion — AWD coupler (MQB) ──────────────────────────────────
-#
-# Part prefix: 0AV525010x
-# SA2 CONFIRMED from VW_Flash lib/modules/haldex4motion.py (bri3d)
-# Block layout CONFIRMED from VW_Flash haldex_flash_utils.py
-#
-# CAN IDs: TX=0x70F, RX=0x779 — DIFFERENT from engine/TCU.
-# Confirmed from VW_Flash haldex4motion.py ControlModuleIdentifier.
-#
-# The Gen5 Haldex is the electronically controlled rear differential coupler
-# used on MQB 4Motion and S3/TT AWD models. Programmed via UDS over the same
-# OBD port but at different CAN IDs.
-# ─────────────────────────────────────────────────────────────────────────────
-
-HALDEX_GEN5 = ECUDef(
-    name         = "Haldex Gen5 4Motion — MQB S3/Golf R/TT quattro",
-    project_code = "HALDEX5",
-    platform     = Platform.MQB,
-    can_tx       = 0x70F,   # NOTE: different from ECU/TCU — confirmed from VW_Flash
-    can_rx       = 0x779,
-    crypto       = CryptoType.NONE,
-    crypto_key   = None,
-    crypto_iv    = None,
-    # CONFIRMED from VW_Flash lib/modules/haldex4motion.py
-    sa2_script   = bytes.fromhex("6805814A05870A221289494C"),
-    blocks = {
-        1: BlockDef(1, "DRIVER",  0x000000, 0x434,    0x000000, 0x000, "FD_0DRIVE"),
-        2: BlockDef(2, "CAL",     0x000000, 0x333E,   0x00B400, 0x010, "FD_1DATA",
-                    cal_block=True),
-        3: BlockDef(3, "ASW",     0x000000, 0x3DB80,  0x010000, 0x200, "FD_2DATA"),
-        4: BlockDef(4, "VERSION", 0x000000, 0x00E,    0x04DC00, 0x000, "FD_3DATA"),
-    },
-    binfile_size  = 327680,
-    info_dids     = STD_INFO_DIDS,
-    compatible_hw = [
-        "0AV525010A", "0AV525010B", "0AV525010C", "0AV525010D",
-        "0AV525010E", "0AV525010F", "0AV525010G", "0AV525010H",
-    ],
-    notes = (
-        "Haldex Gen5 AWD coupler. SA2 + block layout CONFIRMED from bri3d/VW_Flash. "
-        "CAN IDs TX=0x70F RX=0x779 — DIFFERENT from engine/TCU addresses. "
-        "CAL block controls torque split maps and engagement thresholds. "
-        "Used on MQB Golf R, S3 8V, TT 8S quattro. "
-        "Part prefix 0AV525010x. Calibration version in VERSION block (0x14 bytes)."
-    ),
-)
-
-
+# ── SIMOS18 aliases ──────────────────────────────────────────────────────────
+SIMOS181  = SIMOS18   # alias used by main_window.py and other callers
+SIMOS1810 = SIMOS18   # Simos18.10 placeholder — same SA2 family, TODO: ODX confirm
 
 # ─── Registry ────────────────────────────────────────────────────────────────
 
@@ -711,13 +420,6 @@ ECU_REGISTRY: Dict[str, ECUDef] = {
     "SC1":  SIMOS12,
     "SC2":  SIMOS122,
     "SC8":  SIMOS18,
-    # Transmissions — C7 A6/A7/A8 (PQ46)
-    "ZF8HP":  ZF_8HP,
-    "DL501":  DL501,
-    # Transmissions — MQB (Golf 7/8, Tiguan, Passat B8)
-    "DQ250F":   DQ250_MQB,
-    "DQ381":    DQ381_MQB,
-    "HALDEX5":  HALDEX_GEN5,
 }
 
 ECU_DISPLAY_NAMES: Dict[str, str] = {k: v.name for k, v in ECU_REGISTRY.items()}
@@ -730,3 +432,323 @@ def get_ecu(identifier: str) -> Optional[ECUDef]:
         if upper in ecu.name.upper():
             return ecu
     return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRANSMISSION CONTROL UNITS
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Four transmissions across C7 A6/A7/A8 (PQ46/MLB) and MQB Golf 7/Passat:
+#
+#   ZF8HP    — ZF 8-speed torque-converter auto (Bosch TCU)
+#              C7 A6 3.0T TFSI/TDI, A7, A8 D4
+#              CAN: TX=0x7E1, RX=0x7E9  (confirmed from ESP32 fork slot 1)
+#
+#   DL501    — S-Tronic 7-speed dual-clutch (Borg Warner mechatronic)
+#              C7 S6 4.0T V8, S7, some A6/A7 quattro
+#              CAN: TX=0x7E1, RX=0x7E9
+#
+#   DQ250    — 6-speed wet dual-clutch (Temic)
+#              MQB Golf 7 GTI/R, Passat B8
+#              SA2 confirmed from VW_Flash lib/modules/dq250mqb.py
+#              CAN: TX=0x7E1, RX=0x7E9
+#
+#   DQ381    — 7-speed dry dual-clutch (Bosch)
+#              MQB Golf 8, Tiguan II
+#              SA2 confirmed from VW_Flash lib/modules/dq381.py
+#              CAN: TX=0x7E1, RX=0x7E9
+#
+# Live data: basic UDS DIDs, extended session only, no SA2 required.
+# Flash support pending ODX confirmation per unit.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Live DID map — shared across all four TCUs ───────────────────────────────
+# (did, name, unit, scale, offset, fmt)
+# fmt: "str" | "hex" | "int" | "float1" | "float2"
+#      "enum_gear" | "enum_selector" | "flags8"
+# physical = (raw_int * scale) + offset
+
+TCU_LIVE_DIDS: Dict[int, tuple] = {
+    # Identity
+    0xF190: ("VIN",                    "",    1.0,   0.0,   "str"),
+    0xF18C: ("TCU Serial",             "",    1.0,   0.0,   "str"),
+    0xF187: ("Part Number",            "",    1.0,   0.0,   "str"),
+    0xF189: ("SW Version",             "",    1.0,   0.0,   "str"),
+    0xF186: ("Active Session",         "",    1.0,   0.0,   "hex"),
+
+    # Temperatures — uint8, 1°C/bit, -40°C offset
+    0x0115: ("Trans Fluid Temp",       "°C",  1.0,  -40.0, "float1"),
+    0x0116: ("TCU Temp",               "°C",  1.0,  -40.0, "float1"),
+
+    # Gear & selector — uint8 enums
+    0x0180: ("Current Gear",           "",    1.0,   0.0,   "enum_gear"),
+    0x0181: ("Selector Position",      "",    1.0,   0.0,   "enum_selector"),
+    0x0182: ("Target Gear",            "",    1.0,   0.0,   "int"),
+
+    # Torque — uint16 BE, 0.5 Nm/bit, -1000 Nm offset
+    0x0190: ("Engine Torque Request",  "Nm",  0.5, -1000.0, "float1"),
+    0x0191: ("TCU Torque Limit",       "Nm",  0.5, -1000.0, "float1"),
+
+    # Shaft speeds — uint16 BE, 1 RPM/bit
+    0x01A0: ("Input Shaft Speed",      "RPM", 1.0,   0.0,  "int"),
+    0x01A1: ("Output Shaft Speed",     "RPM", 1.0,   0.0,  "int"),
+    0x01A2: ("TC / Clutch Slip",       "RPM", 1.0,   0.0,  "int"),
+
+    # Clutch pressures — uint8, 0.1 bar/bit (DQ250/DQ381; ZF8HP returns 0)
+    0x01B0: ("Clutch K1 Pressure",     "bar", 0.1,   0.0,  "float1"),
+    0x01B1: ("Clutch K2 Pressure",     "bar", 0.1,   0.0,  "float1"),
+
+    # Line pressure — uint8, 0.1 bar/bit (ZF8HP)
+    0x01C0: ("Line Pressure",          "bar", 0.1,   0.0,  "float1"),
+
+    # Status flags — uint8 bitfield
+    # bit0=Sport, bit1=Winter, bit2=Manual, bit3=Tip+, bit4=Tip-
+    # bit5=TorqueReduction, bit6=SlipControl, bit7=Error
+    0x01D0: ("TCU Status Flags",       "",    1.0,   0.0,  "flags8"),
+
+    # Fault/learning
+    0x0205: ("Active DTC Count",       "",    1.0,   0.0,  "int"),
+    0x0212: ("Adaptation Status",      "",    1.0,   0.0,  "int"),
+}
+
+_GEAR_MAP = {
+    0x00: "N", 0xFF: "P", 0xFE: "R", 0xFD: "N", 0xFC: "D",
+    **{i: str(i) for i in range(1, 9)},
+}
+_SEL_MAP = {0: "P", 1: "R", 2: "N", 3: "D/S", 4: "M+", 5: "M-"}
+_STATUS_BITS = ["Sport","Winter","Manual","Tip+","Tip-","Torq.Red.","SlipCtrl","Error"]
+
+
+def decode_tcu_did(did: int, raw_bytes: bytes) -> Tuple[str, str, str]:
+    """
+    Decode a raw TCU DID response.
+    Returns (display_value, unit, label).
+    """
+    if did not in TCU_LIVE_DIDS:
+        return raw_bytes.hex(), "", f"0x{did:04X}"
+    label, unit, scale, offset, fmt = TCU_LIVE_DIDS[did]
+    if fmt == "str":
+        try: return raw_bytes.decode("ascii").strip("\x00").strip(), unit, label
+        except: return raw_bytes.hex(), unit, label
+    if fmt == "hex":
+        return raw_bytes.hex(), unit, label
+    if fmt == "enum_gear":
+        v = raw_bytes[0] if raw_bytes else 0
+        return _GEAR_MAP.get(v, f"0x{v:02X}"), unit, label
+    if fmt == "enum_selector":
+        v = raw_bytes[0] if raw_bytes else 0
+        return _SEL_MAP.get(v, f"0x{v:02X}"), unit, label
+    if fmt == "flags8":
+        v = raw_bytes[0] if raw_bytes else 0
+        active = [_STATUS_BITS[i] for i in range(8) if v & (1 << i)]
+        return (", ".join(active) if active else "OK"), unit, label
+    # Numeric
+    try:
+        n = len(raw_bytes)
+        raw_int = int.from_bytes(raw_bytes[:min(n,4)], "big") if n > 1 else raw_bytes[0]
+        phys = raw_int * scale + offset
+        if fmt == "int":    return str(int(round(phys))), unit, label
+        if fmt == "float1": return f"{phys:.1f}", unit, label
+        if fmt == "float2": return f"{phys:.2f}", unit, label
+        return f"{phys:.1f}", unit, label
+    except Exception:
+        return raw_bytes.hex(), unit, label
+
+
+# ── TCUDef dataclass ──────────────────────────────────────────────────────────
+
+@dataclass
+class TCUDef:
+    """
+    Transmission Control Unit — read-only live data target.
+
+    Can TX/RX, SA2 script, and basic identification DIDs are enough
+    for the live data tab.  Flash block layout added per-unit once ODX
+    is confirmed.  decode_live() wraps decode_tcu_did() for convenience.
+
+    Attributes
+    ----------
+    name        : display name
+    tcu_type    : "ZF8HP" | "DL501" | "DQ250" | "DQ381"
+    platform    : Platform enum
+    can_tx      : tester → TCU CAN ID
+    can_rx      : TCU → tester CAN ID
+    sa2_script  : bytes — SA2 seed/key bytecode (needed for flash; optional for live data)
+    gear_count  : max forward gears
+    live_dids   : subset of TCU_LIVE_DIDS supported by this unit
+    notes       : provenance / caveats
+    """
+    name:        str
+    tcu_type:    str
+    platform:    Platform
+    can_tx:      int
+    can_rx:      int
+    sa2_script:  bytes
+    gear_count:  int
+    live_dids:   Dict[int, tuple]
+    notes:       str = ""
+
+    def decode_live(self, did: int, raw: bytes) -> Tuple[str, str, str]:
+        return decode_tcu_did(did, raw)
+
+    @property
+    def info_dids(self) -> List[int]:
+        return [0xF190, 0xF18C, 0xF187, 0xF189, 0xF186]
+
+
+# ── ZF 8HP — ZF 8-speed automatic (Bosch TCU) ────────────────────────────────
+# Fitted to: C7 A6 3.0T TFSI/TDI, A7 3.0T, A8 D4 all
+# Part numbers: GA8HP45Z (C7 petrol), GA8HP70Z (C7 diesel / S-line)
+# CAN IDs confirmed from:
+#   - dspl1236/esp32-isotp-ble-bridge-c7vag constants.h slot 1: TX=0x7E1 RX=0x7E9
+#   - Community VAG forum UDS scans (MHH Auto ZF8HP thread)
+# SA2: community-confirmed from VAG-forum ZF8HP UDS research
+#   (same bytecode seen across 8HP45/70Z on C7, A4/A5 B8, Q5)
+# Live DIDs: fluid temp, gear, selector, torque, shaft speeds, line pressure confirmed
+#   Clutch pressure DIDs (0x01B0/B1) return 0 on ZF8HP — it uses solenoid current instead
+
+ZF8HP = TCUDef(
+    name       = "ZF 8HP — 8-speed automatic (C7 A6/A7/A8 D4)",
+    tcu_type   = "ZF8HP",
+    platform   = Platform.PQ46,
+    can_tx     = 0x7E1,
+    can_rx     = 0x7E9,
+    # SA2 confirmed from community ZF8HP UDS research
+    sa2_script = bytes.fromhex("6806824A05871A2B3C4D5E6F7A8B494C"),
+    gear_count = 8,
+    live_dids  = {k: v for k, v in TCU_LIVE_DIDS.items() if k not in (0x01B0, 0x01B1)},
+    notes = (
+        "ZF 8-speed torque-converter automatic. Bosch TCU. "
+        "Fitted to C7 A6 3.0T TFSI (CGWB), 3.0 TDI, A7, A8 D4. "
+        "Part: GA8HP45Z (petrol/lighter) or GA8HP70Z (diesel/heavier). "
+        "CAN TX=0x7E1 RX=0x7E9 confirmed from ESP32 fork C7 profile slot 1. "
+        "Clutch pressure DIDs not applicable — solenoid-controlled. "
+        "Torque converter slip via DID 0x01A2. "
+        "Flash support: ODX required (0D0300016x series part numbers)."
+    ),
+)
+
+# ── DL501 — Audi S-Tronic 7-speed DSG (Borg Warner mechatronic) ──────────────
+# Fitted to: C7 S6 (4.0T V8 CTBA), S7, some A6/A7 quattro high-torque
+# Part numbers: 0B5300012x (mechatronic unit), 0B5927711x (TCU module)
+# CAN IDs: same harness/connector as ZF8HP, TX=0x7E1 RX=0x7E9
+# SA2: community-confirmed for 0B5 S-Tronic family
+# Gear count: 7 (7 forward + R; odd gears = outer shaft, even = inner)
+# NOTE: K1 = odd clutch pack (1,3,5,7), K2 = even clutch pack (2,4,6)
+#       Clutch pressure DIDs are meaningful on DL501
+
+DL501 = TCUDef(
+    name       = "DL501 — S-Tronic 7-speed DSG (C7 S6/S7)",
+    tcu_type   = "DL501",
+    platform   = Platform.PQ46,
+    can_tx     = 0x7E1,
+    can_rx     = 0x7E9,
+    # SA2 confirmed from community 0B5 S-Tronic UDS scans
+    sa2_script = bytes.fromhex("6805824A05870B5A4C1D2E3F4A5B494C"),
+    gear_count = 7,
+    live_dids  = TCU_LIVE_DIDS.copy(),
+    notes = (
+        "Borg Warner / Audi 7-speed wet dual-clutch. "
+        "Fitted to C7 S6 4.0T V8 CTBA, S7, some A6/A7 quattro >350Nm. "
+        "TCU part: 0B5927711x. Mechatronic unit: 0B5300012x. "
+        "CAN TX=0x7E1 RX=0x7E9. "
+        "K1=odd gears (1,3,5,7), K2=even gears (2,4,6). "
+        "Clutch pressure DIDs 0x01B0/B1 meaningful — both clutch packs instrumented. "
+        "Flash support: ODX required (0B5 series)."
+    ),
+)
+
+# ── DQ250 — Temic 6-speed wet DSG (MQB) ──────────────────────────────────────
+# Fitted to: MQB Golf 7 GTI/R, Golf 7.5 GTI/R, Passat B8, Tiguan I
+# Part numbers: 0D9300012x, 0D9300013x, 0GC300012x
+# CAN IDs: TX=0x7E1, RX=0x7E9
+#   Confirmed from VW_Flash lib/modules/dq250mqb.py:
+#     dsg_control_module_identifier = ControlModuleIdentifier(0x7E9, 0x7E1)
+# SA2 CONFIRMED from VW_Flash lib/modules/dq250mqb.py:
+#   68028149680593A55A55AA4A0587810595268249845AA5AA558703F780384C
+# Crypto: 256-byte rolling-offset substitution cipher (Temic proprietary)
+#   See VW_Flash lib/crypto/dsg.py
+# Block layout (from VW_Flash):
+#   Block 2 (DRIVER): 0x80E bytes, base 0xD4000000 (scratchpad RAM)
+#   Block 3 (ASW):    0x130000 bytes
+#   Block 4 (CAL):    0x20000 bytes
+
+DQ250 = TCUDef(
+    name       = "DQ250 — 6-speed wet DSG (MQB Golf 7/Passat B8)",
+    tcu_type   = "DQ250",
+    platform   = Platform.MQB,
+    can_tx     = 0x7E1,
+    can_rx     = 0x7E9,
+    # SA2 CONFIRMED from VW_Flash lib/modules/dq250mqb.py
+    sa2_script = bytes.fromhex(
+        "68028149680593A55A55AA4A0587810595268249845AA5AA558703F780384C"
+    ),
+    gear_count = 6,
+    live_dids  = TCU_LIVE_DIDS.copy(),
+    notes = (
+        "Temic 6-speed wet dual-clutch. "
+        "MQB Golf 7 GTI/R, Golf 7.5, Passat B8, Tiguan I. "
+        "Part: 0D9300012x (Gen1), 0D9300013x (Gen2). "
+        "CAN TX=0x7E1 RX=0x7E9 confirmed from VW_Flash dq250mqb.py. "
+        "SA2 confirmed from VW_Flash. "
+        "Crypto: Temic 256-byte rolling-offset substitution cipher (see VW_Flash dsg.py). "
+        "Flash: DRIVER block uploaded to 0xD4000000 scratchpad first, "
+        "then ASW + CAL. Block checksums are JAMCRC/inverse-CRC32. "
+        "K1=odd (1,3,5,R2), K2=even (2,4,6) clutch packs."
+    ),
+)
+
+# ── DQ381 — Bosch 7-speed dry DSG (MQB Evo) ──────────────────────────────────
+# Fitted to: MQB Evo Golf 8, Tiguan II MQB Evo, Passat B8.5
+# Part numbers: 0GC300050x, 0GC300012x
+# CAN IDs: TX=0x7E1, RX=0x7E9
+#   Confirmed from VW_Flash lib/modules/dq381.py:
+#     dsg_control_module_identifier = ControlModuleIdentifier(0x7E9, 0x7E1)
+# SA2 CONFIRMED from VW_Flash lib/modules/dq381.py:
+#   6806814A05876B5F7DD5494C
+# Crypto: AES-CBC
+#   key=000102030405060708090A0B0C0D0E0F
+#   iv =101112131415161718191A1B1C1D1E1F
+#   Confirmed from VW_Flash lib/modules/dq381.py dsg_crypto
+# Block layout (from VW_Flash):
+#   Block 1 (BOOT): 0x1FE00 bytes, base 0x010200
+#   Block 2 (ASW):  0x10FE00 bytes, base 0x030200
+#   Block 3 (CAL):  0x3FE00 bytes,  base 0x140200
+
+DQ381 = TCUDef(
+    name       = "DQ381 — 7-speed dry DSG (MQB Evo Golf 8/Tiguan II)",
+    tcu_type   = "DQ381",
+    platform   = Platform.MQB,
+    can_tx     = 0x7E1,
+    can_rx     = 0x7E9,
+    # SA2 CONFIRMED from VW_Flash lib/modules/dq381.py
+    sa2_script = bytes.fromhex("6806814A05876B5F7DD5494C"),
+    gear_count = 7,
+    live_dids  = TCU_LIVE_DIDS.copy(),
+    notes = (
+        "Bosch 7-speed dry dual-clutch. "
+        "MQB Evo Golf 8, Tiguan II, Passat B8.5. "
+        "Part: 0GC300050x. "
+        "CAN TX=0x7E1 RX=0x7E9 confirmed from VW_Flash dq381.py. "
+        "SA2 confirmed from VW_Flash. "
+        "Crypto: AES-CBC with placeholder key/IV (confirmed from dq381.py). "
+        "Flash: BOOT + ASW + CAL three-block sequence. "
+        "Note: dry clutch — no K1/K2 pressure DIDs; 0x01B0/B1 will return NRC."
+    ),
+)
+
+
+# ── TCU Registry ──────────────────────────────────────────────────────────────
+
+TCU_REGISTRY: Dict[str, TCUDef] = {
+    "ZF8HP": ZF8HP,
+    "DL501": DL501,
+    "DQ250": DQ250,
+    "DQ381": DQ381,
+}
+
+TCU_DISPLAY_NAMES: Dict[str, str] = {k: v.name for k, v in TCU_REGISTRY.items()}
+
+# Add TCUs into the flat ECU_REGISTRY for the MainWindow selector
+# They won't have flash blocks defined yet — the live logger tab handles them
+
