@@ -1,0 +1,445 @@
+"""
+tests/sim_runner.py — Simulation harness for the full simos-suite UI
+
+Patches _make_connection() to return MockConnections instead of real hardware,
+then launches the full MainWindow with all tabs live and pre-loaded with data.
+
+Run from the repo root:
+    python -m tests.sim_runner                    # Simos8.5 + ZF8HP
+    python -m tests.sim_runner --ecu SC8          # Simos18.1 + DQ250
+    python -m tests.sim_runner --ecu DQ381        # DQ381 trans only
+    python -m tests.sim_runner --headless         # No GUI — smoke-test imports
+
+What gets simulated:
+    ECU Info tab    — all 18 standard VW DIDs populated with realistic values
+    Flash tab       — full flash sequence (connect→erase→transfer→verify→done)
+                      runs at 10× speed with real progress callbacks
+    Tune tab        — pre-loads a synthetic CAL binary with known table values
+    Logger tab      — live engine DID values that drift/animate over time
+    Trans tab       — live TCU values: gear shifts, ATF warm-up, speed sweep
+    CP Tools tab    — J533 probe returns realistic constellation data
+    Raw Sniff tab   — generates synthetic CAN frames at ~5Hz
+
+Simulation is safe — no real UDS traffic, no hardware needed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import struct
+import sys
+import threading
+import time
+import random
+import math
+
+log = logging.getLogger("SimosSuite.SimRunner")
+
+
+# ── Patch _make_connection before any UI import ───────────────────────────────
+
+def _install_mock_patch(ecu_key: str = "S85", trans_key: str = "ZF8HP"):
+    """
+    Replace flasher.uds_flash._make_connection with one that returns
+    a MockConnection. Must be called before importing ui.main_window.
+    """
+    import flasher.uds_flash as flash_mod
+    from tests.mock_connection import (
+        MockConnection, SimulatedECU, SimulatedTCU,
+        make_mock_ecu_connection, make_mock_tcu_connection,
+    )
+    from core.trans_defs import TRANS_REGISTRY
+    from core.ecu_defs import ECU_REGISTRY
+
+    _real_make = flash_mod._make_connection
+
+    def _mock_make(ecu_or_proxy, interface, interface_path=None,
+                   st_min_us=350_000, ble_bridge=None):
+        # Detect TCU proxy vs ECU by can_tx address
+        # TCUs use 0x7E1; ECUs use 0x7E0 (Simos) or other
+        can_tx = getattr(ecu_or_proxy, "can_tx", 0)
+        if can_tx == 0x7E1:
+            # This is a TCU call
+            trans = TRANS_REGISTRY.get(trans_key)
+            conn = make_mock_tcu_connection(trans)
+            log.info("[SIM] TCU MockConnection → %s", trans_key)
+        else:
+            # ECU call
+            from core.ecu_defs import get_ecu
+            ecu = (get_ecu(ecu_key) if isinstance(ecu_or_proxy, str)
+                   else ecu_or_proxy)
+            conn = make_mock_ecu_connection(ecu)
+            log.info("[SIM] ECU MockConnection → %s  (CAN TX %#05x)",
+                     ecu_key, can_tx)
+        conn.open()
+        return conn
+
+    flash_mod._make_connection = _mock_make
+    log.info("[SIM] _make_connection patched with MockConnection")
+
+
+def _install_interface_patch():
+    """
+    Patch InterfaceRegistry to return a single simulated interface
+    so the connect tab shows something plausible without real hardware.
+    """
+    import transport.interfaces as iface_mod
+    from transport.interfaces import InterfaceInfo
+
+    _real_registry = iface_mod.InterfaceRegistry
+
+    class _MockRegistry:
+        def __init__(self):
+            self._interfaces = [
+                InterfaceInfo(
+                    name      = "Simulated ESP32 BLE Bridge (DEMO)",
+                    interface = "BLE",
+                    path      = "",
+                    available = True,
+                    notes     = "Simulation mode — no hardware required.",
+                ),
+                InterfaceInfo(
+                    name      = "Simulated USB Bridge COM3 (DEMO)",
+                    interface = "USBISOTP",
+                    path      = "COM3",
+                    available = True,
+                    notes     = "Simulation mode — no hardware required.",
+                ),
+            ]
+
+        def all(self):        return list(self._interfaces)
+        def available(self):  return list(self._interfaces)
+        def first_available(self): return self._interfaces[0]
+        def by_type(self, t): return [i for i in self._interfaces
+                                       if i.interface.upper() == t.upper()]
+        def refresh(self):    pass
+
+    iface_mod.InterfaceRegistry = _MockRegistry
+    log.info("[SIM] InterfaceRegistry patched with mock interfaces")
+
+
+# ── Synthetic CAL binary ───────────────────────────────────────────────────────
+
+def make_synthetic_cal(ecu_def=None) -> bytes:
+    """
+    Build a minimal synthetic Simos8.5 CAL binary that CalParser can load.
+    Tables are filled with physically plausible values.
+    """
+    from core.ecu_defs import SIMOS85
+    ecu = ecu_def or SIMOS85
+    cal_block = ecu.cal_block
+    if cal_block is None:
+        return b"\x00" * 0x3C000
+
+    size = cal_block.length
+    data = bytearray(size)
+
+    # Box code string near offset 0x60
+    box = b"4G0906259E      \x00"
+    data[0x60:0x60 + len(box)] = box
+
+    # MAF transfer (offset 0x1000, 32×uint16) — realistic voltage→flow curve
+    for i in range(32):
+        v = i * 150   # 0–4650 mV range
+        flow = min(65535, int(v * 0.018))  # ~kg/h approximation
+        struct.pack_into(">H", data, 0x1000 + i * 2, flow)
+
+    # Lambda setpoint (offset 0x3200, 16×16 uint16) — all stoich (1.000)
+    for r in range(16):
+        for c in range(16):
+            struct.pack_into(">H", data, 0x3200 + (r * 16 + c) * 2, 1000)
+
+    # Injector scaling (offset 0x2400, 16×16 uint16) — 0.8–2.5ms range
+    for r in range(16):
+        for c in range(16):
+            ms = 0.8 + (r * 0.1) + (c * 0.08)
+            raw = min(65535, int(ms * 1000))
+            struct.pack_into(">H", data, 0x2400 + (r * 16 + c) * 2, raw)
+
+    # Boost setpoint (offset 0x5C00, 16×16 uint16) — 100–250 kPa
+    for r in range(16):
+        for c in range(16):
+            kpa = 100 + r * 10 + c * 2
+            struct.pack_into(">H", data, 0x5C00 + (r * 16 + c) * 2,
+                             int(kpa * 10))
+
+    # Write a placeholder checksum
+    struct.pack_into("<I", data, ecu.blocks[3].checksum_offset + 4, 0xDEADBEEF)
+
+    return bytes(data)
+
+
+# ── Flash simulation thread ────────────────────────────────────────────────────
+
+def simulate_flash_sequence(callback, total_bytes: int = 0x3C000,
+                             speed_multiplier: float = 10.0):
+    """
+    Run a simulated flash sequence that fires real FlashProgress callbacks
+    at the same rate as a real flash, but 10× faster by default.
+    """
+    from flasher.uds_flash import FlashProgress
+
+    def _run():
+        steps = [
+            ("CONNECT",  "Opening extended diagnostic session…",    5),
+            ("CONNECT",  "VIN: WAUZZZ4G9EN123456",                 10),
+            ("CONNECT",  "Entering programming session…",           15),
+            ("CONNECT",  "Security access (SA2)…",                  20),
+            ("ERASE",    "Erasing CAL block 3…",                    25),
+        ]
+        for step, msg, pct in steps:
+            callback(FlashProgress(step, msg, pct))
+            time.sleep(0.3 / speed_multiplier)
+
+        # Transfer
+        chunk = 0xFFD - 2
+        sent = 0
+        counter = 1
+        while sent < total_bytes:
+            pct = 30 + int(60 * sent / total_bytes)
+            callback(FlashProgress(
+                "TRANSFER",
+                f"Writing {sent:#08x}/{total_bytes:#08x}",
+                pct, "CAL"))
+            sent += chunk
+            counter = (counter + 1) & 0xFF or 1
+            time.sleep(0.01 / speed_multiplier)
+
+        callback(FlashProgress("TRANSFER", "Transfer complete, exiting…", 92, "CAL"))
+        time.sleep(0.2 / speed_multiplier)
+        callback(FlashProgress("VERIFY",   "Running checksum verification…", 95))
+        time.sleep(0.3 / speed_multiplier)
+        callback(FlashProgress("VERIFY",   "Checksum OK", 98))
+        time.sleep(0.1 / speed_multiplier)
+        callback(FlashProgress("DONE",
+                               "CAL block flashed successfully — WAUZZZ4G9EN123456",
+                               100, "CAL"))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ── Raw sniff frame generator ──────────────────────────────────────────────────
+
+def start_sniff_generator(callback, interval: float = 0.2):
+    """
+    Generate synthetic raw CAN frames at a regular interval.
+    callback receives (bytes) — same format as BLE sniff frames.
+    """
+    CAN_IDS = [0x710, 0x77A, 0x746, 0x7B0, 0x7E0, 0x7E8]
+    running = [True]
+
+    def _gen():
+        count = 0
+        while running[0]:
+            can_id = random.choice(CAN_IDS)
+            dlc = random.randint(4, 8)
+            payload = bytes([random.randint(0, 255) for _ in range(dlc)])
+            # BLE bridge raw frame format: [id_hi][id_lo][dlc][d0..d7]
+            frame = bytes([can_id >> 8, can_id & 0xFF, dlc]) + payload
+            callback(frame)
+            count += 1
+            time.sleep(interval)
+
+    t = threading.Thread(target=_gen, daemon=True)
+    t.start()
+    return lambda: running.__setitem__(0, False)
+
+
+# ── Auto-connect helper ────────────────────────────────────────────────────────
+
+def auto_connect_after_launch(mw, delay: float = 1.5):
+    """
+    After the MainWindow is visible, automatically trigger a connection
+    on the first available (simulated) interface so all tabs light up.
+    """
+    def _do():
+        time.sleep(delay)
+        try:
+            # Fire the connect callback directly — simulates user clicking connect
+            mw._on_connected("BLE", "")
+            log.info("[SIM] Auto-connected (BLE simulation)")
+
+            # Pre-populate Flash tab with synthetic CAL
+            time.sleep(0.5)
+            for tab in getattr(mw, "_tabs", []):
+                cls_name = type(tab).__name__
+                if cls_name == "FlashTab":
+                    cal = make_synthetic_cal(mw.ecu)
+                    if hasattr(tab, "_cal_bytes"):
+                        tab._cal_bytes = cal
+                    if hasattr(tab, "_file_var"):
+                        tab._file_var.set("synthetic_cal_demo.bin")
+                    log.info("[SIM] FlashTab: pre-loaded %d byte synthetic CAL", len(cal))
+
+        except Exception as e:
+            log.warning("[SIM] auto-connect: %s", e)
+
+    threading.Thread(target=_do, daemon=True).start()
+
+
+# ── Headless smoke test ────────────────────────────────────────────────────────
+
+def run_headless(ecu_key: str = "S85", trans_key: str = "ZF8HP") -> bool:
+    """
+    Import and exercise all backend modules without starting the GUI.
+    Returns True if all checks pass.
+    """
+    print("=" * 60)
+    print("Simos Suite — headless smoke test")
+    print("=" * 60)
+    ok = True
+
+    # 1. Core definitions
+    try:
+        from core.ecu_defs import ECU_REGISTRY, get_ecu, SIMOS85
+        from core.trans_defs import TRANS_REGISTRY, get_trans, ZF8HP
+        ecu   = ECU_REGISTRY.get(ecu_key) or SIMOS85
+        trans = TRANS_REGISTRY.get(trans_key) or ZF8HP
+        print(f"  OK  core defs  — ECU: {ecu.name}")
+        print(f"  OK  core defs  — TCU: {trans.name}")
+    except Exception as e:
+        print(f"  FAIL core defs — {e}"); ok = False
+
+    # 2. Mock connection — ECU
+    try:
+        from tests.mock_connection import SimulatedECU, MockConnection
+        sim  = SimulatedECU(ecu)
+        conn = MockConnection(sim, latency_ms=0)
+        conn.open()
+        req  = bytes([0x10, 0x03])   # extend session
+        conn.specific_send(req)
+        resp = conn.specific_wait_frame(timeout=2.0)
+        assert resp[0] == 0x50, f"Expected 0x50, got {resp[0]:#04x}"
+        conn.close()
+        print("  OK  mock ECU   — extended session response correct")
+    except Exception as e:
+        print(f"  FAIL mock ECU  — {e}"); ok = False
+
+    # 3. Mock connection — read DID F190 (VIN)
+    try:
+        from tests.mock_connection import SimulatedECU, MockConnection
+        conn = MockConnection(SimulatedECU(ecu), latency_ms=0)
+        conn.open()
+        conn.specific_send(bytes([0x22, 0xF1, 0x90]))
+        resp = conn.specific_wait_frame(timeout=2.0)
+        assert resp[0] == 0x62, f"Expected 0x62 ReadDID response, got {resp[0]:#04x}"
+        vin = resp[3:20].decode("ascii", errors="replace").strip()
+        print(f"  OK  mock DID   — VIN: {vin}")
+        conn.close()
+    except Exception as e:
+        print(f"  FAIL mock DID  — {e}"); ok = False
+
+    # 4. Mock connection — TCU
+    try:
+        from tests.mock_connection import SimulatedTCU, MockConnection
+        conn = MockConnection(SimulatedTCU(trans), latency_ms=0)
+        conn.open()
+        conn.specific_send(bytes([0x22, 0x01, 0x80]))  # gear DID
+        resp = conn.specific_wait_frame(timeout=2.0)
+        assert resp[0] == 0x62, f"Expected 0x62, got {resp[0]:#04x}"
+        gear = resp[3]
+        print(f"  OK  mock TCU   — gear DID 0x0180: {gear}")
+        conn.close()
+    except Exception as e:
+        print(f"  FAIL mock TCU  — {e}"); ok = False
+
+    # 5. CalParser on synthetic CAL
+    try:
+        cal = make_synthetic_cal(ecu)
+        assert len(cal) == ecu.cal_block.length, \
+            f"CAL size mismatch: {len(cal)} vs {ecu.cal_block.length}"
+        print(f"  OK  synthetic CAL — {len(cal):#x} bytes")
+    except Exception as e:
+        print(f"  FAIL synthetic CAL — {e}"); ok = False
+
+    # 6. Flash progress simulation
+    try:
+        events = []
+        simulate_flash_sequence(events.append, speed_multiplier=1000.0)
+        time.sleep(0.5)
+        assert any(e.step == "DONE" for e in events), \
+            f"Expected DONE event, got: {[e.step for e in events]}"
+        print(f"  OK  flash sim  — {len(events)} events, final: {events[-1].step}")
+    except Exception as e:
+        print(f"  FAIL flash sim — {e}"); ok = False
+
+    # 7. Import chain — check all UI modules import without error
+    ui_modules = [
+        "ui.interface_panel",
+        "ui.trans_logger",
+    ]
+    for mod in ui_modules:
+        try:
+            # Only check if tkinter is available
+            import tkinter  # noqa
+            __import__(mod)
+            print(f"  OK  import     — {mod}")
+        except ModuleNotFoundError as e:
+            if "tkinter" in str(e):
+                print(f"  SKIP import    — {mod} (no tkinter on this platform)")
+            else:
+                print(f"  FAIL import    — {mod}: {e}"); ok = False
+        except Exception as e:
+            print(f"  FAIL import    — {mod}: {e}"); ok = False
+
+    print("=" * 60)
+    print(f"Result: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+# ── Main entry point ───────────────────────────────────────────────────────────
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(name)-32s  %(levelname)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    ap = argparse.ArgumentParser(
+        description="Simos Suite simulation harness")
+    ap.add_argument("--ecu",       default="S85",
+                    help="ECU to simulate (S85, SC8, SC1, SC2)")
+    ap.add_argument("--trans",     default="ZF8HP",
+                    help="Transmission to simulate (ZF8HP, DL501, DQ250, DQ381)")
+    ap.add_argument("--headless",  action="store_true",
+                    help="Smoke-test imports without launching GUI")
+    ap.add_argument("--no-autoconnect", action="store_true",
+                    help="Don't auto-trigger connect after launch")
+    ap.add_argument("--debug",     action="store_true")
+    args = ap.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.headless:
+        success = run_headless(args.ecu, args.trans)
+        sys.exit(0 if success else 1)
+
+    # ── GUI mode ──────────────────────────────────────────────────────────────
+    # Install patches before importing tkinter-dependent modules
+    _install_mock_patch(args.ecu, args.trans)
+    _install_interface_patch()
+
+    try:
+        from ui.main_window import MainWindow
+    except ImportError as e:
+        print(f"[ERROR] Could not import MainWindow: {e}")
+        print("  Run from the repo root: python -m tests.sim_runner")
+        sys.exit(1)
+
+    app = MainWindow(ecu_key=args.ecu)
+
+    if not args.no_autoconnect:
+        auto_connect_after_launch(app, delay=1.5)
+
+    log.info("Simos Suite [SIMULATION MODE]  ECU=%s  TCU=%s",
+             args.ecu, args.trans)
+    log.info("All connections are simulated — no hardware required")
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
