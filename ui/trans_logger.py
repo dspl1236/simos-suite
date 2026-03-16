@@ -31,8 +31,9 @@ from tkinter import ttk, messagebox
 from typing import Dict, List, Optional
 
 from core.trans_defs import (
-    TRANS_REGISTRY, TRANS_DISPLAY_NAMES, TransDef, TransDID, ECU_DEFAULT_TRANS,
+    TRANS_REGISTRY, TRANS_DISPLAY_NAMES, ECU_DEFAULT_TRANS,
 )
+from core.ecu_defs import TCUDef, TCU_LIVE_DIDS, decode_tcu_did
 
 # ── Palette (matches main_window.py) ─────────────────────────────────────────
 C = {
@@ -73,13 +74,13 @@ CAT_LABEL = {
 CAT_ORDER = ["gear", "temp", "speed", "pressure", "torque", "elec", "adapt"]
 
 
-def _did_cat(did: TransDID) -> str:
-    n = did.name.lower()
-    if any(w in n for w in ("gear", "selector", "sport", "mode", "lever")):
+def _did_cat(name: str) -> str:
+    n = name.lower()
+    if any(w in n for w in ("gear", "selector", "sport", "mode", "lever", "session")):
         return "gear"
     if any(w in n for w in ("temp", "thermal")):
         return "temp"
-    if any(w in n for w in ("speed", "rpm")):
+    if any(w in n for w in ("speed", "rpm", "shaft", "slip")):
         return "speed"
     if any(w in n for w in ("pressure", "bar", "line")):
         return "pressure"
@@ -274,8 +275,8 @@ class TransLoggerTab(tk.Frame):
     def _on_trans_change(self):
         name = self._trans_var.get()
         self._trans = None
-        for t in TRANS_REGISTRY.values():
-            if t.name == name:
+        for key, t in TRANS_REGISTRY.items():
+            if t.name == name or key == name:
                 self._trans = t
                 break
         if not self._trans and TRANS_REGISTRY:
@@ -294,15 +295,16 @@ class TransLoggerTab(tk.Frame):
 
     # ── Card grid ─────────────────────────────────────────────────────────────
 
-    def _build_cards(self, trans: TransDef):
+    def _build_cards(self, trans: TCUDef):
         for w in self._inner.winfo_children():
             w.destroy()
         self._cards.clear()
 
-        # Group DIDs by category
-        cats: Dict[str, List[TransDID]] = {}
-        for d in trans.live_dids:
-            cats.setdefault(_did_cat(d), []).append(d)
+        # Group DIDs by category — live_dids is Dict[int, (name,unit,scale,offset,fmt)]
+        cats: Dict[str, List[tuple]] = {}   # cat → [(did, name, unit, scale, offset, fmt)]
+        for did, spec in trans.live_dids.items():
+            name = spec[0]
+            cats.setdefault(_did_cat(name), []).append((did,) + spec)
 
         grid_row = 0
         COLS = 4
@@ -321,7 +323,8 @@ class TransLoggerTab(tk.Frame):
                 sticky="w", padx=14, pady=(10, 3))
             grid_row += 1
 
-            for i, did in enumerate(dids):
+            for i, spec in enumerate(dids):
+                did_int, name, unit, scale, offset, fmt = spec
                 col = i % COLS
                 if i > 0 and col == 0:
                     grid_row += 1
@@ -335,11 +338,11 @@ class TransLoggerTab(tk.Frame):
                 self._inner.columnconfigure(col, weight=1, minsize=130)
 
                 # DID address
-                tk.Label(card, text=f"0x{did.did:04X}",
+                tk.Label(card, text=f"0x{did_int:04X}",
                          fg=C["dim"], bg=C["surface"],
                          font=("Menlo", 7)).pack(anchor="w")
                 # Name
-                tk.Label(card, text=did.name,
+                tk.Label(card, text=name,
                          fg=C["muted"], bg=C["surface"],
                          font=("Menlo", 8)).pack(anchor="w")
                 # Value (large)
@@ -350,18 +353,11 @@ class TransLoggerTab(tk.Frame):
                          font=("Menlo", 14, "bold")).pack(
                              anchor="w", pady=(2, 0))
                 # Unit
-                tk.Label(card, text=did.unit,
+                tk.Label(card, text=unit,
                          fg=C["dim"], bg=C["surface"],
                          font=("Menlo", 7)).pack(anchor="w")
-                # Tooltip note if present
-                if did.notes:
-                    tk.Label(card, text=did.notes[:40] +
-                             ("…" if len(did.notes) > 40 else ""),
-                             fg=C["dim"], bg=C["surface"],
-                             font=("Menlo", 6),
-                             wraplength=130).pack(anchor="w")
 
-                self._cards[did.did] = var
+                self._cards[did_int] = var
 
             grid_row += 1
 
@@ -436,8 +432,9 @@ class TransLoggerTab(tk.Frame):
                 return self._len
 
         cfg = dict(udsoncan.configs.default_client_config)
+        # Use a 4-byte raw codec for all TCU DIDs — decode_tcu_did handles parsing
         cfg["data_identifiers"] = {
-            d.did: _RawCodec(d.length) for d in trans.live_dids
+            did: _RawCodec(4) for did in trans.live_dids
         }
         cfg["request_timeout"] = max(2.0, interval * 3)
 
@@ -461,26 +458,17 @@ class TransLoggerTab(tk.Frame):
                         if not self._running:
                             break
                         try:
-                            raw = client.read_data_by_identifier_first(
-                                did_obj.did)
+                            raw = client.read_data_by_identifier_first(did_obj)
                             if isinstance(raw, (bytes, bytearray)):
-                                raw_int = int.from_bytes(
-                                    raw[:did_obj.length], "big",
-                                    signed=did_obj.signed)
-                                physical = (raw_int * did_obj.scale
-                                            + did_obj.offset)
-                                if did_obj.unit in ("", " "):
-                                    display = f"{int(physical)}"
-                                else:
-                                    display = f"{physical:.1f}"
+                                display, _, _ = decode_tcu_did(did_obj, raw)
                             else:
                                 display = str(raw)
-                            self.after(0, lambda d=did_obj.did,
+                            self.after(0, lambda d=did_obj,
                                        v=display: self._update(d, v))
                         except udsoncan.exceptions.NegativeResponseException:
                             pass  # DID not supported — silently skip
                         except Exception as e:
-                            self.after(0, lambda d=did_obj.did, e=e:
+                            self.after(0, lambda d=did_obj, e=e:
                                        self._log_msg(
                                            f"0x{d:04X}: {type(e).__name__}",
                                            "warn"))
@@ -499,22 +487,19 @@ class TransLoggerTab(tk.Frame):
             var.set(value)
         # Mirror to hero strip
         trans = self._trans
-        if not trans:
+        if not trans or did not in trans.live_dids:
             return
-        for d in trans.live_dids:
-            if d.did != did:
-                continue
-            n = d.name.lower()
-            if "current gear" in n:
-                self._hero_vars["gear"].set(value)
-            elif "selector" in n or "lever" in n:
-                self._hero_vars["select"].set(value)
-            elif "atf temp" in n:
-                self._hero_vars["ATF"].set(value)
-            elif "vehicle speed" in n:
-                self._hero_vars["speed"].set(value)
-            elif "input" in n and "speed" in n:
-                self._hero_vars["in RPM"].set(value)
+        name = trans.live_dids[did][0].lower()
+        if "current gear" in name or "gear" == name:
+            self._hero_vars["gear"].set(value)
+        elif "selector" in name or "lever" in name:
+            self._hero_vars["select"].set(value)
+        elif "fluid temp" in name or "atf" in name:
+            self._hero_vars["ATF"].set(value)
+        elif "vehicle speed" in name:
+            self._hero_vars["speed"].set(value)
+        elif "input" in name and ("speed" in name or "rpm" in name):
+            self._hero_vars["in RPM"].set(value)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
