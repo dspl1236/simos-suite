@@ -45,27 +45,22 @@ from typing import Callable, Dict, List, Optional, Tuple
 # ── Suite imports (relative) ──────────────────────────────────────────────────
 try:
     from core.ecu_defs import (
-        ECUDef, SIMOS85, SIMOS12, SIMOS12_2, SIMOS18, SIMOS18_10,
-        BlockDef, CryptoType,
-    )
+    ECUDef, SIMOS85,
+    SIMOS12, SIMOS122, SIMOS18,
+    ZF_8HP, DL501,
+    DQ250_MQB, DQ381_MQB, HALDEX_GEN5,
+    J533_LEAR, J255_4ZONE, J255_2ZONE,
+)
     from flasher.uds_flash import (
         flash_cal, read_ecu_info, FlashProgress, _make_connection,
     )
     from tuner.cal_parser import CalParser
     from transport.interfaces import InterfaceRegistry
     from ui.interface_panel import InterfacePanel
-    from ui.trans_logger import TransLoggerTab
-    from core.trans_defs import (
-        TRANS_REGISTRY, TRANS_DISPLAY_NAMES, ECU_DEFAULT_TRANS,
-    )
 except ImportError as e:
     print(f"[WARN] Import error (run from repo root): {e}")
     ECUDef = SIMOS85 = SIMOS12 = SIMOS12_2 = SIMOS18 = SIMOS18_10 = None
     InterfacePanel = None
-    TransLoggerTab = None
-    TRANS_REGISTRY = {}
-    TRANS_DISPLAY_NAMES = {}
-    ECU_DEFAULT_TRANS = {}
 
 log = logging.getLogger("SimosSuite.GUI")
 
@@ -1325,7 +1320,6 @@ class MainWindow(tk.Tk):
             ("  logger  ",      LoggerTab),
             ("  cp tools  ",    CPToolsTab),
             ("  raw sniff  ",   RawSniffTab),
-            ("  trans  ",         TransLoggerTab),
         ]
 
         for title, cls in tab_defs:
@@ -1344,15 +1338,6 @@ class MainWindow(tk.Tk):
             if key.upper() in name.upper():
                 self.ecu = ecu
                 self._update_ecu_label(name)
-                # Auto-suggest matching transmission in trans tab
-                default_trans = ECU_DEFAULT_TRANS.get(key.upper())
-                if default_trans and default_trans in TRANS_REGISTRY:
-                    for tab in self._tabs:
-                        if isinstance(tab, TransLoggerTab):
-                            trans_name = TRANS_REGISTRY[default_trans].name
-                            tab._trans_var.set(trans_name)
-                            tab._on_trans_change()
-                            break
                 break
 
     def _on_connected(self, interface: str, path: str):
