@@ -1205,8 +1205,7 @@ class LoggerTab(_Tab):
                 self._ui(self._values[did].set, display)
                 if v is not None and len(parts) < 6:
                     parts.append(f"{name[:7]}={display}")
-            line = f"{ts}  " + "  ".join(parts) + "
-"
+            line = f"{ts}  " + "  ".join(parts) + "\n"
             self._ui(self._append_log, self._log, line, "val")
             # Build CSV row
             vals = ",".join(
@@ -1223,8 +1222,7 @@ class LoggerTab(_Tab):
 
         if session.error:
             self._ui(self._append_log, self._log,
-                     f"error: {session.error}
-", "err")
+                     f"error: {session.error}\n", "err")
 
         self._ui(self._start_btn.config, text="start logging",
                  fg="#0d1117", bg=C["blue"])
