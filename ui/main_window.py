@@ -45,12 +45,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 # ── Suite imports (relative) ──────────────────────────────────────────────────
 try:
     from core.ecu_defs import (
-    ECUDef, SIMOS85,
-    SIMOS12, SIMOS122, SIMOS18,
-    ZF_8HP, DL501,
-    DQ250_MQB, DQ381_MQB, HALDEX_GEN5,
-    J533_LEAR, J255_4ZONE, J255_2ZONE,
-)
+        ECUDef, SIMOS85, SIMOS12, SIMOS122, SIMOS18,
+        ZF8HP, DL501, DQ250, DQ381,
+        J533_LEAR, J255_4ZONE, J255_2ZONE,
+        ECU_REGISTRY, TCU_REGISTRY,
+    )
     from flasher.uds_flash import (
         flash_cal, read_ecu_info, FlashProgress, _make_connection,
     )
@@ -61,7 +60,10 @@ try:
     from core.trans_defs import TRANS_REGISTRY, ECU_DEFAULT_TRANS
 except ImportError as e:
     print(f"[WARN] Import error (run from repo root): {e}")
-    ECUDef = SIMOS85 = SIMOS12 = SIMOS12_2 = SIMOS18 = SIMOS18_10 = None
+    ECUDef = SIMOS85 = SIMOS12 = SIMOS122 = SIMOS18 = None
+    ZF8HP = DL501 = DQ250 = DQ381 = None
+    J533_LEAR = J255_4ZONE = J255_2ZONE = None
+    ECU_REGISTRY = {}; TCU_REGISTRY = {}
     InterfacePanel = None
     TransLoggerTab = None
     TRANS_REGISTRY = {}
@@ -98,9 +100,9 @@ def _ecus():
         return {
             "Simos8.5  (3.0T TFSI C7 A6/A7)":  SIMOS85,
             "Simos12   (2.0T EA888 Gen1/2)":    SIMOS12,
-            "Simos12.2 (2.0T EA888 Gen3)":       SIMOS12_2,
+            "Simos12.2 (2.0T EA888 Gen3)":       SIMOS122,
             "Simos18.1/6 (MQB SC8)":            SIMOS18,
-            "Simos18.10 (MQB Evo SCG)":         SIMOS18_10,
+            "Simos18.10 (MQB Evo SCG)":         SIMOS18,
         }
     return {"Simos8.5 (demo)": None}
 
