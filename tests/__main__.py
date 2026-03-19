@@ -38,11 +38,12 @@ def main():
     all_pass = all_pass and ok
 
     # 2. ECU backend tests
+    # sim_ecu runs all @_test-decorated functions at import time and
+    # exposes _results + _print_results().
     print("\n[2/3] ECU backend tests (sim_ecu)")
     try:
         import tests.sim_ecu as sim_ecu
-        sim_ecu.print_results()
-        ok = all(r[1] for r in sim_ecu._results)
+        ok = sim_ecu._print_results()   # returns True if all pass
         all_pass = all_pass and ok
     except Exception as e:
         print(f"  ERROR: {e}")
@@ -52,8 +53,7 @@ def main():
     print("\n[3/3] transmission tests (sim_trans)")
     try:
         import tests.sim_trans as sim_trans
-        sim_trans.print_results()
-        ok = all(r[1] for r in sim_trans._results)
+        ok = sim_trans._print_results()
         all_pass = all_pass and ok
     except Exception as e:
         print(f"  ERROR: {e}")
