@@ -329,9 +329,7 @@ def auto_connect_after_launch(mw, delay: float = 1.5):
                                 can_id = (raw_frame[0] << 8) | raw_frame[1]
                                 dlc    = raw_frame[2]
                                 data   = raw_frame[3:3+dlc]
-                                line   = (f"[{ts}]  {can_id:03X}  "
-                                          f"[{dlc}]  {data.hex(' ').upper()}
-")
+                                line   = "[" + ts + "]  " + f"{can_id:03X}  " + "[" + str(dlc) + "]  " + data.hex(" ").upper() + "\n"
                                 tab._append_log(tab._hex_log, line)
                         stop_fn = start_sniff_generator(_on_frame, interval=0.25)
                         log.info("[SIM] RawSniffTab: synthetic CAN frames started")
