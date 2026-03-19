@@ -14,7 +14,7 @@ Companion repos:
 
 ## Download
 
-**[Latest release → SimosSuite.exe](https://github.com/dspl1236/simos-suite/releases/latest)**
+**[SimosSuite.exe — v0.2.0](https://github.com/dspl1236/simos-suite/releases/download/v0.2.0/SimosSuite.exe)**  (Windows x64, 27 MB)
 
 Windows x64, single file, no install required. SmartScreen will flag an
 unsigned binary on first run — click "More info" → "Run anyway". Source is
