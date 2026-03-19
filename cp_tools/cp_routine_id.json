@@ -1,0 +1,19 @@
+{
+  "routine_id_hex": "0x0226",
+  "routine_id_bytes": [
+    2,
+    38
+  ],
+  "uds_sequence": "31 01 02 26",
+  "source": "ES_LIBCompoProteGen3V12.sd.db \u2014 master index header + 268-byte new service definition",
+  "confirmed": false,
+  "extraction_method": "binary analysis \u2014 master index primary key (appears twice as 0x0226 in 772-byte block header)",
+  "corroborating": [
+    "772-byte master index unique to V12, header bytes[4:6] BE = 0x0226 (repeated at bytes[8:10])",
+    "268-byte service definition new in V12, contains 3 sub-entries matching RoutineControl start/stop/result",
+    "62-byte range index new in V12, registers service group 0x0500-0xFFFF",
+    "0x0226 = 550 decimal, within VAG RoutineControl ID range",
+    "V11 has no equivalent 772-byte master index block"
+  ],
+  "notes": "Pending confirmation against live J533. Run: python -m cp_tools.mwb_extract --confirm 0x0226 once verified on hardware."
+}
