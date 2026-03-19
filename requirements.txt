@@ -1,34 +1,36 @@
 # Simos Tuning Suite — Python dependencies
 #
-# Install:
+# Full install (includes hardware deps):
 #   pip install -r requirements.txt
 #   pip install git+https://github.com/bri3d/sa2_seed_key.git
 #
-# Windows note: J2534 PassThru DLL requires 32-bit Python.
-# Use 64-bit Python for BLE/USB/SocketCAN interfaces.
+# CI / headless-only install (no BLE/CAN):
+#   pip install numpy
+#   pip install git+https://github.com/bri3d/sa2_seed_key.git
+#
+# Windows EXE build — use build.bat, which installs everything automatically.
+#
+# J2534 note: PassThru DLL is loaded at runtime via ctypes — no pip package.
+# Install your J2534 DLL separately (Tactrix, Mongoose, VNCI, etc.)
 
-# UDS protocol client
-udsoncan >= 1.21
+# ── Core protocol ─────────────────────────────────────────────────────────────
+udsoncan >= 1.21              # UDS client — all flash/read/routine operations
 
-# CAN bus support (SocketCAN backend)
-python-can >= 4.0
+# ── Transport ─────────────────────────────────────────────────────────────────
+bleak >= 0.21                 # BLE transport for ESP32 bridge
+pyserial >= 3.5               # USB ISO-TP bridge (CP210x / CH340)
+python-can >= 4.0             # SocketCAN backend (Linux)
 
-# BLE transport for ESP32 bridge
-bleak >= 0.21
+# ── Calibration math ──────────────────────────────────────────────────────────
+numpy >= 1.24                 # CAL table parsing, axis math
 
-# Serial port (USB ISO-TP bridge)
-pyserial >= 3.5
+# ── Crypto ────────────────────────────────────────────────────────────────────
+pycryptodome >= 3.18          # AES-CBC for Simos12/18 flash blocks
 
-# Calibration table math
-numpy >= 1.24
-
-# AES crypto for Simos12/18 flash encryption
-pycryptodome >= 3.18
-
-# SA2 seed/key bytecode interpreter
-# Install separately:
+# ── SA2 seed/key ──────────────────────────────────────────────────────────────
+# Install from source — not on PyPI:
 #   pip install git+https://github.com/bri3d/sa2_seed_key.git
 # sa2_seed_key
 
-# Optional: faster CRC32 (falls back to pure Python if not available)
-# fastcrc >= 0.3
+# ── Build tooling (not needed at runtime) ─────────────────────────────────────
+# pyinstaller >= 6.0          # EXE builder — install separately for builds
