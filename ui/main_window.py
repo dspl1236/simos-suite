@@ -690,6 +690,7 @@ class TuneTab(_Tab):
         file_row.pack(fill="x", padx=14, pady=4)
         _btn(file_row, "open CAL .bin", self._open_cal).pack(side="left")
         _btn(file_row, "lean diagnosis", self._lean_diag).pack(side="left", padx=6)
+        _btn(file_row, "tuning guide", self._open_guide).pack(side="left", padx=6)
         self._file_lbl = tk.Label(file_row, text="no file loaded",
                                    fg=C["muted"], bg=C["bg"], font=("Menlo", 10))
         self._file_lbl.pack(side="left", padx=10)
@@ -743,8 +744,16 @@ class TuneTab(_Tab):
     # ── on_connect — sim integration ──────────────────────────────────────────
 
     def on_connect(self):
-        """Called by MainWindow on connection. In sim mode, pre-load synthetic CAL."""
+        """Called by MainWindow on connection. Enable file open button."""
+        # save_btn enabled only after a file is loaded
         pass   # sim_runner calls load_bytes() directly after connect
+
+    def on_disconnect(self):
+        """Disable write/save on disconnect — reading from ECU no longer valid."""
+        if hasattr(self, "_save_btn"):
+            self._save_btn.config(state="disabled")
+        self._info_lbl.config(
+            text="disconnected — CAL data may be stale", fg=C["amber"])
 
     def load_bytes(self, cal_bytes: bytes, filename: str = "synthetic_cal.bin"):
         """Load CAL from raw bytes — used by sim_runner and flash-read results."""
@@ -1015,6 +1024,16 @@ class TuneTab(_Tab):
 
     # ── Lean diagnosis ────────────────────────────────────────────────────────
 
+    def _open_guide(self):
+        """Open the Simos8.5 tuning reference in the system browser."""
+        import webbrowser
+        url = "https://github.com/dspl1236/simos-suite/blob/main/docs/tuning_guide_s85.md"
+        try:
+            webbrowser.open(url)
+        except Exception:
+            messagebox.showinfo("Tuning guide",
+                f"Open this URL in your browser:\n{url}")
+
     def _lean_diag(self):
         if not self._parser:
             messagebox.showinfo("Lean diagnosis", "Load a CAL .bin first.")
@@ -1119,6 +1138,18 @@ class LoggerTab(_Tab):
 
         cfg_row = _frame(self)
         cfg_row.pack(fill="x", padx=14, pady=4)
+
+        # Channel preset selector
+        tk.Label(cfg_row, text="preset", fg=C["muted"],
+                 bg=C["bg"], font=("Menlo", 10)).pack(side="left")
+        self._preset_var = tk.StringVar(value="essential")
+        preset_combo = ttk.Combobox(
+            cfg_row, textvariable=self._preset_var,
+            values=["essential", "fuel", "boost", "ignition", "lean diag", "full"],
+            state="readonly", font=("Menlo", 10), width=12)
+        preset_combo.pack(side="left", padx=(4, 16))
+        preset_combo.bind("<<ComboboxSelected>>", self._on_preset_change)
+
         tk.Label(cfg_row, text="interval ms", fg=C["muted"],
                  bg=C["bg"], font=("Menlo", 10)).pack(side="left")
         self._interval_var = tk.IntVar(value=200)
@@ -1157,6 +1188,30 @@ class LoggerTab(_Tab):
         for v in self._values.values():
             v.set("—")
 
+    def _on_preset_change(self, *_):
+        """Rebuild gauge grid when preset changes."""
+        preset = self._preset_var.get()
+        try:
+            from logger.channels_s85 import (
+                CHANNELS_ESSENTIAL, CHANNELS_FUEL, CHANNELS_BOOST,
+                CHANNELS_IGNITION, CHANNELS_LEAN_DIAG, CHANNELS_FULL,
+            )
+            _map = {
+                "essential": CHANNELS_ESSENTIAL,
+                "fuel":      CHANNELS_FUEL,
+                "boost":     CHANNELS_BOOST,
+                "ignition":  CHANNELS_IGNITION,
+                "lean diag": CHANNELS_LEAN_DIAG,
+                "full":      CHANNELS_FULL,
+            }
+            self._active_channels = _map.get(preset, CHANNELS_ESSENTIAL)
+        except ImportError:
+            from logger import SIMOS85_CHANNELS
+            self._active_channels = SIMOS85_CHANNELS
+        # Reset gauge vars for new channel set
+        self._values = {ch.did: tk.StringVar(value="—")
+                        for ch in self._active_channels}
+
     def _toggle_log(self):
         if self._running:
             self._running = False
@@ -1166,21 +1221,26 @@ class LoggerTab(_Tab):
             self._running = True
             self._start_btn.config(text="stop logging",
                                    fg=C["text"], bg=C["btn"])
-            self._csv_rows = ["timestamp," + ",".join(n for _, n in self.DIDS)]
+            # Apply current preset if not already set
+            if not hasattr(self, "_active_channels"):
+                self._on_preset_change()
+            self._csv_rows = ["timestamp," + ",".join(ch.name for ch in self._active_channels)]
             self._run(self._poll_loop)
 
     def _poll_loop(self):
         """Real LogSession-backed poll loop using logger.LogSession."""
         from logger import LogSession, SIMOS85_CHANNELS, Channel
 
-        # Build channel list matching our gauge DIDs
-        did_map = {did: name for did, name in self.DIDS}
-        channels = [ch for ch in SIMOS85_CHANNELS if ch.did in did_map]
-        # Add any gauge DIDs not in SIMOS85_CHANNELS as raw channels
-        known_dids = {ch.did for ch in channels}
-        for did, name in self.DIDS:
-            if did not in known_dids:
-                channels.append(Channel(did, name, "", 1.0, 0.0, 2, False, "{:.2f}"))
+        # Use preset channels if selected, otherwise fall back to gauge DID list
+        if hasattr(self, "_active_channels") and self._active_channels:
+            channels = list(self._active_channels)
+        else:
+            did_map = {did: name for did, name in self.DIDS}
+            channels = [ch for ch in SIMOS85_CHANNELS if ch.did in did_map]
+            known_dids = {ch.did for ch in channels}
+            for did, name in self.DIDS:
+                if did not in known_dids:
+                    channels.append(Channel(did, name, "", 1.0, 0.0, 2, False, "{:.2f}"))
 
         session = LogSession(
             ecu         = self.mw.ecu,
@@ -1198,18 +1258,17 @@ class LoggerTab(_Tab):
                 return
             ts = row.wall_time
             parts = []
-            for did, name in self.DIDS:
-                v = row.values.get(did)
-                ch = next((c for c in channels if c.did == did), None)
-                display = ch.format(v) if ch else ("—" if v is None else f"{v:.2f}")
-                self._ui(self._values[did].set, display)
+            for ch in channels:
+                v = row.values.get(ch.did)
+                display = ch.format(v)
+                # Update gauge var if it exists
+                if ch.did in self._values:
+                    self._ui(self._values[ch.did].set, display)
                 if v is not None and len(parts) < 6:
-                    parts.append(f"{name[:7]}={display}")
+                    parts.append(f"{ch.name[:7]}={display}")
             line = f"{ts}  " + "  ".join(parts) + "\n"
             self._ui(self._append_log, self._log, line, "val")
-            # Build CSV row
-            vals = ",".join(
-                ch.format(row.values.get(ch.did)) for ch in channels)
+            vals = ",".join(ch.format(row.values.get(ch.did)) for ch in channels)
             self._csv_rows.append(f"{ts},{vals}")
 
         session.start(callback=on_row)
