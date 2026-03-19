@@ -1,72 +1,52 @@
-# Simos Tuning Suite — .gitignore
-
-# ── Python ────────────────────────────────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-*.egg
+*.pyo
+*.pyd
+.Python
 *.egg-info/
 dist/
 build/
 .eggs/
-pip-wheel-metadata/
-*.whl
 
-# ── PyInstaller ───────────────────────────────────────────────────────────────
-# Keep spec, hooks, and version info in repo — exclude build artifacts
+# PyInstaller artifacts
 *.spec.bak
-build/
-dist/
+version_info.txt
 *.manifest
 
-# ── Virtual environments ──────────────────────────────────────────────────────
-.venv/
-venv/
-env/
-ENV/
+# Calibration and log files (user data — don't commit)
+*.bin
+*.csv
+*.log
+simos_suite.log
 
-# ── IDE / editor ─────────────────────────────────────────────────────────────
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-Thumbs.db
-
-# ── Build assets (keep .ico if added) ────────────────────────────────────────
-build_assets/*.png
-build_assets/*.bmp
-build_assets/README.md
-
-# ── ODIS / diagnostic files — never commit these ─────────────────────────────
+# CP research — don't commit extracted keys or live captures
+cp_tools/cp_routine_id.json.bak
 *.sd.db
 *.sd.key
 *.bv.db
 *.bv.key
-*.odx
-*.pdx
+*.mwb
 *.frf
-*.sgo
-*.bin          # CAL binaries — user's own files, not for repo
-*.zip          # Flashdaten archives
+*.odx.bak
 
-# ── Logs and session data ─────────────────────────────────────────────────────
-*.log
-*.csv
-logs/
-sessions/
-*_probe.json
-*_probe_*.json
+# J2534 / interface paths (machine-specific)
+.interface_config
 
-# ── CP routine ID — keep the committed stub, ignore local overrides ───────────
-# cp_tools/cp_routine_id.json is committed with confirmed=false
-# DO NOT gitignore it — it's the canonical research output
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
 
-# ── Test / temp ───────────────────────────────────────────────────────────────
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Test output
 .pytest_cache/
-.coverage
 htmlcov/
-*.tmp
-/tmp/
+.coverage
