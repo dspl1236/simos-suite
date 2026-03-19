@@ -915,55 +915,109 @@ class J533Probe:
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
+    # ── Public convenience API (used by CPToolsTab check button) ─────────────
+
+    def connect(self) -> "J533Probe":
+        """
+        Open an extended diagnostic session on J533.
+        Stores the client in self._client_j533 for subsequent calls.
+        Returns self for chaining.
+        """
+        client = self._make_client(J533_TX, J533_RX)
+        client.__enter__()
+        client.change_session(
+            services.DiagnosticSessionControl.Session.extendedDiagnosticSession)
+        self._client_j533 = client
+        log.info("J533 extended session open")
+        return self
+
+    def disconnect(self):
+        """Close the J533 client session."""
+        if self._client_j533:
+            try:
+                self._client_j533.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._client_j533 = None
+
+    def read_did_raw(self, did: int) -> bytes:
+        """
+        Read a single DID from J533 and return raw bytes.
+        Requires connect() to have been called first.
+        Raises on NRC or timeout.
+        """
+        if self._client_j533 is None:
+            raise RuntimeError("Not connected — call connect() first")
+        raw, err = self._read_did(self._client_j533, did)
+        if err:
+            raise IOError(f"DID 0x{did:04X}: {err}")
+        return raw or b""
+
     def start_cp_routine(self, payload: bytes = b"") -> Optional[bytes]:
         """
-        Send RoutineControl Start (0x31 0x01) with the CP routine ID (0x0226).
+        Send RoutineControl Start (31 01 02 26) to J533.
 
-        This initiates the Component Protection authentication sequence.
-        The J533 expects a GEKO server-signed token in the payload —
-        that token is not yet captured. This method sends the bare start
-        command to confirm the routine ID is accepted.
+        Returns raw response bytes:
+          71 01 02 26 ...  → routine accepted
+          7F 31 22         → ID correct, token required (conditionsNotCorrect)
+          7F 31 31         → wrong routine ID (requestOutOfRange)
+          7F 31 7E         → wrong session (subFunctionNotSupportedInActiveSession)
 
-        Returns the raw response bytes, or None on failure.
-
-        To run:
-            probe.connect()
-            resp = probe.start_cp_routine()
-            # If resp[0] == 0x71: routine accepted
-            # If resp[0] == 0x7F resp[2] == 0x31: sub-function not supported (wrong ID)
-            # If resp[0] == 0x7F resp[2] == 0x22: conditions not correct (token required)
+        Requires connect() to have been called first, or opens a fresh connection.
         """
         routine_id = _load_cp_routine_id()
         rid_hi = (routine_id >> 8) & 0xFF
-        rid_lo = routine_id & 0xFF
+        rid_lo =  routine_id & 0xFF
 
-        log.info("RoutineControl Start  routine_id=0x%04X  payload=%d bytes",
-                 routine_id, len(payload))
+        log.info("RoutineControl Start  0x%04X  (31 01 %02X %02X)  payload=%d bytes",
+                 routine_id, rid_hi, rid_lo, len(payload))
+
+        # Use existing session if available, else open a new one
+        if self._client_j533 is None:
+            self.connect()
+
         try:
-            raw = bytes([0x31, 0x01, rid_hi, rid_lo]) + payload
-            self._client.send_request(raw)
-            resp = self._client.wait_frame(timeout=5.0)
+            conn = self._client_j533._connection
+            request_bytes = bytes([0x31, 0x01, rid_hi, rid_lo]) + payload
+            conn.specific_send(request_bytes)
+            resp = conn.specific_wait_frame(timeout=5.0)
             log.info("CP routine response: %s", resp.hex() if resp else "None")
-            return resp
+            return bytes(resp) if resp else None
         except Exception as e:
             log.warning("CP routine error: %s", e)
-            return None
+            # Fall back: use the client's native request mechanism
+            try:
+                import udsoncan.services as _svc
+                resp = self._client_j533.routine_control(
+                    request_type=_svc.RoutineControl.RequestType.startRoutine,
+                    routine_id=routine_id,
+                    data=payload if payload else None,
+                )
+                raw = bytes([0x71, 0x01, rid_hi, rid_lo])
+                if resp and hasattr(resp, "service_data"):
+                    raw += getattr(resp.service_data, "routine_status_record", b"")
+                return raw
+            except Exception as e2:
+                log.warning("CP routine fallback error: %s", e2)
+                return None
 
     def request_cp_routine_result(self) -> Optional[bytes]:
-        """Send RoutineControl RequestResult (0x31 0x03) for CP routine."""
+        """Send RoutineControl RequestResult (31 03 02 26) for CP routine."""
         routine_id = _load_cp_routine_id()
         rid_hi = (routine_id >> 8) & 0xFF
-        rid_lo = routine_id & 0xFF
+        rid_lo =  routine_id & 0xFF
+        if self._client_j533 is None:
+            self.connect()
         try:
-            raw = bytes([0x31, 0x03, rid_hi, rid_lo])
-            self._client.send_request(raw)
-            resp = self._client.wait_frame(timeout=5.0)
-            return resp
+            conn = self._client_j533._connection
+            conn.specific_send(bytes([0x31, 0x03, rid_hi, rid_lo]))
+            resp = conn.specific_wait_frame(timeout=5.0)
+            return bytes(resp) if resp else None
         except Exception as e:
             log.warning("CP routine result error: %s", e)
             return None
 
-        def save_report(self, path: str, report: ProbeReport):
+    def save_report(self, path: str, report: ProbeReport):
         with open(path, "w") as f:
             json.dump(asdict(report), f, indent=2)
         log.info("Report saved to %s", path)
