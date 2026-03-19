@@ -1419,6 +1419,7 @@ class CPToolsTab(_Tab):
             probe = J533Probe(
                 interface      = self.mw.interface,
                 interface_path = self.mw.iface_path,
+                ble_bridge     = getattr(self.mw, "ble_bridge", None),
             )
             probe.connect()
             log("  J533 connected\n", "ok")
@@ -1547,6 +1548,7 @@ class CPToolsTab(_Tab):
             probe = J533Probe(
                 interface      = self.mw.interface,
                 interface_path = self.mw.iface_path,
+                ble_bridge     = getattr(self.mw, "ble_bridge", None),
             )
             probe.connect()
             self._ui(self._append_log, self._log, "connected to J533\n", "ok")
