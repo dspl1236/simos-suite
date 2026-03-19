@@ -1428,12 +1428,14 @@ class CPToolsTab(_Tab):
         self._probe_btn.config(state="normal")
         self._cp_btn.config(state="normal")
         self._ika_btn.config(state="normal")
+        self._ika_btn.config(state="normal")
         self._cp_status_var.set("connected — ready")
         self._cp_status_lbl.config(fg=C["green"])
 
     def on_disconnect(self):
         self._probe_btn.config(state="disabled")
         self._cp_btn.config(state="disabled")
+        self._ika_btn.config(state="disabled")
         self._ika_btn.config(state="disabled")
         self._cp_status_var.set("not connected")
         self._cp_status_lbl.config(fg=C["muted"])
@@ -1671,6 +1673,103 @@ class CPToolsTab(_Tab):
             self._ui(self._cp_btn.config, state="normal")
 
     # ── J533 full probe ───────────────────────────────────────────────────────
+
+    # ── IKA key reader — read DID 0x00BE from all CP modules ─────────────────
+
+    def _do_read_ika_keys(self):
+        """Read DID 0x00BE from every CP-enrolled module and compare blobs."""
+        self._ika_btn.config(state="disabled")
+        self._clear_log(self._log)
+        self._append_log(self._log,
+            "── IKA key read — DID 0x00BE across all CP modules ──\n", "hdr")
+        self._run(self._ika_read_task)
+
+    def _ika_read_task(self):
+        import udsoncan
+        from udsoncan.client import Client
+        from udsoncan import configs
+
+        # Known blob from Feb 2024 ODIS CP session — J136 Memory Seat
+        KNOWN_BLOB = bytes.fromhex("E62B41D11C44AF202177FB1F274B0AC2D15BD262E4FD27AB61D123C2F15A2C932600")
+
+        MODULES = [
+            ("J533  Gateway",           0x710, 0x77A),
+            ("J255  Climatronic",        0x746, 0x7AE),
+            ("J285  Instrument Cluster", 0x720, 0x728),
+            ("J234  Airbag",             0x736, 0x73E),
+            ("J794  MMI",                0x7C0, 0x7C8),
+            ("J136  Memory Seat",        0x714, 0x77C),
+        ]
+
+        def log(msg, tag=""):
+            self._ui(self._append_log, self._log, msg, tag)
+
+        results = {}
+
+        try:
+            from cp_tools.j533_probe import J533Probe
+        except ImportError as e:
+            log(f"Import error: {e}\n", "err")
+            self._ui(self._ika_btn.config, state="normal")
+            return
+
+        class _BytesCodec(udsoncan.DidCodec):
+            def encode(self, v): return bytes(v)
+            def decode(self, p): return p
+            def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
+
+        for mod_name, tx, rx in MODULES:
+            log(f"\n  {mod_name}  (TX=0x{tx:03X} RX=0x{rx:03X})\n", "hdr")
+            try:
+                probe = J533Probe(
+                    interface      = self.mw.interface,
+                    interface_path = self.mw.iface_path,
+                    ble_bridge     = getattr(self.mw, "ble_bridge", None),
+                )
+                cfg = dict(configs.default_client_config)
+                cfg["data_identifiers"] = {0x00BE: _BytesCodec,
+                                            0x00BD: _BytesCodec}
+                cfg["request_timeout"] = 5
+                conn   = probe._make_conn(tx, rx)
+                client = Client(conn, request_timeout=5, config=cfg)
+                client.__enter__()
+                try:
+                    client.change_session(
+                        udsoncan.services.DiagnosticSessionControl
+                        .Session.extendedDiagnosticSession)
+                    result = client.read_data_by_identifier([0x00BE])
+                    raw    = bytes(result.service_data.values[0x00BE])
+                    same   = (raw == KNOWN_BLOB)
+                    tag    = "ok" if same else "warn"
+                    label  = "✓ matches J136 blob" if same else "≠ different"
+                    log(f"    DID 0x00BE ({len(raw)}B): {raw.hex().upper()}\n", tag)
+                    log(f"    {label}\n", tag)
+                    results[mod_name] = raw.hex().upper()
+                    try:
+                        r2   = client.read_data_by_identifier([0x00BD])
+                        raw2 = bytes(r2.service_data.values[0x00BD])
+                        log(f"    DID 0x00BD ({len(raw2)}B): {raw2.hex().upper()}\n", "dim")
+                    except Exception:
+                        pass
+                finally:
+                    client.__exit__(None, None, None)
+            except Exception as e:
+                log(f"    error: {e}\n", "err")
+                results[mod_name] = f"ERROR: {e}"
+
+        log("\n── Summary ──────────────────────────────────────────\n", "hdr")
+        blobs = set(v for v in results.values() if not v.startswith("ERROR"))
+        if len(blobs) == 1:
+            log("  ALL MODULES: IDENTICAL IKA KEY\n", "ok")
+            log("  → Key is VIN-bound, not per-module. One key fits all.\n", "ok")
+        elif len(blobs) > 1:
+            log(f"  {len(blobs)} DISTINCT IKA KEYS found\n", "warn")
+            log("  → Per-module derivation — each module has unique key.\n", "warn")
+        for mod, blob in results.items():
+            short = blob[:36] + "..." if len(blob) > 36 else blob
+            log(f"  {mod:<30}  {short}\n", "dim")
+        self._ui(self._ika_btn.config, state="normal")
+
 
     def _do_probe(self):
         self._probe_btn.config(state="disabled")
