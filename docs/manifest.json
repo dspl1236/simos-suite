@@ -1,0 +1,17 @@
+{
+  "name": "VAG-CP Tool",
+  "short_name": "VAG-CP",
+  "description": "Component Protection diagnostic tool for VAG vehicles via ESP32 BLE bridge",
+  "start_url": "/simos-suite/docs/",
+  "display": "standalone",
+  "background_color": "#07090a",
+  "theme_color": "#0a0f0a",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%2307090a'/><text y='.9em' font-size='90' x='5'>🔑</text></svg>",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
