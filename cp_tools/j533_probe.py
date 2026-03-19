@@ -174,6 +174,42 @@ J255_CP_WRITE_DIDS = {
     0x00BD: "GKA-Key (34 bytes) — device class authorization key",
 }
 
+# ─── CP Routine ID — extracted from ES_LIBCompoProteGen3V12.sd.db ────────────
+#
+# The RoutineControl identifier for RoutiContrStartRoutiCompoProte.
+# Extracted via binary analysis of ES_LIBCompoProteGen3V12.sd.db:
+#   - 772-byte master index (unique to V12): header bytes[4:6] BE = 0x0226,
+#     repeated at bytes[8:10] — characteristic double-key storage
+#   - 268-byte service definition (new in V12): 3 sub-functions confirming
+#     RoutineControl start/stop/requestResult pattern
+#   - New 62-byte range index covering 0x0500–0xFFFF service group
+#
+# UDS sequence to start CP routine:
+#   31 01 02 26  [payload...]
+#
+# Once confirmed on live J533, call:
+#   python -m cp_tools.mwb_extract --confirm 0x0226
+# and set confirmed=True in cp_routine_id.json.
+#
+CP_ROUTINE_ID: int = 0x0226   # pending hardware confirmation
+
+def _load_cp_routine_id() -> int:
+    """
+    Load CP routine ID from cp_routine_id.json if confirmed, else use default.
+    Allows hardware confirmation to auto-wire into probe without code changes.
+    """
+    try:
+        import json, pathlib
+        p = pathlib.Path(__file__).parent / "cp_routine_id.json"
+        if p.exists():
+            data = json.loads(p.read_text())
+            if data.get("routine_id_hex"):
+                return int(data["routine_id_hex"], 16)
+    except Exception:
+        pass
+    return CP_ROUTINE_ID
+
+
 # ECU name → slot value mapping (confirmed from DID 0x2A2A structure)
 ECU_NAME_MAP = {
     1: "Engine Control Module 1",
@@ -879,7 +915,55 @@ class J533Probe:
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
-    def save_report(self, path: str, report: ProbeReport):
+    def start_cp_routine(self, payload: bytes = b"") -> Optional[bytes]:
+        """
+        Send RoutineControl Start (0x31 0x01) with the CP routine ID (0x0226).
+
+        This initiates the Component Protection authentication sequence.
+        The J533 expects a GEKO server-signed token in the payload —
+        that token is not yet captured. This method sends the bare start
+        command to confirm the routine ID is accepted.
+
+        Returns the raw response bytes, or None on failure.
+
+        To run:
+            probe.connect()
+            resp = probe.start_cp_routine()
+            # If resp[0] == 0x71: routine accepted
+            # If resp[0] == 0x7F resp[2] == 0x31: sub-function not supported (wrong ID)
+            # If resp[0] == 0x7F resp[2] == 0x22: conditions not correct (token required)
+        """
+        routine_id = _load_cp_routine_id()
+        rid_hi = (routine_id >> 8) & 0xFF
+        rid_lo = routine_id & 0xFF
+
+        log.info("RoutineControl Start  routine_id=0x%04X  payload=%d bytes",
+                 routine_id, len(payload))
+        try:
+            raw = bytes([0x31, 0x01, rid_hi, rid_lo]) + payload
+            self._client.send_request(raw)
+            resp = self._client.wait_frame(timeout=5.0)
+            log.info("CP routine response: %s", resp.hex() if resp else "None")
+            return resp
+        except Exception as e:
+            log.warning("CP routine error: %s", e)
+            return None
+
+    def request_cp_routine_result(self) -> Optional[bytes]:
+        """Send RoutineControl RequestResult (0x31 0x03) for CP routine."""
+        routine_id = _load_cp_routine_id()
+        rid_hi = (routine_id >> 8) & 0xFF
+        rid_lo = routine_id & 0xFF
+        try:
+            raw = bytes([0x31, 0x03, rid_hi, rid_lo])
+            self._client.send_request(raw)
+            resp = self._client.wait_frame(timeout=5.0)
+            return resp
+        except Exception as e:
+            log.warning("CP routine result error: %s", e)
+            return None
+
+        def save_report(self, path: str, report: ProbeReport):
         with open(path, "w") as f:
             json.dump(asdict(report), f, indent=2)
         log.info("Report saved to %s", path)
