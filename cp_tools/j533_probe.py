@@ -280,9 +280,11 @@ class J533Probe:
     def __init__(self,
                  interface:      str = "J2534",
                  interface_path: Optional[str] = None,
+                 ble_bridge                    = None,
                  scan_range:     Tuple[int, int] = (0x0100, 0x0300)):
         self.interface      = interface
         self.interface_path = interface_path
+        self.ble_bridge     = ble_bridge      # BLEBridgeSync or None
         self.scan_start, self.scan_end = scan_range
         self._client_j533:  Optional[Client] = None
         self._client_j255:  Optional[Client] = None
@@ -291,19 +293,39 @@ class J533Probe:
     # ── Connection ────────────────────────────────────────────────────────────
 
     def _make_conn(self, tx: int, rx: int):
-        params = {"tx_padding": 0x55}
-        if self.interface.upper() == "J2534":
-            from lib.connections.j2534_connection import J2534Connection
-            return J2534Connection(
-                windll=self.interface_path,
-                rxid=rx,
-                txid=tx,
-                st_min=0x19,   # ~1ms between frames
+        """
+        Create a udsoncan connection for the given CAN IDs.
+
+        Delegates to flasher.uds_flash._make_connection which handles
+        all four interface types: BLE, USBISOTP, J2534, SocketCAN.
+        A lightweight proxy ECU object carries the CAN TX/RX addresses.
+        """
+        try:
+            from flasher.uds_flash import _make_connection
+            class _Proxy:
+                can_tx = tx
+                can_rx = rx
+            return _make_connection(
+                _Proxy(),
+                self.interface,
+                interface_path = self.interface_path,
+                ble_bridge     = self.ble_bridge,
             )
-        else:
-            from udsoncan.connections import IsoTPSocketConnection
-            iface = self.interface_path or self.interface.split("_", 1)[-1]
-            return IsoTPSocketConnection(iface, rxid=rx, txid=tx, params=params)
+        except ImportError:
+            # Fallback for minimal installs without full flasher stack
+            params = {"tx_padding": 0x55}
+            if self.interface.upper() == "J2534":
+                from lib.connections.j2534_connection import J2534Connection
+                return J2534Connection(
+                    windll=self.interface_path,
+                    rxid=rx,
+                    txid=tx,
+                    st_min=0x19,
+                )
+            else:
+                from udsoncan.connections import IsoTPSocketConnection
+                iface = self.interface_path or self.interface.split("_", 1)[-1]
+                return IsoTPSocketConnection(iface, rxid=rx, txid=tx, params=params)
 
     def _make_client(self, tx: int, rx: int) -> Client:
         conn = self._make_conn(tx, rx)
