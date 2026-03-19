@@ -144,7 +144,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='simos_suite',
+    name='SimosSuite',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -179,5 +179,5 @@ exe = EXE(
 #     strip=False,
 #     upx=True,
 #     upx_exclude=[],
-#     name='simos_suite',
+#     name='SimosSuite',
 # )
