@@ -112,9 +112,11 @@ def main():
 
     # ── Verify ────────────────────────────────────────────────────────────────
     dist = root / "dist"
-    exe = dist / "SimosSuite.exe"
-    if not exe.exists():
-        exe = dist / "SimosSuite"   # Linux/Mac
+    # Check all possible output names (spec name controls this)
+    for candidate in ["SimosSuite.exe", "simos_suite.exe", "SimosSuite", "simos_suite"]:
+        exe = dist / candidate
+        if exe.exists():
+            break
 
     if exe.exists():
         size_mb = exe.stat().st_size / 1_048_576
