@@ -1039,6 +1039,92 @@ class J533Probe:
             log.warning("CP routine result error: %s", e)
             return None
 
+    def read_all_ika_keys(self) -> dict:
+        """
+        Read IKA key (DID 0x00BE) from all accessible CP modules:
+          - J533 Gateway   (TX=0x710, RX=0x77A) — already connected
+          - J255 Climatronic (TX=0x746, RX=0x7B0) — direct UDS
+
+        Returns dict:
+          {
+            "J533": {"did": "0x00BE", "raw": bytes, "status": "ok"|"nrc"|"error",
+                     "cp_active": bool, "hex": str},
+            "J255": {...},
+          }
+
+        Requires connect() to have been called first (J533 session open).
+        """
+        results = {}
+
+        # ── J533 (already connected) ───────────────────────────────────────
+        for name, tx, rx in [
+            ("J533", J533_TX, J533_RX),
+            ("J255", J255_TX, J255_RX),
+        ]:
+            try:
+                if name == "J533":
+                    client = self._client_j533
+                    if client is None:
+                        self.connect()
+                        client = self._client_j533
+                else:
+                    # Open a fresh UDS session to J255
+                    client = self._make_client(tx, rx)
+                    client.__enter__()
+                    try:
+                        client.change_session(
+                            udsoncan.services.DiagnosticSessionControl
+                            .Session.extendedDiagnosticSession)
+                    except Exception:
+                        pass  # J255 may not need extended session for read
+
+                raw, err = self._read_did(client, 0x00BE)
+
+                if err:
+                    results[name] = {
+                        "did": "0x00BE", "raw": b"", "hex": "",
+                        "status": f"nrc: {err}", "cp_active": None,
+                    }
+                else:
+                    cp_active = all(b == 0 for b in raw) if raw else None
+                    results[name] = {
+                        "did": "0x00BE",
+                        "raw": raw or b"",
+                        "hex": (raw or b"").hex().upper(),
+                        "hex_spaced": " ".join(f"{b:02X}" for b in (raw or b"")),
+                        "length": len(raw or b""),
+                        "status": "ok",
+                        "cp_active": cp_active,
+                    }
+                    log.info("%s 0x00BE (%d bytes) cp_active=%s",
+                             name, len(raw or b""), cp_active)
+
+                if name == "J255" and client is not None:
+                    try:
+                        client.__exit__(None, None, None)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                results[name] = {
+                    "did": "0x00BE", "raw": b"", "hex": "",
+                    "status": f"error: {e}", "cp_active": None,
+                }
+
+        # ── Also read constellation ────────────────────────────────────────
+        try:
+            const_raw, const_err = self._read_did(self._client_j533, 0x04A3)
+            results["J533_constellation"] = {
+                "did": "0x04A3",
+                "raw": const_raw or b"",
+                "hex_spaced": " ".join(f"{b:02X}" for b in (const_raw or b"")),
+                "status": "ok" if not const_err else f"nrc: {const_err}",
+            }
+        except Exception as e:
+            results["J533_constellation"] = {"did": "0x04A3", "status": f"error: {e}"}
+
+        return results
+
     def save_report(self, path: str, report: ProbeReport):
         with open(path, "w") as f:
             json.dump(asdict(report), f, indent=2)
