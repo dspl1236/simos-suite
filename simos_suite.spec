@@ -1,240 +1,142 @@
 # -*- mode: python ; coding: utf-8 -*-
+#
 # simos_suite.spec — PyInstaller build specification
 #
 # Build:
 #   pyinstaller simos_suite.spec
 #
-# Output: dist/SimosSuite.exe  (single-file, Windows x64)
-#
-# Requirements before building:
-#   pip install pyinstaller udsoncan bleak pyserial numpy pycryptodome
-#   pip install git+https://github.com/bri3d/sa2_seed_key.git
-#   pip install python-can
+# Output:
+#   dist/simos_suite.exe            (Windows one-file EXE)
+#   dist/simos_suite/simos_suite    (Linux/macOS one-dir build)
 #
 # Notes:
-#   - bleak uses asyncio + WinRT on Windows — all collected automatically
-#   - udsoncan is pure Python, no hidden imports needed
-#   - sa2_seed_key bytecode interpreter is pure Python
-#   - J2534 DLL loaded at runtime via ctypes — no static linking needed
-#   - numpy: PyInstaller handles numpy hooks automatically since v5
-#   - tkinter is bundled with the Python installer on Windows
-#     (if missing: reinstall Python with "tcl/tk and IDLE" option checked)
+#   - Targets Python 3.10+ on 64-bit Windows
+#   - J2534 PassThru DLL is loaded at runtime — not bundled
+#   - BLE via bleak requires Windows BT stack (Bluetooth LE hardware)
+#   - udsoncan, bleak, pyserial, pycryptodome must be pip-installed first
+#
+# Windows build machine prerequisites:
+#   pip install pyinstaller udsoncan bleak pyserial numpy pycryptodome
+#   pip install git+https://github.com/bri3d/sa2_seed_key.git
+#   pyinstaller simos_suite.spec
 
 import sys
 import os
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from pathlib import Path
 
 block_cipher = None
 
-# ── Collect data files ─────────────────────────────────────────────────────────
-# cp_routine_id.json must ship inside the EXE so the probe works offline
-datas = [
-    ('cp_tools/cp_routine_id.json', 'cp_tools'),
-]
+# ── Paths ─────────────────────────────────────────────────────────────────────
+ROOT = Path(SPECPATH)
 
-# bleak ships platform-specific backends — collect them all
-try:
-    datas += collect_data_files('bleak')
-except Exception:
-    pass
-
-# ── Hidden imports ─────────────────────────────────────────────────────────────
-# Modules loaded dynamically that PyInstaller's static analysis misses
-
-hiddenimports = [
-    # udsoncan internal services — loaded by name at runtime
-    'udsoncan',
-    'udsoncan.services',
-    'udsoncan.services.DiagnosticSessionControl',
-    'udsoncan.services.SecurityAccess',
-    'udsoncan.services.ReadDataByIdentifier',
-    'udsoncan.services.WriteDataByIdentifier',
-    'udsoncan.services.RoutineControl',
-    'udsoncan.services.RequestDownload',
-    'udsoncan.services.TransferData',
-    'udsoncan.services.RequestTransferExit',
-    'udsoncan.services.ECUReset',
-    'udsoncan.services.ReadMemoryByAddress',
-    'udsoncan.client',
-    'udsoncan.connections',
-    'udsoncan.configs',
-    'udsoncan.exceptions',
-
-    # sa2_seed_key — loaded by name in security access
-    'sa2_seed_key',
-    'sa2_seed_key.sa2_seed_key',
-
-    # bleak Windows backend
-    'bleak',
-    'bleak.backends',
-    'bleak.backends.winrt',
-    'bleak.backends.winrt.client',
-    'bleak.backends.winrt.scanner',
-    'bleak.backends.winrt.service',
-    'bleak.backends.winrt.characteristic',
-    'bleak.backends.winrt.descriptor',
-    'bleak.backends.dotnet',     # fallback
-    'bleak.backends.p4android',  # not used but avoids import error
-    'bleak.exc',
-
-    # python-can backends (only USB-SocketCAN used but collect all)
-    'can',
-    'can.interfaces',
-    'can.interfaces.socketcan',
-    'can.interfaces.usb2can',
-    'can.interfaces.vector',
-    'can.interfaces.kvaser',
-    'can.interfaces.pcan',
-    'can.interfaces.ixxat',
-    'can.interfaces.nican',
-    'can.interfaces.iscan',
-    'can.interfaces.neovi',
-    'can.interfaces.gs_usb',
-    'can.interfaces.virtual',
-    'can.interfaces.slcan',
-    'can.interfaces.systec',
-    'can.listener',
-    'can.util',
-    'can.message',
-    'can.notifier',
-    'can.typechecking',
-
-    # pyserial
-    'serial',
-    'serial.serialwin32',
-    'serial.serialutil',
-    'serial.tools',
-    'serial.tools.list_ports',
-    'serial.tools.list_ports_windows',
-
-    # numpy and its lazy-loaded submodules
-    'numpy',
-    'numpy.core',
-    'numpy.core._multiarray_umath',
-    'numpy.lib',
-    'numpy.random',
-
-    # pycryptodome (AES for Simos12/18)
-    'Crypto',
-    'Crypto.Cipher',
-    'Crypto.Cipher.AES',
-    'Crypto.Util',
-    'Crypto.Util.Padding',
-
-    # tkinter extras sometimes missed
-    'tkinter',
-    'tkinter.ttk',
-    'tkinter.filedialog',
-    'tkinter.messagebox',
-    'tkinter.scrolledtext',
-    'tkinter.font',
-    '_tkinter',
-
-    # asyncio event loop for bleak on Windows
-    'asyncio',
-    'asyncio.events',
-    'asyncio.windows_events',
-    'asyncio.proactor_events',
-
-    # winrt (bleak Windows BLE backend, Python 3.12+)
-    'winrt',
-    'winrt.windows.devices.bluetooth',
-    'winrt.windows.devices.bluetooth.advertisement',
-    'winrt.windows.devices.bluetooth.genericattributeprofile',
-    'winrt.windows.foundation',
-    'winrt.windows.foundation.collections',
-    'winrt.windows.storage.streams',
-
-    # Our own modules — all subpackages
-    'core',
-    'core.ecu_defs',
-    'core.trans_defs',
-    'cp_tools',
-    'cp_tools.j533_probe',
-    'cp_tools.odx_parser',
-    'cp_tools.mwb_extract',
-    'flasher',
-    'flasher.uds_flash',
-    'lib.connections',
-    'lib.connections.j2534',
-    'lib.connections.j2534_connection',
-    'lib.connections.usb_isotp_connection',
-    'logger',
-    'transport',
-    'transport.ble_bridge',
-    'transport.interfaces',
-    'tuner',
-    'tuner.cal_parser',
-    'ui',
-    'ui.main_window',
-    'ui.trans_logger',
-    'ui.trans_tab',
-    'ui.interface_panel',
-    'ui.hardware_tab',
-]
-
-# ── Analysis ───────────────────────────────────────────────────────────────────
-
+# ── Analysis ──────────────────────────────────────────────────────────────────
 a = Analysis(
-    ['simos_suite_main.py'],
-    pathex=['.'],
+    ['simos_suite.py'],
+    pathex=[str(ROOT)],
     binaries=[],
-    datas=datas,
-    hiddenimports=hiddenimports,
-    hookspath=['build_hooks'],
-    hooksconfig={},
-    runtime_hooks=[],
+    datas=[
+        # Ship the CP research data file so the routine ID is available offline
+        ('cp_tools/cp_routine_id.json', 'cp_tools'),
+        # Ship the docs for the about dialog / help
+        ('docs/tuning_guide_s85.md',   'docs'),
+        ('docs/odx_findings.md',       'docs'),
+        ('README.md',                  '.'),
+        ('LICENSE',                    '.'),
+    ],
+    hiddenimports=[
+        # udsoncan internals PyInstaller can miss
+        'udsoncan',
+        'udsoncan.client',
+        'udsoncan.services',
+        'udsoncan.configs',
+        'udsoncan.exceptions',
+        'udsoncan.connections',
+        'udsoncan.Request',
+        'udsoncan.Response',
+        # bleak BLE backend — Windows needs the winRT backend
+        'bleak',
+        'bleak.backends.winrt.client',
+        'bleak.backends.winrt.scanner',
+        'bleak.backends.winrt.utils',
+        # pyserial
+        'serial',
+        'serial.tools',
+        'serial.tools.list_ports',
+        # numpy (cal_parser)
+        'numpy',
+        'numpy.core._methods',
+        'numpy.lib.format',
+        # pycryptodome (Simos12/18 AES)
+        'Crypto',
+        'Crypto.Cipher',
+        'Crypto.Cipher.AES',
+        # sa2_seed_key (SA2 bytecode interpreter)
+        'sa2_seed_key',
+        'sa2_seed_key.sa2_seed_key',
+        # python-can (SocketCAN — used on Linux, imported lazily on Windows)
+        'can',
+        'can.interfaces',
+        'can.interfaces.socketcan',
+        # our own packages
+        'core',
+        'core.ecu_defs',
+        'core.trans_defs',
+        'cp_tools',
+        'cp_tools.j533_probe',
+        'cp_tools.mwb_extract',
+        'cp_tools.odx_parser',
+        'flasher',
+        'flasher.uds_flash',
+        'lib',
+        'lib.connections',
+        'lib.connections.j2534',
+        'lib.connections.j2534_connection',
+        'lib.connections.usb_isotp_connection',
+        'logger',
+        'transport',
+        'transport.ble_bridge',
+        'transport.interfaces',
+        'tuner',
+        'tuner.cal_parser',
+        'ui',
+        'ui.main_window',
+        'ui.hardware_tab',
+        'ui.interface_panel',
+        'ui.trans_logger',
+        'ui.trans_tab',
+        'tests',
+        'tests.mock_connection',
+        'tests.sim_runner',
+    ],
     excludes=[
-        # Exclude heavy unused packages
-        'matplotlib',
-        'scipy',
-        'pandas',
-        'PIL',
-        'PIL.Image',
-        'wx',
-        'PyQt5',
-        'PyQt6',
-        'PySide2',
-        'PySide6',
-        'IPython',
-        'jupyter',
-        'notebook',
+        # exclude test/dev-only packages
         'pytest',
         'setuptools',
         'distutils',
+        'pip',
+        'IPython',
+        'jupyter',
+        'matplotlib',
+        # exclude macOS-specific bleak backend
+        'bleak.backends.corebluetooth',
+        # exclude Linux bleak backend (Windows build)
+        'bleak.backends.bluezdbus',
+        # large unused modules
+        'tkinter.test',
+        'xmlrpc',
         'email',
         'html',
         'http',
-        'urllib',
-        'xml',
-        'xmlrpc',
-        'ftplib',
-        'imaplib',
-        'poplib',
-        'smtplib',
-        'telnetlib',
-        'nntplib',
-        'unittest',
-        'doctest',
-        'pdb',
-        'profile',
-        'cProfile',
-        'pstats',
-        'timeit',
-        'trace',
-        'turtle',
-        'tkinter.test',
+        'urllib3',
+        'multiprocessing',
     ],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
+    optimize=1,
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# ── Single-file EXE ───────────────────────────────────────────────────────────
-
+# ── One-file EXE (Windows) ────────────────────────────────────────────────────
 exe = EXE(
     pyz,
     a.scripts,
@@ -242,26 +144,40 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='SimosSuite',
+    name='simos_suite',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,           # compress with UPX if available (smaller EXE)
+    upx=True,          # compress — cuts ~30% on most binaries
     upx_exclude=[
-        # Don't compress these — causes issues with some AV/Windows
+        # don't compress these — UPX breaks some DLLs
         'vcruntime140.dll',
-        'python3*.dll',
-        '_tkinter*.pyd',
+        '_ssl.dll',
+        'libssl*.dll',
+        'libcrypto*.dll',
     ],
     runtime_tmpdir=None,
-    console=False,       # No console window — pure GUI app
+    console=False,      # no console window — log goes to %TEMP%\simos_suite.log
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,    # x64 by default on x64 Python
+    target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # Windows-specific metadata
-    version='version_info.txt',
-    icon='build_assets/simos_suite.ico',
-    uac_admin=False,     # Don't require admin — user-land tool
+    # Windows-specific:
+    version='version_info.txt',   # see build_exe.py for auto-generation
+    # icon='assets/simos_suite.ico',  # uncomment when icon is added
 )
+
+# ── One-dir build (Linux / macOS) ────────────────────────────────────────────
+# Uncomment for Linux/macOS one-dir instead of one-file:
+#
+# coll = COLLECT(
+#     exe,
+#     a.binaries,
+#     a.zipfiles,
+#     a.datas,
+#     strip=False,
+#     upx=True,
+#     upx_exclude=[],
+#     name='simos_suite',
+# )
