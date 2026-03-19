@@ -3,13 +3,17 @@ name: Build EXE
 on:
   push:
     tags:
-      - 'v*'           # trigger on version tags: v0.2.0, v1.0.0, etc.
-  workflow_dispatch:   # allow manual trigger from GitHub UI
+      - 'v*'
+  workflow_dispatch:
     inputs:
       version:
         description: 'Version string (e.g. 0.2.0)'
         required: false
         default: 'dev'
+
+# Grant write access so the release upload step can attach assets
+permissions:
+  contents: write
 
 jobs:
   build-windows-exe:
@@ -37,29 +41,11 @@ jobs:
         shell: cmd
         run: python -m tests.sim_runner --headless
 
-      - name: Create build directories
-        shell: cmd
-        run: |
-          if not exist build_assets mkdir build_assets
-          if not exist build_hooks mkdir build_hooks
-
-      - name: Patch spec if no icon
-        shell: python
-        run: |
-          import re, pathlib
-          spec = pathlib.Path('simos_suite.spec').read_text()
-          # Remove icon and version references if files don't exist
-          if not pathlib.Path('build_assets/simos_suite.ico').exists():
-              spec = re.sub(r",\s*\n\s*icon='build_assets/simos_suite\.ico'", '', spec)
-          if not pathlib.Path('version_info.txt').exists():
-              spec = re.sub(r",\s*\n\s*version='version_info\.txt'", '', spec)
-          pathlib.Path('simos_suite.spec').write_text(spec)
-
       - name: Build EXE
         shell: cmd
-        run: pyinstaller simos_suite.spec --clean --noconfirm
+        run: python build_exe.py --no-test --no-upx
 
-      - name: Verify EXE exists
+      - name: Verify EXE
         shell: cmd
         run: |
           if not exist dist\SimosSuite.exe (
@@ -72,8 +58,7 @@ jobs:
         id: version
         shell: python
         run: |
-          import os, subprocess
-          # Try tag first, then input, then git describe
+          import os
           ref = os.environ.get('GITHUB_REF', '')
           if ref.startswith('refs/tags/'):
               version = ref.replace('refs/tags/', '')
@@ -86,16 +71,16 @@ jobs:
       - name: Rename EXE with version
         shell: cmd
         run: |
-          copy dist\SimosSuite.exe dist\SimosSuite-${{ steps.version.outputs.version }}.exe
+          copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.version.outputs.version }}.exe"
 
-      - name: Upload EXE as artifact
+      - name: Upload artifact (always)
         uses: actions/upload-artifact@v4
         with:
           name: SimosSuite-${{ steps.version.outputs.version }}-windows-x64
           path: dist/SimosSuite-${{ steps.version.outputs.version }}.exe
           retention-days: 90
 
-      - name: Create GitHub Release (on tag push)
+      - name: Upload to GitHub Release (tag pushes only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
@@ -108,29 +93,28 @@ jobs:
 
             ### What's included
             - Full 8-tab GUI (Connect, ECU Info, Flash, Tune, Logger, CP Tools, Raw Sniff, Trans)
-            - Simos8.5 CAL editor — all 14 tables with axis labels and heat-map
-            - ZF8HP / DL501 / DQ250 / DQ381 live data
-            - J533 Component Protection probe (CP routine ID: 0x0226, pending hardware confirmation)
-            - BLE bridge support (ESP32 firmware: dspl1236/esp32-isotp-ble-bridge-c7vag)
+            - Simos8.5 CAL editor — all 14 tables with RPM/load axis labels and heat-map
+            - ZF8HP / DL501 / DQ250 / DQ381 transmission live data
+            - J533 Component Protection probe — CP routine ID 0x0226 (pending hardware confirmation)
+            - BLE bridge support (ESP32: dspl1236/esp32-isotp-ble-bridge-c7vag)
 
             ### Running
             ```
             SimosSuite.exe              # normal mode
-            SimosSuite.exe --ecu SC8    # Simos18 / Golf 7 mode
+            SimosSuite.exe --ecu SC8    # Simos18 / MQB Golf 7 mode
             SimosSuite.exe --debug      # verbose logging
             ```
 
             ### First run
-            Windows Defender SmartScreen may flag an unsigned EXE. Click "More info" → "Run anyway".
-            Source is at github.com/dspl1236/simos-suite — GPL v3.
+            Windows Defender SmartScreen may flag an unsigned EXE — click **More info → Run anyway**.
+            Source: github.com/dspl1236/simos-suite — GPL v3.
 
             ### Requirements
             - Windows 10 or 11, x64
-            - Bluetooth 4.0+ adapter (for BLE bridge)
-            - J2534 DLL (Tactrix/Mongoose/VNCI) for J2534 interface
+            - Bluetooth 4.0+ adapter (BLE bridge mode)
+            - J2534 DLL for J2534 mode (Tactrix, Mongoose, VNCI)
           files: |
             dist/SimosSuite-${{ steps.version.outputs.version }}.exe
+          fail_on_unmatched_files: true
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, 'alpha') || contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'dev') }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
