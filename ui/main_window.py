@@ -1260,29 +1260,84 @@ class LoggerTab(_Tab):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CPToolsTab(_Tab):
+    """
+    CP Tools tab — J533 constellation probe, CP routine check, ODX parser.
+
+    The CP routine check button (⟳ check CP status) is the key diagnostic:
+    it connects to J533, reads the constellation and IKA key DID, then fires
+    RoutineControl Start (31 01 02 26) and reports J533's response. This lets
+    you confirm:
+      - Whether J533 sees J255 in the constellation
+      - Whether the IKA key is zeroed (CP active) or populated (CP cleared)
+      - Whether 0x0226 is the correct routine ID (7F 31 22 = yes, needs token)
+
+    All operations run in a background thread — UI stays responsive.
+    """
+
     def __init__(self, parent, mw):
         super().__init__(parent, mw)
 
-        _section(self, "J533 probe")
+        # ── CP status check (primary diagnostic) ─────────────────────────────
+        _section(self, "component protection check")
 
-        info = _card(self, padx=12, pady=8)
-        info.pack(fill="x", padx=14, pady=4)
-        tk.Label(info, text=(
-            "Connects to J533 gateway (TX=0x710, RX=0x77A) and reads every accessible DID.\n"
-            "Run alongside an ODIS session in raw sniff mode to capture CP removal sequence."
+        cp_info = _card(self, padx=12, pady=8)
+        cp_info.pack(fill="x", padx=14, pady=(4, 2))
+        tk.Label(cp_info, text=(
+            "Reads constellation + IKA key from J533, then sends RoutineControl\n"
+            "Start (31 01 02 26) to confirm the routine ID and read J533's response.\n"
+            "Expected response if ID is correct: 7F 31 22 (conditionsNotCorrect — needs token).\n"
+            "Expected response if ID is wrong:   7F 31 31 (requestOutOfRange)."
         ), fg=C["muted"], bg=C["surface"], font=("Menlo", 10),
-            justify="left", wraplength=580).pack(anchor="w")
+            justify="left", wraplength=600).pack(anchor="w")
+
+        cp_row = _frame(self)
+        cp_row.pack(fill="x", padx=14, pady=6)
+        self._cp_btn = _btn(cp_row, "⟳  check CP status",
+                            self._do_cp_check, primary=True, state="disabled")
+        self._cp_btn.pack(side="left")
+
+        # Status indicator
+        self._cp_status_var = tk.StringVar(value="not connected")
+        self._cp_status_lbl = tk.Label(cp_row, textvariable=self._cp_status_var,
+                                        fg=C["muted"], bg=C["bg"],
+                                        font=("Menlo", 10))
+        self._cp_status_lbl.pack(side="left", padx=16)
+
+        # Result summary strip
+        self._cp_result_frame = _frame(self)
+        self._cp_result_frame.pack(fill="x", padx=14, pady=(0, 4))
+        self._cp_fields = {}
+        for label in ("VIN", "J255 slot", "IKA key", "Routine 0x0226", "J533 response"):
+            row = _frame(self._cp_result_frame)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=f"  {label:<22}", fg=C["dim"], bg=C["bg"],
+                     font=("Menlo", 9)).pack(side="left")
+            var = tk.StringVar(value="—")
+            tk.Label(row, textvariable=var, fg=C["blue"], bg=C["bg"],
+                     font=("Menlo", 9)).pack(side="left")
+            self._cp_fields[label] = var
+
+        # ── J533 full probe ───────────────────────────────────────────────────
+        _section(self, "J533 full DID probe")
+
+        probe_info = _card(self, padx=12, pady=8)
+        probe_info.pack(fill="x", padx=14, pady=(4, 2))
+        tk.Label(probe_info, text=(
+            "Sweeps all accessible DIDs on J533 (TX=0x710, RX=0x77A).\n"
+            "Run alongside ODIS in raw sniff mode to capture the full CP token exchange."
+        ), fg=C["muted"], bg=C["surface"], font=("Menlo", 10),
+            justify="left", wraplength=600).pack(anchor="w")
 
         op_row = _frame(self)
         op_row.pack(fill="x", padx=14, pady=6)
         self._probe_btn = _btn(op_row, "run full probe",
-                               self._do_probe, primary=True,
-                               state="disabled")
+                               self._do_probe, state="disabled")
         self._probe_btn.pack(side="left")
         self._save_btn = _btn(op_row, "save report JSON",
                               self._save_report, state="disabled")
         self._save_btn.pack(side="left", padx=8)
 
+        # ── ODX parser ────────────────────────────────────────────────────────
         _section(self, "ODX parser")
 
         odx_row = _frame(self)
@@ -1293,21 +1348,192 @@ class CPToolsTab(_Tab):
                                  font=("Menlo", 10))
         self._odx_lbl.pack(side="left", padx=10)
 
+        # ── Output log ────────────────────────────────────────────────────────
         _section(self, "output")
-        log_outer, self._log = _scrolled_text(self, height=14)
+        log_outer, self._log = _scrolled_text(self, height=12)
         log_outer.pack(fill="both", expand=True, padx=14, pady=4)
-        self._log.tag_config("ok",  foreground=C["green"])
-        self._log.tag_config("err", foreground=C["red"])
-        self._log.tag_config("hdr", foreground=C["blue"])
-        self._log.tag_config("dim", foreground=C["muted"])
+        self._log.tag_config("ok",   foreground=C["green"])
+        self._log.tag_config("err",  foreground=C["red"])
+        self._log.tag_config("hdr",  foreground=C["blue"])
+        self._log.tag_config("dim",  foreground=C["muted"])
+        self._log.tag_config("warn", foreground=C["amber"])
 
         self._report = None
 
+    # ── Connection state ──────────────────────────────────────────────────────
+
     def on_connect(self):
         self._probe_btn.config(state="normal")
+        self._cp_btn.config(state="normal")
+        self._cp_status_var.set("connected — ready")
+        self._cp_status_lbl.config(fg=C["green"])
 
     def on_disconnect(self):
         self._probe_btn.config(state="disabled")
+        self._cp_btn.config(state="disabled")
+        self._cp_status_var.set("not connected")
+        self._cp_status_lbl.config(fg=C["muted"])
+        for var in self._cp_fields.values():
+            var.set("—")
+
+    # ── CP status check ───────────────────────────────────────────────────────
+
+    def _do_cp_check(self):
+        self._cp_btn.config(state="disabled")
+        self._cp_status_var.set("checking...")
+        self._cp_status_lbl.config(fg=C["amber"])
+        for var in self._cp_fields.values():
+            var.set("...")
+        self._clear_log(self._log)
+        self._append_log(self._log,
+            "── CP status check ──────────────────────────────────\n", "hdr")
+        self._append_log(self._log,
+            "  Connecting to J533 (TX=0x710 RX=0x77A)...\n", "dim")
+        self._run(self._cp_check_task)
+
+    def _cp_check_task(self):
+        """
+        Background thread: connect to J533, read constellation + IKA key,
+        fire RoutineControl Start 0x0226, report raw response.
+        """
+        import struct
+
+        def log(msg, tag=""):
+            self._ui(self._append_log, self._log, msg, tag)
+
+        def field(name, val, color=None):
+            self._ui(self._cp_fields[name].set, val)
+            if color:
+                # We can't easily recolor a StringVar label — log it instead
+                pass
+
+        try:
+            from cp_tools.j533_probe import J533Probe, CP_ROUTINE_ID
+        except ImportError as e:
+            self._ui(self._cp_status_var.set, f"import error: {e}")
+            self._ui(self._cp_status_lbl.config, fg=C["red"])
+            self._ui(self._cp_btn.config, state="normal")
+            return
+
+        try:
+            probe = J533Probe(
+                interface      = self.mw.interface,
+                interface_path = self.mw.iface_path,
+            )
+            probe.connect()
+            log("  J533 connected\n", "ok")
+
+            # ── VIN ───────────────────────────────────────────────────────────
+            try:
+                vin = probe.read_did_raw(0xF190)
+                vin_str = vin.decode("ascii", errors="replace").strip("\x00").strip()
+                log(f"  VIN               {vin_str}\n", "ok")
+                field("VIN", vin_str)
+            except Exception as e:
+                log(f"  VIN read failed: {e}\n", "warn")
+                field("VIN", f"error: {e}")
+
+            # ── Constellation — find J255 slot ────────────────────────────────
+            try:
+                alloc = probe.read_did_raw(0x2A2A)
+                # Structure: pairs of (ecu_id u8, ecu_name u8)
+                j255_slot = None
+                for i in range(0, len(alloc) - 1, 2):
+                    slot_idx = alloc[i]
+                    ecu_name = alloc[i + 1]
+                    if ecu_name == 8:   # 8 = Air Conditioning = J255
+                        j255_slot = slot_idx
+                        break
+                if j255_slot is not None:
+                    log(f"  J255 in slot      {j255_slot}  (ECU name code 8)\n", "ok")
+                    field("J255 slot", str(j255_slot))
+                else:
+                    log("  J255 NOT found in constellation\n", "warn")
+                    field("J255 slot", "not enrolled")
+            except Exception as e:
+                log(f"  constellation read failed: {e}\n", "warn")
+                field("J255 slot", f"error: {e}")
+
+            # ── IKA key — 34 bytes, all zeros = CP active ────────────────────
+            try:
+                ika = probe.read_did_raw(0x00BE)
+                if len(ika) == 34 and all(b == 0 for b in ika):
+                    log("  IKA key (0x00BE)  all-zero — CP ACTIVE\n", "warn")
+                    field("IKA key", "all-zero (CP active)")
+                elif len(ika) == 34:
+                    log(f"  IKA key (0x00BE)  {ika[:8].hex()}...  CP cleared\n", "ok")
+                    field("IKA key", f"{ika[:8].hex()}...  (populated)")
+                else:
+                    log(f"  IKA key (0x00BE)  unexpected length {len(ika)}\n", "warn")
+                    field("IKA key", f"{len(ika)}B: {ika.hex()}")
+            except Exception as e:
+                log(f"  IKA key read failed: {e}\n", "warn")
+                field("IKA key", f"error: {e}")
+
+            # ── RoutineControl Start 0x0226 ───────────────────────────────────
+            rid_hi = (CP_ROUTINE_ID >> 8) & 0xFF
+            rid_lo = CP_ROUTINE_ID & 0xFF
+            log(f"\n  Sending RoutineControl Start: 31 01 {rid_hi:02X} {rid_lo:02X}\n",
+                "hdr")
+            field("Routine 0x0226", "sending...")
+
+            try:
+                raw_resp = probe.start_cp_routine()
+                if raw_resp is None:
+                    log("  No response (timeout)\n", "err")
+                    field("Routine 0x0226", "timeout")
+                    field("J533 response", "no response")
+                else:
+                    hex_resp = raw_resp.hex(" ").upper()
+                    log(f"  Raw response:     {hex_resp}\n", "ok")
+                    field("J533 response", hex_resp)
+
+                    # Interpret
+                    if len(raw_resp) >= 1 and raw_resp[0] == 0x71:
+                        log("  ✓ ROUTINE ACCEPTED — J533 accepted 0x0226\n", "ok")
+                        field("Routine 0x0226", "✓ accepted (0x71)")
+                    elif len(raw_resp) >= 3 and raw_resp[0] == 0x7F:
+                        nrc = raw_resp[2]
+                        if nrc == 0x22:
+                            log("  ✓ ID CONFIRMED — NRC 0x22 conditionsNotCorrect\n"
+                                "    J533 knows this routine but requires the token.\n",
+                                "ok")
+                            field("Routine 0x0226", "✓ ID confirmed (NRC 0x22)")
+                        elif nrc == 0x31:
+                            log("  ✗ WRONG ID — NRC 0x31 requestOutOfRange\n"
+                                "    0x0226 is NOT the correct routine ID.\n",
+                                "err")
+                            field("Routine 0x0226", "✗ wrong ID (NRC 0x31)")
+                        elif nrc == 0x7E:
+                            log("  ○ NRC 0x7E — subFunctionNotSupportedInActiveSession\n"
+                                "    Try extended session first.\n", "warn")
+                            field("Routine 0x0226", "needs ext session (0x7E)")
+                        else:
+                            log(f"  ? NRC 0x{nrc:02X} — see ISO 14229-1 Table A.1\n", "warn")
+                            field("Routine 0x0226", f"NRC 0x{nrc:02X}")
+                    else:
+                        log(f"  ? Unknown response format\n", "warn")
+                        field("Routine 0x0226", f"unknown: {hex_resp}")
+
+            except Exception as e:
+                log(f"  RoutineControl error: {e}\n", "err")
+                field("Routine 0x0226", f"error: {e}")
+                field("J533 response", "exception")
+
+            log("\n── check complete ───────────────────────────────────\n", "hdr")
+            self._ui(self._cp_status_var.set, "check complete")
+            self._ui(self._cp_status_lbl.config, fg=C["green"])
+
+        except Exception as e:
+            self._ui(self._append_log, self._log,
+                     f"  fatal: {e}\n", "err")
+            self._ui(self._cp_status_var.set, f"error: {str(e)[:40]}")
+            self._ui(self._cp_status_lbl.config, fg=C["red"])
+
+        finally:
+            self._ui(self._cp_btn.config, state="normal")
+
+    # ── J533 full probe ───────────────────────────────────────────────────────
 
     def _do_probe(self):
         self._probe_btn.config(state="disabled")
@@ -1319,12 +1545,11 @@ class CPToolsTab(_Tab):
         try:
             from cp_tools.j533_probe import J533Probe
             probe = J533Probe(
-                interface     = self.mw.interface,
-                interface_path= self.mw.iface_path,
+                interface      = self.mw.interface,
+                interface_path = self.mw.iface_path,
             )
             probe.connect()
-            self._ui(self._append_log, self._log,
-                     "connected to J533\n", "ok")
+            self._ui(self._append_log, self._log, "connected to J533\n", "ok")
             report = probe.full_probe()
             self._report = report
             self._ui(self._show_probe_report, report)
@@ -1335,8 +1560,8 @@ class CPToolsTab(_Tab):
 
     def _show_probe_report(self, report):
         self._append_log(self._log, "\n── probe report ─────────────────────\n", "hdr")
-        for k, v in report.__dict__.items() if hasattr(report, "__dict__") \
-                else report.items():
+        data = report.__dict__ if hasattr(report, "__dict__") else report
+        for k, v in data.items():
             self._append_log(self._log, f"  {k:<28}  {v}\n")
         self._probe_btn.config(state="normal")
         self._save_btn.config(state="normal")
@@ -1353,13 +1578,14 @@ class CPToolsTab(_Tab):
             import json
             from dataclasses import asdict
             try:
-                data = asdict(self._report) if hasattr(self._report, "__dataclass_fields__") \
-                       else dict(self._report)
+                data = asdict(self._report) if hasattr(self._report, "__dataclass_fields__")                        else dict(self._report)
                 with open(path, "w") as f:
                     json.dump(data, f, indent=2, default=str)
                 messagebox.showinfo("Saved", os.path.basename(path))
             except Exception as e:
                 messagebox.showerror("Save error", str(e))
+
+    # ── ODX parser ────────────────────────────────────────────────────────────
 
     def _open_odx(self):
         path = filedialog.askopenfilename(
