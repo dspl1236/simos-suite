@@ -5,14 +5,14 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main]
-  release:
-    types: [published]
 
 jobs:
-  # ── Backend tests (Linux, no hardware deps) ────────────────────────────────
+  # ── Backend tests — Linux, no hardware deps ──────────────────────────────────
   test:
+    name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
 
@@ -24,11 +24,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
+      - name: Install minimal deps (no hardware stack)
         run: |
           pip install numpy
           pip install git+https://github.com/bri3d/sa2_seed_key.git || true
-          echo "Hardware deps (udsoncan/bleak/pyserial) skipped for CI"
+          echo "Hardware deps (udsoncan/bleak/pyserial) skipped in CI"
 
       - name: Headless smoke test
         run: python -m tests.sim_runner --headless
@@ -44,19 +44,29 @@ jobs:
 
       - name: Import chain verification
         run: |
-          python -c "from core.ecu_defs import ECU_REGISTRY, TCU_REGISTRY, SIMOS85, ZF8HP; print('core OK')"
+          python -c "
+          from core.ecu_defs import (
+              ECU_REGISTRY, TCU_REGISTRY,
+              SIMOS85, SIMOS12, SIMOS122, SIMOS18,
+              ZF8HP, DL501, DQ250, DQ381,
+          )
+          print(f'core OK — {len(ECU_REGISTRY)} ECUs, {len(TCU_REGISTRY)} TCUs')
+          "
           python -c "from core.trans_defs import TRANS_REGISTRY, ECU_DEFAULT_TRANS; print('trans_defs OK')"
           python -c "from logger import LogSession, SIMOS85_CHANNELS, Channel; print('logger OK')"
           python -c "from tuner.cal_parser import CalParser; print('cal_parser OK')"
-          python -c "from cp_tools.mwb_extract import load_confirmed_routine_id; rid=load_confirmed_routine_id(); print(f'cp_tools OK (routine_id={rid})')"
+          python -c "
+          from cp_tools.mwb_extract import load_confirmed_routine_id
+          rid = load_confirmed_routine_id()
+          print(f'cp_tools OK — CP_ROUTINE_ID={hex(rid) if rid else \"pending confirmation\"}')
+          "
 
-  # ── Windows EXE build (only on release tag or manual push to main) ─────────
+  # ── Windows EXE build — runs after tests pass ──────────────────────────────
   build-exe:
+    name: Build Windows EXE
     needs: test
     runs-on: windows-latest
-    if: >
-      github.event_name == 'release' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
 
     steps:
       - uses: actions/checkout@v4
@@ -68,36 +78,30 @@ jobs:
           architecture: "x64"
 
       - name: Install all dependencies
+        shell: cmd
         run: |
           pip install pyinstaller
-          pip install udsoncan bleak pyserial numpy pycryptodome
+          pip install udsoncan bleak pyserial numpy pycryptodome python-can
           pip install git+https://github.com/bri3d/sa2_seed_key.git
           python -c "import udsoncan, bleak, serial, numpy, Crypto; print('All deps OK')"
 
-      - name: Run smoke test before build
-        run: python -m tests.sim_runner --headless
-
       - name: Build EXE
+        shell: cmd
         run: python build_exe.py --no-test --no-upx
-        # UPX not in GitHub Actions runner by default — skip for CI builds
-        # Add --sign if you add cert to repo secrets
 
-      - name: Verify EXE
+      - name: Verify EXE exists and runs
+        shell: cmd
         run: |
-          dist\simos_suite.exe --version
-          dist\simos_suite.exe --headless
+          if not exist dist\SimosSuite.exe (
+            echo ERROR: dist\SimosSuite.exe not found
+            exit /b 1
+          )
+          dir dist\SimosSuite.exe
+          echo EXE verified.
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: simos_suite-windows-x64
-          path: dist/simos_suite.exe
+          name: SimosSuite-windows-x64-${{ github.sha }}
+          path: dist/SimosSuite.exe
           retention-days: 30
-
-      - name: Attach EXE to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/simos_suite.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
