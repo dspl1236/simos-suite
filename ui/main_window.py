@@ -1354,6 +1354,9 @@ class CPToolsTab(_Tab):
         self._cp_btn = _btn(cp_row, "⟳  check CP status",
                             self._do_cp_check, primary=True, state="disabled")
         self._cp_btn.pack(side="left")
+        self._ika_btn = _btn(cp_row, "📖  read IKA keys",
+                             self._do_read_ika, state="disabled")
+        self._ika_btn.pack(side="left", padx=8)
 
         # Status indicator
         self._cp_status_var = tk.StringVar(value="not connected")
@@ -1424,18 +1427,92 @@ class CPToolsTab(_Tab):
     def on_connect(self):
         self._probe_btn.config(state="normal")
         self._cp_btn.config(state="normal")
+        self._ika_btn.config(state="normal")
         self._cp_status_var.set("connected — ready")
         self._cp_status_lbl.config(fg=C["green"])
 
     def on_disconnect(self):
         self._probe_btn.config(state="disabled")
         self._cp_btn.config(state="disabled")
+        self._ika_btn.config(state="disabled")
         self._cp_status_var.set("not connected")
         self._cp_status_lbl.config(fg=C["muted"])
         for var in self._cp_fields.values():
             var.set("—")
 
     # ── CP status check ───────────────────────────────────────────────────────
+
+    def _do_read_ika(self):
+        """Read DID 0x00BE (IKA key) from J533 and J255 directly."""
+        self._ika_btn.config(state="disabled")
+        self._clear_log(self._log)
+        self._append_log(self._log,
+            "── IKA key readback ─────────────────────────────────\n", "hdr")
+        self._append_log(self._log,
+            "  Known J136 blob: E6 2B 41 D1 1C 44 AF 20 21 77 FB 1F\n"
+            "                   27 4B 0A C2 D1 5B D2 62 E4 FD 27 AB\n"
+            "                   61 D1 23 C2 F1 5A 2C 93 26 00\n", "dim")
+        self._run(self._ika_task)
+
+    def _ika_task(self):
+        def log(msg, tag=""):
+            self._ui(self._append_log, self._log, msg, tag)
+
+        KNOWN_J136 = bytes.fromhex(
+            "E62B41D11C44AF202177FB1F274B0AC2D15B"
+            "D262E4FD27AB61D123C2F15A2C932600")
+
+        try:
+            from cp_tools.j533_probe import J533Probe
+            probe = J533Probe(
+                interface      = self.mw.interface,
+                interface_path = self.mw.iface_path,
+                ble_bridge     = getattr(self.mw, "ble_bridge", None),
+            )
+            probe.connect()
+            log("  J533 connected\n", "ok")
+
+            results = probe.read_all_ika_keys()
+
+            for module, info in results.items():
+                if module == "J533_constellation":
+                    log(f"\n  Constellation (0x04A3):\n", "hdr")
+                    log(f"    {info.get('hex_spaced','')}\n", "ok")
+                    continue
+
+                log(f"\n  {module} — DID 0x00BE:\n", "hdr")
+                status = info.get("status","?")
+                raw    = info.get("raw", b"")
+
+                if status == "ok":
+                    hex_s = info.get("hex_spaced","")
+                    cp    = info.get("cp_active")
+                    length = info.get("length", 0)
+                    log(f"    Length: {length} bytes\n")
+                    log(f"    Hex:    {hex_s}\n",
+                        "warn" if cp else "ok")
+                    if cp:
+                        log(f"    ⚠ ALL ZEROS — CP still active\n", "warn")
+                    elif cp is False:
+                        log(f"    ✓ Key populated — CP cleared\n", "ok")
+
+                    # Compare J533 against known J136 blob
+                    if module == "J533" and raw == KNOWN_J136:
+                        log("    ✓ MATCHES known J136 blob!\n", "ok")
+                    elif module == "J255" and raw and not all(b==0 for b in raw):
+                        # This is the blob we COULDN'T get from the log
+                        log("    ★ J255 IKA blob captured — new data!\n", "ok")
+                        self._ui(self._cp_fields["IKA key"].set,
+                                 f"{raw[:8].hex().upper()}... ({length}B)")
+                else:
+                    log(f"    {status}\n", "err")
+
+            log("\n── readback complete ────────────────────────────────\n", "hdr")
+
+        except Exception as e:
+            log(f"  error: {e}\n", "err")
+        finally:
+            self._ui(self._ika_btn.config, state="normal")
 
     def _do_cp_check(self):
         self._cp_btn.config(state="disabled")
