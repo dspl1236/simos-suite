@@ -39,6 +39,7 @@ class TableMeta:
     offset_val:  float = 0.0   # add after scale
     unit:        str   = ""
     writable:    bool  = True
+    notes:       str   = ""   # tuning guidance shown in the Tune tab
 
 
 # ─── Simos8.5 CGWB known table map ───────────────────────────────────────────
@@ -171,11 +172,7 @@ S85_TABLES: Dict[str, TableMeta] = {
     ),
 }
 
-# Add notes attribute to TableMeta after-the-fact (dataclass doesn't have it)
-# Quick monkey-patch to not break the dataclass definition above
-for _t in S85_TABLES.values():
-    if not hasattr(_t, "notes"):
-        _t.notes = ""
+# notes field is now declared in TableMeta directly
 
 
 # ─── Axis breakpoints ────────────────────────────────────────────────────────
