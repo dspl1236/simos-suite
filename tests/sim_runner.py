@@ -439,6 +439,9 @@ def run_headless(ecu_key: str = "S85", trans_key: str = "ZF8HP") -> bool:
         "ui.interface_panel",
         "ui.trans_logger",
     ]
+    # Hardware deps that are legitimately absent in CI / headless environments
+    _HARDWARE_DEPS = {"bleak", "udsoncan", "serial", "can", "Crypto"}
+
     for mod in ui_modules:
         try:
             # Only check if tkinter is available
@@ -446,8 +449,12 @@ def run_headless(ecu_key: str = "S85", trans_key: str = "ZF8HP") -> bool:
             __import__(mod)
             print(f"  OK  import     — {mod}")
         except ModuleNotFoundError as e:
+            missing = str(e).replace("No module named ", "").strip("'")
+            top = missing.split(".")[0]
             if "tkinter" in str(e):
                 print(f"  SKIP import    — {mod} (no tkinter on this platform)")
+            elif top in _HARDWARE_DEPS:
+                print(f"  SKIP import    — {mod} (hardware dep '{top}' not installed — OK in CI)")
             else:
                 print(f"  FAIL import    — {mod}: {e}"); ok = False
         except Exception as e:
