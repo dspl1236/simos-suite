@@ -62,6 +62,13 @@ a = Analysis(
         'serial',
         'serial.tools',
         'serial.tools.list_ports',
+        'websocket',
+        'websocket._core',
+        'websocket._http',
+        'websocket._handshake',
+        'websocket._socket',
+        'websocket._ssl_compat',
+        'websocket._utils',
         # numpy (cal_parser)
         'numpy',
         'numpy.core._methods',
