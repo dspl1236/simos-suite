@@ -297,6 +297,30 @@ class InterfaceRegistry:
                     notes     = "DLL not found — install drivers",
                 ))
 
+        # FunkBridge WiFi (AP or Station mode)
+        try:
+            from transport.ws_bridge import ws_available, detect_funkbridge_url
+            if ws_available():
+                url = detect_funkbridge_url(timeout=1.0)
+                self._interfaces.append(InterfaceInfo(
+                    name      = f"FunkBridge WiFi ({url or 'not detected'})"
+                                if url else "FunkBridge WiFi (not detected)",
+                    interface = "WIFI",
+                    path      = url or "ws://funkbridge.local/ws",
+                    available = url is not None,
+                    notes     = "FunkBridge WiFi firmware — AP or Station mode",
+                ))
+            else:
+                self._interfaces.append(InterfaceInfo(
+                    name      = "FunkBridge WiFi (websocket-client not installed)",
+                    interface = "WIFI",
+                    path      = "ws://funkbridge.local/ws",
+                    available = False,
+                    notes     = "Run: pip install websocket-client",
+                ))
+        except Exception:
+            pass
+
         # SocketCAN (Linux only)
         if platform.system() == "Linux":
             can_ifaces = self._scan_socketcan()
