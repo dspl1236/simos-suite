@@ -1328,7 +1328,7 @@ CP_MODULES = [
     ("J234  Airbag",          "15",  0x736, 0x73E),
     ("J794  MMI",             "5F",  0x7C0, 0x7C8),
     ("J136  Mem.Seat Driver", "36",  0x714, 0x77C),
-    ("J521  Mem.Seat Pass.",  "06",  0x760, 0x768),
+    ("J521  Mem.Seat Pass.",  "06",  0x760, 0x768),  # addr unconfirmed — verify on car
     ("J518  KESSY",           "03",  0x7A0, 0x7A8),
     ("J519  Body Elect.",     "09",  0x716, 0x77E),
     ("J525  Sound System",    "47",  0x740, 0x748),
