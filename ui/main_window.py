@@ -1315,421 +1315,318 @@ class LoggerTab(_Tab):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # TAB 6 — CP Tools
 # ─────────────────────────────────────────────────────────────────────────────
 
+# All C7 VAG modules that participate in Component Protection
+CP_MODULES = [
+    # (display name,          addr,  tx_id, rx_id)
+    ("J533  Gateway",         "01",  0x710, 0x77A),
+    ("J255  Climatronic",     "08",  0x746, 0x7AE),
+    ("J285  Instruments",     "17",  0x720, 0x728),
+    ("J234  Airbag",          "15",  0x736, 0x73E),
+    ("J794  MMI",             "5F",  0x7C0, 0x7C8),
+    ("J136  Mem.Seat Driver", "36",  0x714, 0x77C),
+    ("J521  Mem.Seat Pass.",  "06",  0x760, 0x768),
+    ("J518  KESSY",           "03",  0x7A0, 0x7A8),
+    ("J519  Body Elect.",     "09",  0x716, 0x77E),
+    ("J525  Sound System",    "47",  0x740, 0x748),
+]
+
+# Known IKA key blob — Feb 2024 ODIS session, J136, VIN WAUGGA**********8
+KNOWN_IKA_BLOB = bytes.fromhex(
+    "E62B41D11C44AF202177FB1F274B0AC2"
+    "D15BD262E4FD27AB61D123C2F15A2C93"
+    "2600"
+)
+
+# Constellation DID known values
+CONST_DID       = 0x04A3
+IKA_DID         = 0x00BE
+CP_ROUTINE_ID   = 0x0226
+
+
 class CPToolsTab(_Tab):
     """
-    CP Tools tab — J533 constellation probe, CP routine check, ODX parser.
+    CP Tools tab — Scan all modules for Component Protection status,
+    identify CP-afflicted modules, write IKA keys, update J533 constellation.
 
-    The CP routine check button (⟳ check CP status) is the key diagnostic:
-    it connects to J533, reads the constellation and IKA key DID, then fires
-    RoutineControl Start (31 01 02 26) and reports J533's response. This lets
-    you confirm:
-      - Whether J533 sees J255 in the constellation
-      - Whether the IKA key is zeroed (CP active) or populated (CP cleared)
-      - Whether 0x0226 is the correct routine ID (7F 31 22 = yes, needs token)
-
-    All operations run in a background thread — UI stays responsive.
+    Workflow:
+      1. ⟳ Scan All Modules  — reads DID 0x00BE from each module,
+                                marks CP active (all-zeros) vs cleared
+      2. Checkboxes           — select which modules to fix
+      3. ✎ Write IKA Keys    — SA2 unlock + WriteDataByIdentifier(0x00BE)
+                                on all selected modules
+      4. ⊞ Update Constellation — rewrite J533 DID 0x04A3 to enroll
+                                   all fixed modules
     """
 
     def __init__(self, parent, mw):
         super().__init__(parent, mw)
+        self._scan_results: dict = {}    # mod_name → bytes or None
+        self._module_vars:  dict = {}    # mod_name → BooleanVar (checkbox)
+        self._module_rows:  dict = {}    # mod_name → dict of tk widgets
+        self._ika_blob:     bytes = KNOWN_IKA_BLOB
+        self._const_before: bytes = b""
+        self._build_ui()
 
-        # ── CP status check (primary diagnostic) ─────────────────────────────
-        _section(self, "component protection check")
+    # ── UI construction ───────────────────────────────────────────────────────
 
-        cp_info = _card(self, padx=12, pady=8)
-        cp_info.pack(fill="x", padx=14, pady=(4, 2))
-        tk.Label(cp_info, text=(
-            "Reads constellation + IKA key from J533, then sends RoutineControl\n"
-            "Start (31 01 02 26) to confirm the routine ID and read J533's response.\n"
-            "Expected response if ID is correct: 7F 31 22 (conditionsNotCorrect — needs token).\n"
-            "Expected response if ID is wrong:   7F 31 31 (requestOutOfRange)."
-        ), fg=C["muted"], bg=C["surface"], font=("Menlo", 10),
-            justify="left", wraplength=600).pack(anchor="w")
+    def _build_ui(self):
+        # ── Action bar ────────────────────────────────────────────────────────
+        act = _card(self, padx=10, pady=8)
+        act.pack(fill="x", padx=14, pady=(8, 2))
 
-        cp_row = _frame(self)
-        cp_row.pack(fill="x", padx=14, pady=6)
-        self._cp_btn = _btn(cp_row, "⟳  check CP status",
-                            self._do_cp_check, primary=True, state="disabled")
-        self._cp_btn.pack(side="left")
-        self._ika_btn = _btn(cp_row, "📖  read IKA keys",
-                             self._do_read_ika, state="disabled")
-        self._ika_btn.pack(side="left", padx=8)
+        row1 = _frame(act)
+        row1.pack(fill="x")
 
-        # Status indicator
-        self._cp_status_var = tk.StringVar(value="not connected")
-        self._cp_status_lbl = tk.Label(cp_row, textvariable=self._cp_status_var,
-                                        fg=C["muted"], bg=C["bg"],
-                                        font=("Menlo", 10))
-        self._cp_status_lbl.pack(side="left", padx=16)
+        self._scan_btn = _btn(row1, "⟳  Scan All Modules",
+                              self._do_scan, primary=True, state="disabled")
+        self._scan_btn.pack(side="left")
 
-        # Result summary strip
-        self._cp_result_frame = _frame(self)
-        self._cp_result_frame.pack(fill="x", padx=14, pady=(0, 4))
-        self._cp_fields = {}
-        for label in ("VIN", "J255 slot", "IKA key", "Routine 0x0226", "J533 response"):
-            row = _frame(self._cp_result_frame)
-            row.pack(fill="x", pady=1)
-            tk.Label(row, text=f"  {label:<22}", fg=C["dim"], bg=C["bg"],
-                     font=("Menlo", 9)).pack(side="left")
-            var = tk.StringVar(value="—")
-            tk.Label(row, textvariable=var, fg=C["blue"], bg=C["bg"],
-                     font=("Menlo", 9)).pack(side="left")
-            self._cp_fields[label] = var
+        self._write_btn = _btn(row1, "✎  Write IKA Key to Selected",
+                               self._do_write, state="disabled")
+        self._write_btn.pack(side="left", padx=(8, 0))
 
-        # ── J533 full probe ───────────────────────────────────────────────────
-        _section(self, "J533 full DID probe")
+        self._const_btn = _btn(row1, "⊞  Update Constellation",
+                               self._do_update_constellation, state="disabled")
+        self._const_btn.pack(side="left", padx=(8, 0))
 
-        probe_info = _card(self, padx=12, pady=8)
-        probe_info.pack(fill="x", padx=14, pady=(4, 2))
-        tk.Label(probe_info, text=(
-            "Sweeps all accessible DIDs on J533 (TX=0x710, RX=0x77A).\n"
-            "Run alongside ODIS in raw sniff mode to capture the full CP token exchange."
-        ), fg=C["muted"], bg=C["surface"], font=("Menlo", 10),
-            justify="left", wraplength=600).pack(anchor="w")
+        self._sel_all_btn = _btn(row1, "☑ Select All CP",
+                                 self._select_all_cp, state="disabled")
+        self._sel_all_btn.pack(side="right")
 
-        op_row = _frame(self)
-        op_row.pack(fill="x", padx=14, pady=6)
-        self._probe_btn = _btn(op_row, "run full probe",
+        # Status line
+        self._status_var = tk.StringVar(value="connect to vehicle first")
+        tk.Label(act, textvariable=self._status_var,
+                 bg=C["surface"], fg=C["muted"],
+                 font=("Courier New", 10)).pack(anchor="w", pady=(6, 0))
+
+        # ── Constellation banner ───────────────────────────────────────────────
+        const_card = _card(self, padx=10, pady=6)
+        const_card.pack(fill="x", padx=14, pady=(2, 2))
+        tk.Label(const_card, text="CONSTELLATION  DID 0x04A3",
+                 bg=C["surface"], fg=C["muted"],
+                 font=("Courier New", 9)).pack(side="left")
+        self._const_var = tk.StringVar(value="—")
+        tk.Label(const_card, textvariable=self._const_var,
+                 bg=C["surface"], fg=C["amber"],
+                 font=("Courier New", 10)).pack(side="left", padx=(12, 0))
+
+        # ── Module grid ───────────────────────────────────────────────────────
+        grid_card = _card(self, padx=10, pady=6)
+        grid_card.pack(fill="x", padx=14, pady=(2, 2))
+
+        hdr = _frame(grid_card, bg=C["surface"])
+        hdr.pack(fill="x", pady=(0, 4))
+        for col, width, text in [
+            (0, 2,  ""),
+            (1, 22, "MODULE"),
+            (2, 6,  "ADDR"),
+            (3, 9,  "STATUS"),
+            (4, 70, "IKA KEY (DID 0x00BE)"),
+        ]:
+            tk.Label(hdr, text=text, bg=C["surface"], fg=C["muted"],
+                     font=("Courier New", 8), width=width,
+                     anchor="w").grid(row=0, column=col, sticky="w", padx=2)
+
+        self._grid_frame = _frame(grid_card, bg=C["surface"])
+        self._grid_frame.pack(fill="x")
+        self._build_module_rows()
+
+        # ── IKA blob selector ─────────────────────────────────────────────────
+        blob_card = _card(self, padx=10, pady=6)
+        blob_card.pack(fill="x", padx=14, pady=(2, 2))
+        tk.Label(blob_card, text="IKA BLOB TO WRITE",
+                 bg=C["surface"], fg=C["muted"],
+                 font=("Courier New", 9)).pack(anchor="w")
+        blob_row = _frame(blob_card)
+        blob_row.pack(fill="x", pady=(4, 0))
+        self._blob_var = tk.StringVar(value=KNOWN_IKA_BLOB.hex().upper())
+        blob_entry = tk.Entry(blob_row, textvariable=self._blob_var,
+                              bg=C["bg"], fg=C["amber"],
+                              insertbackground=C["green"],
+                              font=("Courier New", 9),
+                              relief="flat", width=72)
+        blob_entry.pack(side="left")
+        _btn(blob_row, "✓ Use Scanned",
+             self._use_scanned_blob, state="normal").pack(
+             side="left", padx=(8, 0))
+        tk.Label(blob_card,
+                 text="Feb 2024 session blob pre-loaded. After scan, click "
+                      "'Use Scanned' to load the dominant blob from scan results.",
+                 bg=C["surface"], fg=C["muted"],
+                 font=("Courier New", 8), wraplength=560,
+                 justify="left").pack(anchor="w", pady=(4, 0))
+
+        # ── Log ───────────────────────────────────────────────────────────────
+        _section(self, "log")
+        self._log = _log_widget(self)
+        self._log.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+        # ── Legacy buttons (keep for compat) ──────────────────────────────────
+        leg = _frame(self)
+        leg.pack(fill="x", padx=14, pady=(0, 8))
+        self._probe_btn = _btn(leg, "⊙  J533 probe",
                                self._do_probe, state="disabled")
         self._probe_btn.pack(side="left")
-        self._save_btn = _btn(op_row, "save report JSON",
-                              self._save_report, state="disabled")
-        self._save_btn.pack(side="left", padx=8)
-
-        # ── ODX parser ────────────────────────────────────────────────────────
-        _section(self, "ODX parser")
-
-        odx_row = _frame(self)
-        odx_row.pack(fill="x", padx=14, pady=4)
-        _btn(odx_row, "open ODX file", self._open_odx).pack(side="left")
-        self._odx_lbl = tk.Label(odx_row, text="no ODX loaded",
-                                 fg=C["muted"], bg=C["bg"],
-                                 font=("Menlo", 10))
-        self._odx_lbl.pack(side="left", padx=10)
-
-        # ── Output log ────────────────────────────────────────────────────────
-        _section(self, "output")
-        log_outer, self._log = _scrolled_text(self, height=12)
-        log_outer.pack(fill="both", expand=True, padx=14, pady=4)
-        self._log.tag_config("ok",   foreground=C["green"])
-        self._log.tag_config("err",  foreground=C["red"])
-        self._log.tag_config("hdr",  foreground=C["blue"])
-        self._log.tag_config("dim",  foreground=C["muted"])
-        self._log.tag_config("warn", foreground=C["amber"])
-
+        self._save_btn  = _btn(leg, "↓  save report",
+                               self._save_report, state="disabled")
+        self._save_btn.pack(side="left", padx=(8, 0))
+        self._odx_lbl   = tk.Label(leg, text="no ODX loaded",
+                                   bg=C["bg"], fg=C["muted"],
+                                   font=("Courier New", 9))
+        self._odx_lbl.pack(side="left", padx=(16, 0))
+        _btn(leg, "⊙  open ODX",
+             self._open_odx, state="normal").pack(side="right")
         self._report = None
 
-    # ── Connection state ──────────────────────────────────────────────────────
+    def _build_module_rows(self):
+        for mod_name, addr, tx, rx in CP_MODULES:
+            var = tk.BooleanVar(value=False)
+            self._module_vars[mod_name] = var
+
+            row = _frame(self._grid_frame, bg=C["surface"])
+            row.pack(fill="x", pady=1)
+
+            cb = tk.Checkbutton(row, variable=var,
+                                bg=C["surface"], fg=C["green"],
+                                activebackground=C["surface"],
+                                selectcolor=C["bg"],
+                                state="disabled")
+            cb.grid(row=0, column=0, padx=2)
+
+            name_lbl = tk.Label(row, text=mod_name,
+                                bg=C["surface"], fg=C["muted"],
+                                font=("Courier New", 10), width=22, anchor="w")
+            name_lbl.grid(row=0, column=1, padx=2, sticky="w")
+
+            addr_lbl = tk.Label(row, text=f"0x{addr}",
+                                bg=C["surface"], fg=C["muted"],
+                                font=("Courier New", 10), width=6, anchor="w")
+            addr_lbl.grid(row=0, column=2, padx=2)
+
+            status_lbl = tk.Label(row, text="—",
+                                  bg=C["surface"], fg=C["muted"],
+                                  font=("Courier New", 10), width=9, anchor="w")
+            status_lbl.grid(row=0, column=3, padx=2)
+
+            blob_lbl = tk.Label(row, text="—",
+                                bg=C["surface"], fg=C["dim"],
+                                font=("Courier New", 9), anchor="w",
+                                width=70)
+            blob_lbl.grid(row=0, column=4, padx=2, sticky="w")
+
+            self._module_rows[mod_name] = {
+                "row": row, "cb": cb,
+                "status": status_lbl, "blob": blob_lbl
+            }
+
+    # ── Connect / Disconnect ─────────────────────────────────────────────────
 
     def on_connect(self):
+        self._scan_btn.config(state="normal")
         self._probe_btn.config(state="normal")
-        self._cp_btn.config(state="normal")
-        self._ika_btn.config(state="normal")
-        self._ika_btn.config(state="normal")
-        self._cp_status_var.set("connected — ready")
-        self._cp_status_lbl.config(fg=C["green"])
+        self._status_var.set("ready — click Scan to check all modules")
+        self._status_lbl_color(C["green"])
 
     def on_disconnect(self):
-        self._probe_btn.config(state="disabled")
-        self._cp_btn.config(state="disabled")
-        self._ika_btn.config(state="disabled")
-        self._ika_btn.config(state="disabled")
-        self._cp_status_var.set("not connected")
-        self._cp_status_lbl.config(fg=C["muted"])
-        for var in self._cp_fields.values():
-            var.set("—")
+        self._scan_btn.config(state="disabled")
+        self._write_btn.config(state="disabled")
+        self._const_btn.config(state="disabled")
+        self._sel_all_btn.config(state="disabled")
+        self._status_var.set("connect to vehicle first")
+        self._status_lbl_color(C["muted"])
+        self._reset_module_rows()
 
-    # ── CP status check ───────────────────────────────────────────────────────
+    def _status_lbl_color(self, color):
+        # find status label and recolor
+        for child in self.winfo_children():
+            pass  # color is via StringVar, set directly below
 
-    def _do_read_ika(self):
-        """Read DID 0x00BE (IKA key) from J533 and J255 directly."""
-        self._ika_btn.config(state="disabled")
+    # ── Scan all modules ─────────────────────────────────────────────────────
+
+    def _do_scan(self):
+        self._scan_btn.config(state="disabled")
+        self._write_btn.config(state="disabled")
+        self._const_btn.config(state="disabled")
+        self._sel_all_btn.config(state="disabled")
+        self._reset_module_rows()
         self._clear_log(self._log)
         self._append_log(self._log,
-            "── IKA key readback ─────────────────────────────────\n", "hdr")
-        self._append_log(self._log,
-            "  Known J136 blob: E6 2B 41 D1 1C 44 AF 20 21 77 FB 1F\n"
-            "                   27 4B 0A C2 D1 5B D2 62 E4 FD 27 AB\n"
-            "                   61 D1 23 C2 F1 5A 2C 93 26 00\n", "dim")
-        self._run(self._ika_task)
+            "── CP Module Scan ─────────────────────────────────────\n", "hdr")
+        self._status_var.set("scanning...")
+        self._run(self._scan_task)
 
-    def _ika_task(self):
-        def log(msg, tag=""):
-            self._ui(self._append_log, self._log, msg, tag)
-
-        KNOWN_J136 = bytes.fromhex(
-            "E62B41D11C44AF202177FB1F274B0AC2D15B"
-            "D262E4FD27AB61D123C2F15A2C932600")
-
-        try:
-            from cp_tools.j533_probe import J533Probe
-            probe = J533Probe(
-                interface      = self.mw.interface,
-                interface_path = self.mw.iface_path,
-                ble_bridge     = getattr(self.mw, "ble_bridge", None),
-            )
-            probe.connect()
-            log("  J533 connected\n", "ok")
-
-            results = probe.read_all_ika_keys()
-
-            for module, info in results.items():
-                if module == "J533_constellation":
-                    log(f"\n  Constellation (0x04A3):\n", "hdr")
-                    log(f"    {info.get('hex_spaced','')}\n", "ok")
-                    continue
-
-                log(f"\n  {module} — DID 0x00BE:\n", "hdr")
-                status = info.get("status","?")
-                raw    = info.get("raw", b"")
-
-                if status == "ok":
-                    hex_s = info.get("hex_spaced","")
-                    cp    = info.get("cp_active")
-                    length = info.get("length", 0)
-                    log(f"    Length: {length} bytes\n")
-                    log(f"    Hex:    {hex_s}\n",
-                        "warn" if cp else "ok")
-                    if cp:
-                        log(f"    ⚠ ALL ZEROS — CP still active\n", "warn")
-                    elif cp is False:
-                        log(f"    ✓ Key populated — CP cleared\n", "ok")
-
-                    # Compare J533 against known J136 blob
-                    if module == "J533" and raw == KNOWN_J136:
-                        log("    ✓ MATCHES known J136 blob!\n", "ok")
-                    elif module == "J255" and raw and not all(b==0 for b in raw):
-                        # This is the blob we COULDN'T get from the log
-                        log("    ★ J255 IKA blob captured — new data!\n", "ok")
-                        self._ui(self._cp_fields["IKA key"].set,
-                                 f"{raw[:8].hex().upper()}... ({length}B)")
-                else:
-                    log(f"    {status}\n", "err")
-
-            log("\n── readback complete ────────────────────────────────\n", "hdr")
-
-        except Exception as e:
-            log(f"  error: {e}\n", "err")
-        finally:
-            self._ui(self._ika_btn.config, state="normal")
-
-    def _do_cp_check(self):
-        self._cp_btn.config(state="disabled")
-        self._cp_status_var.set("checking...")
-        self._cp_status_lbl.config(fg=C["amber"])
-        for var in self._cp_fields.values():
-            var.set("...")
-        self._clear_log(self._log)
-        self._append_log(self._log,
-            "── CP status check ──────────────────────────────────\n", "hdr")
-        self._append_log(self._log,
-            "  Connecting to J533 (TX=0x710 RX=0x77A)...\n", "dim")
-        self._run(self._cp_check_task)
-
-    def _cp_check_task(self):
-        """
-        Background thread: connect to J533, read constellation + IKA key,
-        fire RoutineControl Start 0x0226, report raw response.
-        """
-        import struct
-
-        def log(msg, tag=""):
-            self._ui(self._append_log, self._log, msg, tag)
-
-        def field(name, val, color=None):
-            self._ui(self._cp_fields[name].set, val)
-            if color:
-                # We can't easily recolor a StringVar label — log it instead
-                pass
-
-        try:
-            from cp_tools.j533_probe import J533Probe, CP_ROUTINE_ID
-        except ImportError as e:
-            self._ui(self._cp_status_var.set, f"import error: {e}")
-            self._ui(self._cp_status_lbl.config, fg=C["red"])
-            self._ui(self._cp_btn.config, state="normal")
-            return
-
-        try:
-            probe = J533Probe(
-                interface      = self.mw.interface,
-                interface_path = self.mw.iface_path,
-                ble_bridge     = getattr(self.mw, "ble_bridge", None),
-            )
-            probe.connect()
-            log("  J533 connected\n", "ok")
-
-            # ── VIN ───────────────────────────────────────────────────────────
-            try:
-                vin = probe.read_did_raw(0xF190)
-                vin_str = vin.decode("ascii", errors="replace").strip("\x00").strip()
-                log(f"  VIN               {vin_str}\n", "ok")
-                field("VIN", vin_str)
-            except Exception as e:
-                log(f"  VIN read failed: {e}\n", "warn")
-                field("VIN", f"error: {e}")
-
-            # ── Constellation — find J255 slot ────────────────────────────────
-            try:
-                alloc = probe.read_did_raw(0x2A2A)
-                # Structure: pairs of (ecu_id u8, ecu_name u8)
-                j255_slot = None
-                for i in range(0, len(alloc) - 1, 2):
-                    slot_idx = alloc[i]
-                    ecu_name = alloc[i + 1]
-                    if ecu_name == 8:   # 8 = Air Conditioning = J255
-                        j255_slot = slot_idx
-                        break
-                if j255_slot is not None:
-                    log(f"  J255 in slot      {j255_slot}  (ECU name code 8)\n", "ok")
-                    field("J255 slot", str(j255_slot))
-                else:
-                    log("  J255 NOT found in constellation\n", "warn")
-                    field("J255 slot", "not enrolled")
-            except Exception as e:
-                log(f"  constellation read failed: {e}\n", "warn")
-                field("J255 slot", f"error: {e}")
-
-            # ── IKA key — 34 bytes, all zeros = CP active ────────────────────
-            try:
-                ika = probe.read_did_raw(0x00BE)
-                if len(ika) == 34 and all(b == 0 for b in ika):
-                    log("  IKA key (0x00BE)  all-zero — CP ACTIVE\n", "warn")
-                    field("IKA key", "all-zero (CP active)")
-                elif len(ika) == 34:
-                    log(f"  IKA key (0x00BE)  {ika[:8].hex()}...  CP cleared\n", "ok")
-                    field("IKA key", f"{ika[:8].hex()}...  (populated)")
-                else:
-                    log(f"  IKA key (0x00BE)  unexpected length {len(ika)}\n", "warn")
-                    field("IKA key", f"{len(ika)}B: {ika.hex()}")
-            except Exception as e:
-                log(f"  IKA key read failed: {e}\n", "warn")
-                field("IKA key", f"error: {e}")
-
-            # ── RoutineControl Start 0x0226 ───────────────────────────────────
-            rid_hi = (CP_ROUTINE_ID >> 8) & 0xFF
-            rid_lo = CP_ROUTINE_ID & 0xFF
-            log(f"\n  Sending RoutineControl Start: 31 01 {rid_hi:02X} {rid_lo:02X}\n",
-                "hdr")
-            field("Routine 0x0226", "sending...")
-
-            try:
-                raw_resp = probe.start_cp_routine()
-                if raw_resp is None:
-                    log("  No response (timeout)\n", "err")
-                    field("Routine 0x0226", "timeout")
-                    field("J533 response", "no response")
-                else:
-                    hex_resp = raw_resp.hex(" ").upper()
-                    log(f"  Raw response:     {hex_resp}\n", "ok")
-                    field("J533 response", hex_resp)
-
-                    # Interpret
-                    if len(raw_resp) >= 1 and raw_resp[0] == 0x71:
-                        log("  ✓ ROUTINE ACCEPTED — J533 accepted 0x0226\n", "ok")
-                        field("Routine 0x0226", "✓ accepted (0x71)")
-                    elif len(raw_resp) >= 3 and raw_resp[0] == 0x7F:
-                        nrc = raw_resp[2]
-                        if nrc == 0x22:
-                            log("  ✓ ID CONFIRMED — NRC 0x22 conditionsNotCorrect\n"
-                                "    J533 knows this routine but requires the token.\n",
-                                "ok")
-                            field("Routine 0x0226", "✓ ID confirmed (NRC 0x22)")
-                        elif nrc == 0x31:
-                            log("  ✗ WRONG ID — NRC 0x31 requestOutOfRange\n"
-                                "    0x0226 is NOT the correct routine ID.\n",
-                                "err")
-                            field("Routine 0x0226", "✗ wrong ID (NRC 0x31)")
-                        elif nrc == 0x7E:
-                            log("  ○ NRC 0x7E — subFunctionNotSupportedInActiveSession\n"
-                                "    Try extended session first.\n", "warn")
-                            field("Routine 0x0226", "needs ext session (0x7E)")
-                        else:
-                            log(f"  ? NRC 0x{nrc:02X} — see ISO 14229-1 Table A.1\n", "warn")
-                            field("Routine 0x0226", f"NRC 0x{nrc:02X}")
-                    else:
-                        log(f"  ? Unknown response format\n", "warn")
-                        field("Routine 0x0226", f"unknown: {hex_resp}")
-
-            except Exception as e:
-                log(f"  RoutineControl error: {e}\n", "err")
-                field("Routine 0x0226", f"error: {e}")
-                field("J533 response", "exception")
-
-            log("\n── check complete ───────────────────────────────────\n", "hdr")
-            self._ui(self._cp_status_var.set, "check complete")
-            self._ui(self._cp_status_lbl.config, fg=C["green"])
-
-        except Exception as e:
-            self._ui(self._append_log, self._log,
-                     f"  fatal: {e}\n", "err")
-            self._ui(self._cp_status_var.set, f"error: {str(e)[:40]}")
-            self._ui(self._cp_status_lbl.config, fg=C["red"])
-
-        finally:
-            self._ui(self._cp_btn.config, state="normal")
-
-    # ── J533 full probe ───────────────────────────────────────────────────────
-
-    # ── IKA key reader — read DID 0x00BE from all CP modules ─────────────────
-
-    def _do_read_ika_keys(self):
-        """Read DID 0x00BE from every CP-enrolled module and compare blobs."""
-        self._ika_btn.config(state="disabled")
-        self._clear_log(self._log)
-        self._append_log(self._log,
-            "── IKA key read — DID 0x00BE across all CP modules ──\n", "hdr")
-        self._run(self._ika_read_task)
-
-    def _ika_read_task(self):
+    def _scan_task(self):
         import udsoncan
         from udsoncan.client import Client
         from udsoncan import configs
 
-        # Known blob from Feb 2024 ODIS CP session — J136 Memory Seat
-        KNOWN_BLOB = bytes.fromhex("E62B41D11C44AF202177FB1F274B0AC2D15BD262E4FD27AB61D123C2F15A2C932600")
-
-        MODULES = [
-            ("J533  Gateway",           0x710, 0x77A),
-            ("J255  Climatronic",        0x746, 0x7AE),
-            ("J285  Instrument Cluster", 0x720, 0x728),
-            ("J234  Airbag",             0x736, 0x73E),
-            ("J794  MMI",                0x7C0, 0x7C8),
-            ("J136  Memory Seat",        0x714, 0x77C),
-        ]
-
         def log(msg, tag=""):
             self._ui(self._append_log, self._log, msg, tag)
 
-        results = {}
-
-        try:
-            from cp_tools.j533_probe import J533Probe
-        except ImportError as e:
-            log(f"Import error: {e}\n", "err")
-            self._ui(self._ika_btn.config, state="normal")
-            return
+        def set_row(mod_name, status_text, status_color, blob_text, blob_color,
+                    cp_active=False):
+            widgets = self._module_rows.get(mod_name, {})
+            if not widgets:
+                return
+            self._ui(widgets["status"].config,
+                     text=status_text, fg=status_color)
+            self._ui(widgets["blob"].config,
+                     text=blob_text,   fg=blob_color)
+            if cp_active:
+                self._ui(widgets["cb"].config, state="normal")
+                self._ui(self._module_vars[mod_name].set, True)
 
         class _BytesCodec(udsoncan.DidCodec):
             def encode(self, v): return bytes(v)
             def decode(self, p): return p
             def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
 
-        for mod_name, tx, rx in MODULES:
-            log(f"\n  {mod_name}  (TX=0x{tx:03X} RX=0x{rx:03X})\n", "hdr")
+        # Read J533 constellation first
+        try:
+            from cp_tools.j533_probe import J533Probe
+            probe_j533 = J533Probe(
+                interface      = self.mw.interface,
+                interface_path = self.mw.iface_path,
+                ble_bridge     = getattr(self.mw, "ble_bridge", None),
+            )
+            cfg_j533 = dict(configs.default_client_config)
+            cfg_j533["data_identifiers"] = {CONST_DID: _BytesCodec}
+            cfg_j533["request_timeout"]  = 5
+            conn_j533 = probe_j533._make_conn(0x710, 0x77A)
+            with Client(conn_j533, request_timeout=5, config=cfg_j533) as c:
+                c.change_session(
+                    udsoncan.services.DiagnosticSessionControl
+                    .Session.extendedDiagnosticSession)
+                r = c.read_data_by_identifier([CONST_DID])
+                const_bytes = bytes(r.service_data.values[CONST_DID])
+                self._const_before = const_bytes
+                self._ui(self._const_var.set,
+                         " ".join(f"{b:02X}" for b in const_bytes))
+                log(f"  J533 constellation: "
+                    f"{' '.join(f'{b:02X}' for b in const_bytes)}\n", "ok")
+        except Exception as e:
+            log(f"  J533 constellation read failed: {e}\n", "err")
+
+        # Scan each module
+        self._scan_results = {}
+        cp_count = 0
+
+        for mod_name, addr, tx, rx in CP_MODULES:
+            log(f"\n  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}\n", "hdr")
             try:
+                from cp_tools.j533_probe import J533Probe
                 probe = J533Probe(
                     interface      = self.mw.interface,
                     interface_path = self.mw.iface_path,
                     ble_bridge     = getattr(self.mw, "ble_bridge", None),
                 )
                 cfg = dict(configs.default_client_config)
-                cfg["data_identifiers"] = {0x00BE: _BytesCodec,
-                                            0x00BD: _BytesCodec}
-                cfg["request_timeout"] = 5
+                cfg["data_identifiers"] = {IKA_DID: _BytesCodec}
+                cfg["request_timeout"]  = 5
                 conn   = probe._make_conn(tx, rx)
                 client = Client(conn, request_timeout=5, config=cfg)
                 client.__enter__()
@@ -1737,39 +1634,333 @@ class CPToolsTab(_Tab):
                     client.change_session(
                         udsoncan.services.DiagnosticSessionControl
                         .Session.extendedDiagnosticSession)
-                    result = client.read_data_by_identifier([0x00BE])
-                    raw    = bytes(result.service_data.values[0x00BE])
-                    same   = (raw == KNOWN_BLOB)
-                    tag    = "ok" if same else "warn"
-                    label  = "✓ matches J136 blob" if same else "≠ different"
-                    log(f"    DID 0x00BE ({len(raw)}B): {raw.hex().upper()}\n", tag)
-                    log(f"    {label}\n", tag)
-                    results[mod_name] = raw.hex().upper()
-                    try:
-                        r2   = client.read_data_by_identifier([0x00BD])
-                        raw2 = bytes(r2.service_data.values[0x00BD])
-                        log(f"    DID 0x00BD ({len(raw2)}B): {raw2.hex().upper()}\n", "dim")
-                    except Exception:
-                        pass
+                    result = client.read_data_by_identifier([IKA_DID])
+                    raw = bytes(result.service_data.values[IKA_DID])
+                    self._scan_results[mod_name] = raw
+
+                    all_zeros = all(b == 0 for b in raw)
+                    short     = raw[:8].hex().upper() + "..."
+
+                    if all_zeros:
+                        cp_count += 1
+                        set_row(mod_name,
+                                "CP ACTIVE", C["red"],
+                                "all zeros — key not installed", C["red"],
+                                cp_active=True)
+                        log(f"    ✗ CP ACTIVE — IKA key all zeros\n", "err")
+                    else:
+                        same = (raw == KNOWN_IKA_BLOB)
+                        set_row(mod_name,
+                                "CP clear", C["green"],
+                                short, C["green"] if same else C["amber"])
+                        tag = "ok" if same else "warn"
+                        lbl = "matches known blob" if same else "different blob"
+                        log(f"    ✓ CP clear  {short}  ({lbl})\n", tag)
                 finally:
                     client.__exit__(None, None, None)
+
+            except udsoncan.exceptions.NegativeResponseException as nre:
+                nrc = nre.response.code if hasattr(nre, "response") else 0
+                if nrc in (0x22, 0x31):  # conditionsNotCorrect / requestOutOfRange
+                    set_row(mod_name, "CP ACTIVE", C["red"],
+                            f"NRC 0x{nrc:02X} — CP preventing read",
+                            C["red"], cp_active=True)
+                    self._scan_results[mod_name] = b"\x00" * 34
+                    cp_count += 1
+                    log(f"    ✗ CP ACTIVE — NRC 0x{nrc:02X}\n", "err")
+                else:
+                    set_row(mod_name, "NRC error", C["amber"],
+                            f"NRC 0x{nrc:02X}", C["amber"])
+                    log(f"    ? NRC 0x{nrc:02X}\n", "warn")
+
             except Exception as e:
-                log(f"    error: {e}\n", "err")
-                results[mod_name] = f"ERROR: {e}"
+                err_str = str(e)[:50]
+                if "timeout" in err_str.lower():
+                    set_row(mod_name, "not present", C["muted"],
+                            "no response", C["muted"])
+                    log(f"    — not present (timeout)\n", "dim")
+                else:
+                    set_row(mod_name, "error", C["amber"],
+                            err_str, C["amber"])
+                    log(f"    ! error: {err_str}\n", "warn")
 
-        log("\n── Summary ──────────────────────────────────────────\n", "hdr")
-        blobs = set(v for v in results.values() if not v.startswith("ERROR"))
-        if len(blobs) == 1:
-            log("  ALL MODULES: IDENTICAL IKA KEY\n", "ok")
-            log("  → Key is VIN-bound, not per-module. One key fits all.\n", "ok")
-        elif len(blobs) > 1:
-            log(f"  {len(blobs)} DISTINCT IKA KEYS found\n", "warn")
-            log("  → Per-module derivation — each module has unique key.\n", "warn")
-        for mod, blob in results.items():
-            short = blob[:36] + "..." if len(blob) > 36 else blob
-            log(f"  {mod:<30}  {short}\n", "dim")
-        self._ui(self._ika_btn.config, state="normal")
+        # Summary
+        log(f"\n── Scan complete: {cp_count} module(s) CP active ───────────────\n",
+            "ok" if cp_count == 0 else "warn")
 
+        # Blob analysis
+        valid = [v for v in self._scan_results.values()
+                 if v and not all(b == 0 for b in v)]
+        if valid:
+            unique = set(v.hex() for v in valid)
+            if len(unique) == 1:
+                log("  All populated modules: IDENTICAL blob → VIN-bound key ✓\n", "ok")
+                log(f"  Blob: {valid[0].hex().upper()}\n", "ok")
+                self._ika_blob = valid[0]
+                self._ui(self._blob_var.set, valid[0].hex().upper())
+            else:
+                log(f"  {len(unique)} distinct blobs found → per-module derivation\n",
+                    "warn")
+
+        if cp_count > 0:
+            self._ui(self._write_btn.config, state="normal")
+            self._ui(self._sel_all_btn.config, state="normal")
+            self._ui(self._status_var.set,
+                     f"{cp_count} module(s) CP active — select and click Write")
+        else:
+            self._ui(self._status_var.set, "all modules clear ✓")
+
+        self._ui(self._scan_btn.config, state="normal")
+
+    # ── Select all CP-active ─────────────────────────────────────────────────
+
+    def _select_all_cp(self):
+        for mod_name, row in self._module_rows.items():
+            if row["cb"]["state"] == "normal":
+                self._module_vars[mod_name].set(True)
+
+    # ── Use scanned blob ─────────────────────────────────────────────────────
+
+    def _use_scanned_blob(self):
+        valid = [v for v in self._scan_results.values()
+                 if v and not all(b == 0 for b in v)]
+        if valid:
+            self._ika_blob = valid[0]
+            self._blob_var.set(valid[0].hex().upper())
+            self._append_log(self._log,
+                f"IKA blob updated from scan results: "
+                f"{valid[0].hex().upper()[:16]}...\n", "ok")
+        else:
+            self._append_log(self._log,
+                "No populated blobs found in scan results.\n", "warn")
+
+    # ── Write IKA keys ───────────────────────────────────────────────────────
+
+    def _do_write(self):
+        selected = [m for m, v in self._module_vars.items() if v.get()]
+        if not selected:
+            self._append_log(self._log,
+                "No modules selected — check boxes next to modules to fix.\n",
+                "warn")
+            return
+        try:
+            blob = bytes.fromhex(self._blob_var.get().replace(" ", ""))
+        except ValueError:
+            self._append_log(self._log,
+                "Invalid IKA blob hex string.\n", "err")
+            return
+        if len(blob) != 34:
+            self._append_log(self._log,
+                f"IKA blob must be 34 bytes (got {len(blob)}).\n", "err")
+            return
+
+        self._write_btn.config(state="disabled")
+        self._scan_btn.config(state="disabled")
+        self._append_log(self._log,
+            f"\n── Writing IKA key to {len(selected)} module(s) ─────────────\n",
+            "hdr")
+        self._run(self._write_task, selected, blob)
+
+    def _write_task(self, selected: list, blob: bytes):
+        import udsoncan
+        from udsoncan.client import Client
+        from udsoncan import configs
+
+        def log(msg, tag=""):
+            self._ui(self._append_log, self._log, msg, tag)
+
+        mod_map = {m[0]: m for m in CP_MODULES}
+        written = []
+
+        class _BytesCodec(udsoncan.DidCodec):
+            def encode(self, v): return bytes(v)
+            def decode(self, p): return p
+            def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
+
+        for mod_name in selected:
+            if mod_name not in mod_map:
+                continue
+            _, addr, tx, rx = mod_map[mod_name]
+            log(f"\n  Writing to {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}\n",
+                "hdr")
+            try:
+                from cp_tools.j533_probe import J533Probe
+                probe = J533Probe(
+                    interface      = self.mw.interface,
+                    interface_path = self.mw.iface_path,
+                    ble_bridge     = getattr(self.mw, "ble_bridge", None),
+                )
+                cfg = dict(configs.default_client_config)
+                cfg["data_identifiers"] = {IKA_DID: _BytesCodec}
+                cfg["request_timeout"]  = 10
+                conn = probe._make_conn(tx, rx)
+                with Client(conn, request_timeout=10, config=cfg) as c:
+                    # Extended session
+                    c.change_session(
+                        udsoncan.services.DiagnosticSessionControl
+                        .Session.extendedDiagnosticSession)
+                    log("    extended session opened\n", "dim")
+
+                    # SA2 seed/key
+                    try:
+                        from sa2_seed_key.sa2_script import Sa2Algorithm
+                        seed_resp = c.request_seed(0x03)
+                        seed      = bytes(seed_resp.service_data.seed)
+                        key       = Sa2Algorithm().compute_key(seed)
+                        c.send_key(0x04, key)
+                        log("    SA2 unlocked ✓\n", "ok")
+                    except ImportError:
+                        log("    SA2 module not available — write may fail\n",
+                            "warn")
+                    except Exception as sa2_e:
+                        log(f"    SA2 error: {sa2_e}\n", "err")
+                        continue
+
+                    # Write DID 0x00BE
+                    c.write_data_by_identifier(IKA_DID, blob)
+                    log(f"    DID 0x00BE written: "
+                        f"{blob.hex().upper()[:16]}...\n", "ok")
+
+                    # Verify
+                    verify = c.read_data_by_identifier([IKA_DID])
+                    readback = bytes(verify.service_data.values[IKA_DID])
+                    if readback == blob:
+                        log(f"    Verified ✓  readback matches\n", "ok")
+                        written.append(mod_name)
+                        self._ui(self._module_rows[mod_name]["status"].config,
+                                 text="written ✓", fg=C["green"])
+                        self._ui(self._module_rows[mod_name]["blob"].config,
+                                 text=blob.hex().upper()[:36] + "...",
+                                 fg=C["green"])
+                    else:
+                        log(f"    Verify FAILED — readback mismatch\n", "err")
+
+            except Exception as e:
+                log(f"    Error: {e}\n", "err")
+
+        log(f"\n── Write complete: {len(written)}/{len(selected)} modules written\n",
+            "ok" if len(written) == len(selected) else "warn")
+
+        if written:
+            log("\nNext step: click ⊞ Update Constellation to enroll "
+                "written modules in J533.\n", "hdr")
+            self._ui(self._const_btn.config, state="normal")
+
+        self._ui(self._write_btn.config, state="normal")
+        self._ui(self._scan_btn.config, state="normal")
+
+    # ── Update J533 constellation ─────────────────────────────────────────────
+
+    def _do_update_constellation(self):
+        self._const_btn.config(state="disabled")
+        self._append_log(self._log,
+            "\n── Updating J533 constellation (DID 0x04A3) ─────────\n", "hdr")
+        self._run(self._constellation_task)
+
+    def _constellation_task(self):
+        import udsoncan
+        from udsoncan.client import Client
+        from udsoncan import configs
+
+        def log(msg, tag=""):
+            self._ui(self._append_log, self._log, msg, tag)
+
+        class _BytesCodec(udsoncan.DidCodec):
+            def encode(self, v): return bytes(v)
+            def decode(self, p): return p
+            def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
+
+        try:
+            from cp_tools.j533_probe import J533Probe
+            probe = J533Probe(
+                interface      = self.mw.interface,
+                interface_path = self.mw.iface_path,
+                ble_bridge     = getattr(self.mw, "ble_bridge", None),
+            )
+            cfg = dict(configs.default_client_config)
+            cfg["data_identifiers"] = {CONST_DID: _BytesCodec}
+            cfg["request_timeout"]  = 10
+            conn = probe._make_conn(0x710, 0x77A)
+            with Client(conn, request_timeout=10, config=cfg) as c:
+                c.change_session(
+                    udsoncan.services.DiagnosticSessionControl
+                    .Session.extendedDiagnosticSession)
+
+                # Read current constellation
+                r = c.read_data_by_identifier([CONST_DID])
+                current = bytes(r.service_data.values[CONST_DID])
+                log(f"  Current:  "
+                    f"{' '.join(f'{b:02X}' for b in current)}\n", "dim")
+
+                # Determine which modules were written
+                written_names = [
+                    m for m, row in self._module_rows.items()
+                    if row["status"].cget("text") == "written ✓"
+                ]
+                if not written_names:
+                    log("  No modules marked as written — "
+                        "run Write IKA Keys first.\n", "warn")
+                    self._ui(self._const_btn.config, state="normal")
+                    return
+
+                log(f"  Modules to enroll: {', '.join(written_names)}\n",
+                    "hdr")
+
+                # SA2 unlock on J533
+                try:
+                    from sa2_seed_key.sa2_script import Sa2Algorithm
+                    seed_resp = c.request_seed(0x03)
+                    seed = bytes(seed_resp.service_data.seed)
+                    key  = Sa2Algorithm().compute_key(seed)
+                    c.send_key(0x04, key)
+                    log("  SA2 unlocked on J533 ✓\n", "ok")
+                except ImportError:
+                    log("  SA2 module not available\n", "warn")
+                except Exception as e:
+                    log(f"  SA2 error: {e}\n", "err")
+                    self._ui(self._const_btn.config, state="normal")
+                    return
+
+                # Write updated constellation
+                # The Feb 2024 known-good constellation post-session:
+                # FD A1 E8 0C FE 62 60 0D 00 00
+                # We write this as the target — it enrolled J255, J136, and others
+                # For a full re-enrol we use the post-session known value
+                TARGET_CONST = bytes.fromhex("FDA1E80CFE62600D0000")
+
+                log(f"  Writing: "
+                    f"{' '.join(f'{b:02X}' for b in TARGET_CONST)}\n", "hdr")
+                c.write_data_by_identifier(CONST_DID, TARGET_CONST)
+
+                # Verify
+                r2 = c.read_data_by_identifier([CONST_DID])
+                readback = bytes(r2.service_data.values[CONST_DID])
+                if readback == TARGET_CONST:
+                    log("  Constellation written ✓  readback matches\n", "ok")
+                    self._ui(self._const_var.set,
+                             " ".join(f"{b:02X}" for b in readback))
+                    log("\n✓ CP fix complete — cycle ignition and recheck.\n",
+                        "ok")
+                else:
+                    log(f"  Verify FAILED — readback: "
+                        f"{' '.join(f'{b:02X}' for b in readback)}\n", "err")
+
+        except Exception as e:
+            log(f"  Constellation error: {e}\n", "err")
+
+        self._ui(self._const_btn.config, state="normal")
+
+    # ── Reset module rows to default state ───────────────────────────────────
+
+    def _reset_module_rows(self):
+        for mod_name, row in self._module_rows.items():
+            row["status"].config(text="—", fg=C["muted"])
+            row["blob"].config(text="—", fg=C["dim"])
+            row["cb"].config(state="disabled")
+            self._module_vars[mod_name].set(False)
+        self._const_var.set("—")
+
+    # ── Legacy: J533 probe ───────────────────────────────────────────────────
 
     def _do_probe(self):
         self._probe_btn.config(state="disabled")
@@ -1796,7 +1987,8 @@ class CPToolsTab(_Tab):
             self._ui(self._probe_btn.config, state="normal")
 
     def _show_probe_report(self, report):
-        self._append_log(self._log, "\n── probe report ─────────────────────\n", "hdr")
+        self._append_log(self._log,
+            "\n── probe report ─────────────────────\n", "hdr")
         data = report.__dict__ if hasattr(report, "__dict__") else report
         for k, v in data.items():
             self._append_log(self._log, f"  {k:<28}  {v}\n")
@@ -1815,7 +2007,9 @@ class CPToolsTab(_Tab):
             import json
             from dataclasses import asdict
             try:
-                data = asdict(self._report) if hasattr(self._report, "__dataclass_fields__")                        else dict(self._report)
+                data = (asdict(self._report)
+                        if hasattr(self._report, "__dataclass_fields__")
+                        else dict(self._report))
                 with open(path, "w") as f:
                     json.dump(data, f, indent=2, default=str)
                 messagebox.showinfo("Saved", os.path.basename(path))
@@ -1848,7 +2042,8 @@ class CPToolsTab(_Tab):
 
     def _show_odx(self, p, path: str):
         self._odx_lbl.config(text=os.path.basename(path), fg=C["green"])
-        self._append_log(self._log, f"── ODX: {os.path.basename(path)} ──\n", "hdr")
+        self._append_log(self._log,
+            f"── ODX: {os.path.basename(path)} ──\n", "hdr")
         if p.cp_routine_id is not None:
             self._append_log(self._log,
                 f"  CP routine ID     0x{p.cp_routine_id:04X}\n", "ok")
@@ -1862,13 +2057,14 @@ class CPToolsTab(_Tab):
             f"  DID map           {len(p.did_map)} entries\n")
         for did, entry in list(p.did_map.items())[:20]:
             self._append_log(self._log,
-                f"    0x{did:04X}  {entry.name:<36}  {entry.byte_length}B\n", "dim")
+                f"    0x{did:04X}  {entry.name:<36}  {entry.byte_length}B\n",
+                "dim")
         if len(p.did_map) > 20:
             self._append_log(self._log,
                 f"    ... {len(p.did_map)-20} more\n", "dim")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 # TAB 7 — Raw Sniff
 # ─────────────────────────────────────────────────────────────────────────────
 
