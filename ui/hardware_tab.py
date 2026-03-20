@@ -55,6 +55,7 @@ BADGE_COLORS = {
     "USBISOTP": ("#00ff88", "#0a1a12"),
     "J2534":    ("#ffb800", "#1a1200"),
     "SocketCAN":("#ff8c00", "#1a0e00"),
+    "WIFI":     ("#00e676", "#001a0a"),
 }
 
 
@@ -240,7 +241,7 @@ class HardwareTab(ttk.Frame):
                  font=("Courier New", 9), width=6, anchor="w").pack(side="left")
 
         self._mtype = tk.StringVar(value="USBISOTP")
-        opts = ["USBISOTP", "BLE", "J2534", "SocketCAN"]
+        opts = ["USBISOTP", "BLE", "WIFI", "J2534", "SocketCAN"]
         om = tk.OptionMenu(tr, self._mtype, *opts, command=lambda _: self._on_mtype())
         om.config(bg=PAL["bg1"], fg=PAL["text_sec"], font=("Courier New", 9),
                   bd=0, highlightthickness=0, activebackground=PAL["bg3"],
@@ -531,6 +532,12 @@ class HardwareTab(ttk.Frame):
         elif t == "BLE":
             self._mport_row.pack_forget()
             self._mdll_row.pack_forget()
+        elif t == "WIFI":
+            self._mdll_row.pack_forget()
+            self._mport_lbl.config(text="URL")
+            if not self._mport_var.get().startswith("ws"):
+                self._mport_var.set("ws://funkbridge.local/ws")
+            self._mport_row.pack(fill="x", padx=12, pady=(0,6))
         elif t == "SocketCAN":
             self._mdll_row.pack_forget()
             self._mport_lbl.config(text="Iface")
@@ -544,11 +551,18 @@ class HardwareTab(ttk.Frame):
         t   = self._mtype.get()
         port = (self._mdll_var.get() if t == "J2534" else self._mport_var.get()).strip()
 
-        if t != "BLE" and not port:
+        if t not in ("BLE", "WIFI") and not port:
             self._log("ERR", "Manual override: port / path is required")
             return
 
-        cs = f"SocketCAN_{port}" if t == "SocketCAN" else t
+        if t == "SocketCAN":
+            cs = f"SocketCAN_{port}"
+        elif t == "WIFI":
+            cs = "WIFI"
+            if port and not port.startswith("ws"):
+                port = "ws://" + port + "/ws"
+        else:
+            cs = t
 
         iface = InterfaceInfo(
             name      = f"{t} ({port})" if port else t,
