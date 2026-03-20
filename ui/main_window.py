@@ -1403,6 +1403,20 @@ class CPToolsTab(_Tab):
                  bg=C["surface"], fg=C["muted"],
                  font=("Courier New", 10)).pack(anchor="w", pady=(6, 0))
 
+        # ── Verdict banner ──────────────────────────────────────────────────
+        self._verdict_var = tk.StringVar(value="")
+        self._verdict_lbl = tk.Label(self,
+                                     textvariable=self._verdict_var,
+                                     bg=C["bg"], fg=C["muted"],
+                                     font=("Courier New", 13, "bold"),
+                                     pady=4)
+        self._verdict_lbl.pack(fill="x", padx=14, pady=(2, 0))
+
+        # Ignition cycle button — enabled after constellation write
+        self._ign_btn = _btn(self, "⚡  Cycle Ignition (guided)",
+                             self._do_ignition_cycle, state="disabled")
+        self._ign_btn.pack(fill="x", padx=14, pady=(2, 0))
+
         # ── Constellation banner ───────────────────────────────────────────────
         const_card = _card(self, padx=10, pady=6)
         const_card.pack(fill="x", padx=14, pady=(2, 2))
@@ -1539,6 +1553,9 @@ class CPToolsTab(_Tab):
         self._status_var.set("connect to vehicle first")
         self._status_lbl_color(C["muted"])
         self._reset_module_rows()
+        self._verdict_var.set("")
+        if hasattr(self, "_ign_btn"):
+            self._ign_btn.config(state="disabled")
 
     def _status_lbl_color(self, color):
         # find status label and recolor
@@ -1707,8 +1724,13 @@ class CPToolsTab(_Tab):
             self._ui(self._sel_all_btn.config, state="normal")
             self._ui(self._status_var.set,
                      f"{cp_count} module(s) CP active — select and click Write")
+            self._ui(self._verdict_var.set,
+                     f"⚠  {cp_count} MODULE(S) CP ACTIVE")
+            self._ui(self._verdict_lbl.config, fg=C["red"])
         else:
             self._ui(self._status_var.set, "all modules clear ✓")
+            self._ui(self._verdict_var.set, "✓  ALL MODULES CLEAR")
+            self._ui(self._verdict_lbl.config, fg=C["green"])
 
         self._ui(self._scan_btn.config, state="normal")
 
@@ -1845,6 +1867,7 @@ class CPToolsTab(_Tab):
             log("\nNext step: click ⊞ Update Constellation to enroll "
                 "written modules in J533.\n", "hdr")
             self._ui(self._const_btn.config, state="normal")
+            self._ui(self._ign_btn.config, state="disabled")  # wait for const first
 
         self._ui(self._write_btn.config, state="normal")
         self._ui(self._scan_btn.config, state="normal")
@@ -1939,7 +1962,8 @@ class CPToolsTab(_Tab):
                     log("  Constellation written ✓  readback matches\n", "ok")
                     self._ui(self._const_var.set,
                              " ".join(f"{b:02X}" for b in readback))
-                    log("\n✓ CP fix complete — cycle ignition and recheck.\n",
+                    log("\n✓ CP fix complete — click ⚡ Cycle Ignition to guide\n"
+                        "through the key cycle and auto-rescan.\n",
                         "ok")
                 else:
                     log(f"  Verify FAILED — readback: "
@@ -1949,6 +1973,118 @@ class CPToolsTab(_Tab):
             log(f"  Constellation error: {e}\n", "err")
 
         self._ui(self._const_btn.config, state="normal")
+
+    # ── Guided ignition cycle ────────────────────────────────────────────────
+
+    def _do_ignition_cycle(self):
+        """Guided key-off → wait → key-on sequence. Auto-rescans after."""
+        self._ign_btn.config(state="disabled")
+        self._scan_btn.config(state="disabled")
+        self._write_btn.config(state="disabled")
+        self._const_btn.config(state="disabled")
+        self._verdict_var.set("follow ignition cycle steps...")
+        self._verdict_lbl.config(fg=C["amber"])
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Ignition Cycle")
+        dlg.configure(bg=C["bg"])
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.geometry("400x230")
+        dlg.update_idletasks()
+        px = self.winfo_rootx() + self.winfo_width()  // 2 - 200
+        py = self.winfo_rooty() + self.winfo_height() // 2 - 115
+        dlg.geometry(f"+{px}+{py}")
+
+        self._ign_dlg   = dlg
+        self._ign_phase = 0
+
+        self._ign_title = tk.Label(dlg, text="STEP 1 OF 3  —  KEY OFF",
+                                   bg=C["bg"], fg=C["amber"],
+                                   font=("Courier New", 12, "bold"))
+        self._ign_title.pack(pady=(20, 6))
+
+        self._ign_msg = tk.Label(dlg,
+            text="Turn ignition KEY OFF and remove key.\nClick Continue when done.",
+            bg=C["bg"], fg=C["text"],
+            font=("Courier New", 11), justify="center")
+        self._ign_msg.pack(pady=6)
+
+        self._ign_timer_lbl = tk.Label(dlg, text="",
+                                       bg=C["bg"], fg=C["dim"],
+                                       font=("Courier New", 10))
+        self._ign_timer_lbl.pack(pady=4)
+
+        self._ign_next_btn = tk.Button(dlg,
+            text="Continue \u2192",
+            command=self._ign_advance,
+            bg=C["surface"], fg=C["green"],
+            activebackground=C["surface"],
+            activeforeground=C["green"],
+            font=("Courier New", 11, "bold"),
+            relief="solid", bd=1,
+            highlightbackground=C["green"],
+            highlightthickness=1,
+            padx=20, pady=8, cursor="hand2")
+        self._ign_next_btn.pack(pady=(4, 0))
+        self._ign_countdown = 0
+
+    def _ign_advance(self):
+        self._ign_phase += 1
+        if self._ign_phase == 1:
+            # Key confirmed off — start 12s countdown
+            self._ign_title.config(text="STEP 2 OF 3  —  WAITING")
+            self._ign_msg.config(
+                text="Waiting 12 seconds for J533 to fully power down...")
+            self._ign_next_btn.config(state="disabled")
+            self._ign_countdown = 12
+            self._ign_tick(self._ign_off_done)
+        elif self._ign_phase == 3:
+            # Key confirmed on — start 10s countdown
+            self._ign_title.config(text="STEP 3 OF 3  —  J533 BOOTING")
+            self._ign_msg.config(
+                text="Waiting 10 seconds for J533 to initialise...")
+            self._ign_next_btn.config(state="disabled")
+            self._ign_timer_lbl.config(fg=C["green"])
+            self._ign_countdown = 10
+            self._ign_tick(self._ign_on_done)
+
+    def _ign_tick(self, callback):
+        if self._ign_countdown > 0:
+            self._ign_timer_lbl.config(
+                text=f"{self._ign_countdown}s remaining...")
+            self._ign_countdown -= 1
+            self.after(1000, lambda: self._ign_tick(callback))
+        else:
+            callback()
+
+    def _ign_off_done(self):
+        self._ign_timer_lbl.config(
+            text="\u2713 J533 powered down", fg=C["green"])
+        self._ign_title.config(
+            text="STEP 3 OF 3  —  KEY ON", fg=C["green"])
+        self._ign_msg.config(
+            text="Turn ignition KEY ON (engine off is fine).\n"
+                 "Click Continue when done.")
+        self._ign_next_btn.config(
+            state="normal", text="Key is on \u2192")
+        self._ign_phase = 2   # next click triggers phase 3
+
+    def _ign_on_done(self):
+        self._ign_timer_lbl.config(
+            text="\u2713 J533 ready", fg=C["green"])
+        self._ign_msg.config(text="\u2713 Rescanning now...")
+        self._ign_next_btn.config(state="disabled")
+        self.after(800, self._ign_finish)
+
+    def _ign_finish(self):
+        if hasattr(self, "_ign_dlg") and self._ign_dlg.winfo_exists():
+            self._ign_dlg.destroy()
+        self._scan_btn.config(state="normal")
+        self._ign_btn.config(state="disabled")
+        self._verdict_var.set("rescanning after ignition cycle...")
+        self._verdict_lbl.config(fg=C["amber"])
+        self.after(200, self._do_scan)
 
     # ── Reset module rows to default state ───────────────────────────────────
 
