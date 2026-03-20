@@ -482,10 +482,41 @@ class HardwareTab(ttk.Frame):
 
         def _do():
             # Real connection would call _make_connection() here.
-            # This wires the BLE scan+connect or serial open and calls back.
-            import time
-            time.sleep(0.8)   # placeholder — replace with actual connect
-            self.after(0, lambda: self._connect_ok(iface))
+            # Route to correct transport
+            t = iface.interface
+            try:
+                if t == "BLE":
+                    from transport.ble_bridge import BLEBridgeSync
+                    bridge = BLEBridgeSync()
+                    devices = bridge.scan(timeout=6.0)
+                    if not devices:
+                        raise RuntimeError("No BLE device found — is ESP32 powered?")
+                    ok = bridge.connect(devices[0])
+                    if not ok:
+                        raise RuntimeError("BLE connect failed")
+                    self._bridge = bridge
+                    self._bridge_type = "BLE"
+
+                elif t == "WIFI":
+                    from transport.ws_bridge import WSBridge
+                    url = iface.path or "ws://funkbridge.local/ws"
+                    bridge = WSBridge(url)
+                    bridge.connect(timeout=8.0)
+                    self._bridge = bridge
+                    self._bridge_type = "WIFI"
+
+                elif t == "USBISOTP":
+                    # USB serial — existing path
+                    self._bridge = None
+                    self._bridge_type = "USBISOTP"
+
+                elif t == "J2534":
+                    self._bridge = None
+                    self._bridge_type = "J2534"
+
+                self.after(0, lambda: self._connect_ok(iface))
+            except Exception as exc:
+                self.after(0, lambda e=exc: self._connect_fail(str(e)))
 
         threading.Thread(target=_do, daemon=True).start()
 
