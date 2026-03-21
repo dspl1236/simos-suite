@@ -114,6 +114,8 @@ RAW_SNIFF_CAN_ID       = 0xCAFE  # txID/rxID used for raw CAN sniff frames
 
 # ─── State ───────────────────────────────────────────────────────────────────
 
+BLE_DEFAULT_PASSWORD = "BLE2"   # v1.03+ firmware default
+
 class BridgeState(Enum):
     DISCONNECTED  = auto()
     SCANNING      = auto()
@@ -261,6 +263,9 @@ class BLEBridge:
                                        disconnected_callback=self._on_disconnected)
             await self._client.connect()
             await self._client.start_notify(BLE_CHAR_NOTIFY_UUID, self._on_notify)
+            # Authenticate with v1.03+ firmware — send password via CMD characteristic
+            # Default password is "BLE2" (PASSWORD_CHECK enabled in v1.03)
+            await self._authenticate()
             try:
                 await self._client.request_mtu(517)
             except Exception:
@@ -323,6 +328,24 @@ class BLEBridge:
         payload = bytes([FLAG_SETTINGS, setting_id]) + value
         await self._client.write_gatt_char(BLE_CHAR_CMD_UUID, payload,
                                            response=False)
+
+    async def _authenticate(self, password: str = None):
+        if password is None:
+            password = getattr(self, "_password", BLE_DEFAULT_PASSWORD)
+        """
+        Send password to v1.03+ firmware before any UDS traffic.
+        v1.03 release notes: 'BLE is now password protected'.
+        Payload: FLAG_SETTINGS | SETTING_PASSWORD + password bytes.
+        Sent on CMD characteristic (0xABF3), not the data write characteristic.
+        """
+        payload = bytes([FLAG_SETTINGS, SETTING_PASSWORD]) + password.encode()
+        try:
+            await self._client.write_gatt_char(BLE_CHAR_CMD_UUID, payload,
+                                               response=False)
+            await asyncio.sleep(0.3)   # brief pause for firmware to process
+            log.debug("BLE password sent: %s", password)
+        except Exception as e:
+            log.warning("BLE password send failed (older firmware?): %s", e)
 
     # ── Receive ───────────────────────────────────────────────────────────
 
@@ -567,3 +590,7 @@ class BLEBridgeSync:
     def send_settings(self, setting_id: int, value: bytes):
         """Send a BRG_SETTING_* command to the bridge firmware."""
         self._bridge.send_settings(setting_id, value)
+
+    def set_password(self, password: str):
+        """Set the BLE password used during connect (default: 'BLE2')."""
+        self._bridge._password = password
