@@ -2350,6 +2350,498 @@ class CPToolsTab(_Tab):
 
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB — Diagnostics (Bus Scan + DTC Read/Clear)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Full VAG C7 module list for bus scan — extends CP_MODULES with more addresses
+SCAN_MODULES = [
+    # (display name,            addr,  tx_id, rx_id)
+    ("J533  Gateway",           "01",  0x710, 0x77A),
+    ("J519  Body Elect.",       "09",  0x716, 0x77E),
+    ("J255  Climatronic",       "08",  0x746, 0x7AE),
+    ("J285  Instruments",       "17",  0x720, 0x728),
+    ("J234  Airbag",            "15",  0x736, 0x73E),
+    ("J794  MMI",               "5F",  0x7C0, 0x7C8),
+    ("J136  Mem.Seat Driver",   "36",  0x714, 0x77C),
+    ("J521  Mem.Seat Pass.",    "06",  0x760, 0x768),
+    ("J518  KESSY",             "03",  0x7A0, 0x7A8),
+    ("J525  Sound System",      "47",  0x740, 0x748),
+    ("J527  Steer.Column",      "16",  0x712, 0x77B),
+    ("J540  PDC",               "6C",  0x766, 0x76E),
+    ("J623  Engine (ECU)",      "01",  0x7E0, 0x7E8),
+    ("J743  DSG/TCU",           "02",  0x7E1, 0x7E9),
+    ("J104  ABS/ESC",           "03",  0x713, 0x77D),
+    ("J428  ACC Radar",         "76",  0x76C, 0x774),
+    ("J393  Comfort Sys.",      "46",  0x750, 0x758),
+    ("J844  Lane Assist",       "6D",  0x787, 0x78F),
+    ("J769  Side Assist",       "3C",  0x78C, 0x794),
+    ("J587  El. Steering",      "44",  0x712, 0x77B),
+]
+
+# Standard UDS DTC status mask meanings
+DTC_STATUS = {
+    0x01: "testFailed",
+    0x02: "testFailedThisMonitoringCycle",
+    0x04: "pendingDTC",
+    0x08: "confirmedDTC",
+    0x10: "testNotCompletedSinceLastClear",
+    0x20: "testFailedSinceLastClear",
+    0x40: "testNotCompletedThisMonitoringCycle",
+    0x80: "warningIndicatorRequested",
+}
+
+# VAG DTC format: 3 bytes = [byte1][byte2][byte3]
+# byte1 high nibble = system prefix (P/C/B/U)
+# Format them as standard OBD codes
+def format_dtc(dtc_bytes: bytes) -> str:
+    if len(dtc_bytes) < 2:
+        return "INVALID"
+    b1, b2 = dtc_bytes[0], dtc_bytes[1]
+    prefix = ["P", "C", "B", "U"][(b1 >> 6) & 0x03]
+    num = ((b1 & 0x3F) << 8) | b2
+    return f"{prefix}{num:04X}"
+
+
+class DiagTab(_Tab):
+    """
+    Diagnostics tab — Bus scan and DTC read/clear for all VAG modules.
+
+    Workflow:
+      1. ⟳ Bus Scan    — probes all known module addresses, shows what's present
+      2. ◈ Read DTCs   — reads stored DTCs from all present modules (UDS 0x19)
+      3. ✕ Clear DTCs  — clears all DTCs from selected modules (UDS 0x14)
+    """
+
+    def __init__(self, parent, mw):
+        super().__init__(parent, mw)
+        self._present: dict = {}     # mod_name → (tx, rx)
+        self._dtcs:    dict = {}     # mod_name → list of (code, status)
+        self._module_rows: dict = {}
+        self._module_vars: dict = {}
+        self._build_ui()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        # Action bar
+        act = _card(self, padx=10, pady=8)
+        act.pack(fill="x", padx=14, pady=(8, 2))
+
+        row1 = _frame(act)
+        row1.pack(fill="x")
+
+        self._scan_btn = _btn(row1, "⟳  Bus Scan",
+                              self._do_bus_scan, primary=True, state="disabled")
+        self._scan_btn.pack(side="left")
+
+        self._dtc_btn = _btn(row1, "◈  Read DTCs",
+                             self._do_read_dtcs, state="disabled")
+        self._dtc_btn.pack(side="left", padx=(8, 0))
+
+        self._clear_btn = _btn(row1, "✕  Clear DTCs (selected)",
+                               self._do_clear_dtcs, state="disabled")
+        self._clear_btn.pack(side="left", padx=(8, 0))
+
+        self._sel_all_btn = _btn(row1, "☑ Select All",
+                                 self._select_all, state="disabled")
+        self._sel_all_btn.pack(side="right")
+
+        # Status
+        self._status_var = tk.StringVar(value="connect to vehicle first")
+        tk.Label(act, textvariable=self._status_var,
+                 bg=C["surface"], fg=C["muted"],
+                 font=("Courier New", 10)).pack(anchor="w", pady=(6, 0))
+
+        # Summary banner
+        self._summary_var = tk.StringVar(value="")
+        self._summary_lbl = tk.Label(self,
+                                     textvariable=self._summary_var,
+                                     bg=C["bg"], fg=C["muted"],
+                                     font=("Courier New", 12, "bold"),
+                                     pady=3)
+        self._summary_lbl.pack(fill="x", padx=14, pady=(2, 0))
+
+        # Module grid
+        grid_card = _card(self, padx=10, pady=6)
+        grid_card.pack(fill="x", padx=14, pady=(2, 2))
+
+        hdr = _frame(grid_card, bg=C["surface"])
+        hdr.pack(fill="x", pady=(0, 3))
+        for col, width, text in [
+            (0, 2,  ""),
+            (1, 22, "MODULE"),
+            (2, 8,  "STATUS"),
+            (3, 8,  "DTCs"),
+            (4, 55, "FAULT CODES"),
+        ]:
+            tk.Label(hdr, text=text, bg=C["surface"], fg=C["muted"],
+                     font=("Courier New", 8), width=width,
+                     anchor="w").grid(row=0, column=col, sticky="w", padx=2)
+
+        self._grid_frame = _frame(grid_card, bg=C["surface"])
+        self._grid_frame.pack(fill="x")
+        self._build_module_rows()
+
+        # DTC detail log
+        _section(self, "dtc detail")
+        self._log = _log_widget(self)
+        self._log.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+    def _build_module_rows(self):
+        for mod_name, addr, tx, rx in SCAN_MODULES:
+            var = tk.BooleanVar(value=False)
+            self._module_vars[mod_name] = var
+
+            row = _frame(self._grid_frame, bg=C["surface"])
+            row.pack(fill="x", pady=1)
+
+            cb = tk.Checkbutton(row, variable=var,
+                                bg=C["surface"], fg=C["green"],
+                                activebackground=C["surface"],
+                                selectcolor=C["bg"],
+                                state="disabled")
+            cb.grid(row=0, column=0, padx=2)
+
+            name_lbl = tk.Label(row, text=mod_name,
+                                bg=C["surface"], fg=C["muted"],
+                                font=("Courier New", 10), width=22, anchor="w")
+            name_lbl.grid(row=0, column=1, padx=2, sticky="w")
+
+            status_lbl = tk.Label(row, text="—",
+                                  bg=C["surface"], fg=C["muted"],
+                                  font=("Courier New", 10), width=8, anchor="w")
+            status_lbl.grid(row=0, column=2, padx=2)
+
+            dtc_count_lbl = tk.Label(row, text="—",
+                                     bg=C["surface"], fg=C["muted"],
+                                     font=("Courier New", 10), width=8, anchor="w")
+            dtc_count_lbl.grid(row=0, column=3, padx=2)
+
+            codes_lbl = tk.Label(row, text="—",
+                                 bg=C["surface"], fg=C["dim"],
+                                 font=("Courier New", 9), anchor="w", width=55)
+            codes_lbl.grid(row=0, column=4, padx=2, sticky="w")
+
+            self._module_rows[mod_name] = {
+                "cb": cb, "status": status_lbl,
+                "dtc_count": dtc_count_lbl, "codes": codes_lbl
+            }
+
+    # ── Connect / Disconnect ──────────────────────────────────────────────────
+
+    def on_connect(self):
+        self._scan_btn.config(state="normal")
+        self._status_var.set("ready — click Bus Scan")
+
+    def on_disconnect(self):
+        self._scan_btn.config(state="disabled")
+        self._dtc_btn.config(state="disabled")
+        self._clear_btn.config(state="disabled")
+        self._sel_all_btn.config(state="disabled")
+        self._status_var.set("connect to vehicle first")
+        self._reset_rows()
+
+    def _reset_rows(self):
+        for mod_name, row in self._module_rows.items():
+            row["status"].config(text="—", fg=C["muted"])
+            row["dtc_count"].config(text="—", fg=C["muted"])
+            row["codes"].config(text="—", fg=C["dim"])
+            row["cb"].config(state="disabled")
+            self._module_vars[mod_name].set(False)
+        self._summary_var.set("")
+        self._present = {}
+        self._dtcs = {}
+
+    def _select_all(self):
+        for mod_name, row in self._module_rows.items():
+            if row["cb"]["state"] == "normal":
+                self._module_vars[mod_name].set(True)
+
+    # ── Bus Scan ──────────────────────────────────────────────────────────────
+
+    def _do_bus_scan(self):
+        self._scan_btn.config(state="disabled")
+        self._dtc_btn.config(state="disabled")
+        self._clear_btn.config(state="disabled")
+        self._sel_all_btn.config(state="disabled")
+        self._reset_rows()
+        self._clear_log(self._log)
+        self._append_log(self._log,
+            "── Bus Scan ────────────────────────────────────────────\n", "hdr")
+        self._append_log(self._log,
+            "  Probing all known module addresses...\n", "dim")
+        self._status_var.set("scanning bus...")
+        self._run(self._bus_scan_task)
+
+    def _bus_scan_task(self):
+        import udsoncan
+        from udsoncan.client import Client
+        from udsoncan import configs
+
+        def log(msg, tag=""):
+            self._ui(self._append_log, self._log, msg, tag)
+
+        present_count = 0
+        seen_addrs = set()  # deduplicate by TX address
+
+        for mod_name, addr, tx, rx in SCAN_MODULES:
+            if tx in seen_addrs:
+                continue  # skip duplicate TX addresses
+
+            try:
+                from cp_tools.j533_probe import J533Probe
+                probe = J533Probe(
+                    interface      = self.mw.interface,
+                    interface_path = self.mw.iface_path,
+                    ble_bridge     = getattr(self.mw, "ble_bridge", None),
+                )
+                cfg = dict(configs.default_client_config)
+                cfg["request_timeout"] = 2  # short timeout for bus scan
+                conn = probe._make_conn(tx, rx)
+                with Client(conn, request_timeout=2, config=cfg) as c:
+                    # Try default session — any response means module is present
+                    c.change_session(
+                        udsoncan.services.DiagnosticSessionControl
+                        .Session.defaultSession)
+                    # Module responded
+                    present_count += 1
+                    seen_addrs.add(tx)
+                    self._present[mod_name] = (tx, rx)
+                    self._ui(self._module_rows[mod_name]["status"].config,
+                             text="present", fg=C["green"])
+                    self._ui(self._module_rows[mod_name]["cb"].config,
+                             state="normal")
+                    self._ui(self._module_vars[mod_name].set, True)
+                    log(f"  ✓ {mod_name:<28} TX=0x{tx:03X}\n", "ok")
+
+            except udsoncan.exceptions.NegativeResponseException:
+                # Got a response (even negative) — module IS present
+                present_count += 1
+                seen_addrs.add(tx)
+                self._present[mod_name] = (tx, rx)
+                self._ui(self._module_rows[mod_name]["status"].config,
+                         text="present", fg=C["green"])
+                self._ui(self._module_rows[mod_name]["cb"].config,
+                         state="normal")
+                self._ui(self._module_vars[mod_name].set, True)
+                log(f"  ✓ {mod_name:<28} TX=0x{tx:03X} (NRC response)\n", "ok")
+
+            except Exception as e:
+                err = str(e).lower()
+                if "timeout" in err:
+                    self._ui(self._module_rows[mod_name]["status"].config,
+                             text="absent", fg=C["dim"])
+                else:
+                    self._ui(self._module_rows[mod_name]["status"].config,
+                             text="error", fg=C["amber"])
+                    log(f"  ? {mod_name:<28} {str(e)[:40]}\n", "warn")
+
+        log(f"\n── Scan complete: {present_count} modules present ──────────────\n",
+            "ok")
+        self._ui(self._summary_var.set,
+                 f"{'✓' if present_count else '—'}  {present_count} module(s) found on bus")
+        self._ui(self._summary_lbl.config,
+                 fg=C["green"] if present_count else C["muted"])
+        self._ui(self._status_var.set,
+                 f"{present_count} modules — click Read DTCs")
+        self._ui(self._scan_btn.config, state="normal")
+
+        if present_count:
+            self._ui(self._dtc_btn.config, state="normal")
+            self._ui(self._sel_all_btn.config, state="normal")
+
+    # ── Read DTCs ─────────────────────────────────────────────────────────────
+
+    def _do_read_dtcs(self):
+        selected = [m for m, v in self._module_vars.items()
+                    if v.get() and m in self._present]
+        if not selected:
+            self._append_log(self._log,
+                "No modules selected.\n", "warn")
+            return
+        self._dtc_btn.config(state="disabled")
+        self._scan_btn.config(state="disabled")
+        self._clear_log(self._log)
+        self._append_log(self._log,
+            f"── Read DTCs — {len(selected)} module(s) ───────────────────────\n",
+            "hdr")
+        self._status_var.set("reading DTCs...")
+        self._run(self._read_dtcs_task, selected)
+
+    def _read_dtcs_task(self, selected: list):
+        import udsoncan
+        from udsoncan.client import Client
+        from udsoncan import configs
+
+        def log(msg, tag=""):
+            self._ui(self._append_log, self._log, msg, tag)
+
+        total_dtcs = 0
+        self._dtcs = {}
+
+        for mod_name in selected:
+            if mod_name not in self._present:
+                continue
+            tx, rx = self._present[mod_name]
+            log(f"\n  {mod_name}  TX=0x{tx:03X}\n", "hdr")
+
+            try:
+                from cp_tools.j533_probe import J533Probe
+                probe = J533Probe(
+                    interface      = self.mw.interface,
+                    interface_path = self.mw.iface_path,
+                    ble_bridge     = getattr(self.mw, "ble_bridge", None),
+                )
+                cfg = dict(configs.default_client_config)
+                cfg["request_timeout"] = 5
+                conn = probe._make_conn(tx, rx)
+                with Client(conn, request_timeout=5, config=cfg) as c:
+                    # Extended session for full DTC access
+                    try:
+                        c.change_session(
+                            udsoncan.services.DiagnosticSessionControl
+                            .Session.extendedDiagnosticSession)
+                    except Exception:
+                        pass  # some modules answer DTCs in default session
+
+                    # UDS 0x19 02 09 — read all stored DTCs (confirmed + pending)
+                    resp = c.get_dtc_by_status_mask(0x09)
+                    dtcs = []
+                    if hasattr(resp, 'dtcs') and resp.dtcs:
+                        for dtc in resp.dtcs:
+                            code = format_dtc(dtc.id.to_bytes(3, 'big')
+                                              if hasattr(dtc.id, 'to_bytes')
+                                              else bytes(dtc.id))
+                            status = dtc.status.raw_value if hasattr(
+                                dtc, 'status') else 0
+                            dtcs.append((code, status))
+
+                    self._dtcs[mod_name] = dtcs
+                    count = len(dtcs)
+                    total_dtcs += count
+
+                    if dtcs:
+                        codes_str = "  ".join(c for c, _ in dtcs[:5])
+                        if len(dtcs) > 5:
+                            codes_str += f"  +{len(dtcs)-5} more"
+                        self._ui(self._module_rows[mod_name]["dtc_count"].config,
+                                 text=str(count), fg=C["red"])
+                        self._ui(self._module_rows[mod_name]["codes"].config,
+                                 text=codes_str, fg=C["amber"])
+                        log(f"    {count} DTC(s):\n", "err")
+                        for code, status in dtcs:
+                            active = "confirmed" if status & 0x08 else "pending"
+                            log(f"      {code}  [{active}  0x{status:02X}]\n",
+                                "err" if status & 0x08 else "warn")
+                    else:
+                        self._ui(self._module_rows[mod_name]["dtc_count"].config,
+                                 text="0", fg=C["green"])
+                        self._ui(self._module_rows[mod_name]["codes"].config,
+                                 text="no faults", fg=C["dim"])
+                        log("    no DTCs stored ✓\n", "ok")
+
+            except udsoncan.exceptions.NegativeResponseException as nre:
+                nrc = nre.response.code if hasattr(nre, "response") else 0
+                self._ui(self._module_rows[mod_name]["dtc_count"].config,
+                         text="—", fg=C["amber"])
+                log(f"    NRC 0x{nrc:02X} — DTC service not supported\n", "warn")
+            except Exception as e:
+                log(f"    Error: {e}\n", "err")
+
+        # Summary
+        log(f"\n── DTC read complete: {total_dtcs} total fault(s) ──────────────\n",
+            "ok" if total_dtcs == 0 else "warn")
+        self._ui(self._summary_var.set,
+                 f"{'✓  NO FAULTS' if total_dtcs == 0 else f'⚠  {total_dtcs} FAULT(S) STORED'}")
+        self._ui(self._summary_lbl.config,
+                 fg=C["green"] if total_dtcs == 0 else C["red"])
+        self._ui(self._status_var.set,
+                 f"{total_dtcs} DTC(s) found — select modules and click Clear DTCs to erase")
+        self._ui(self._dtc_btn.config, state="normal")
+        self._ui(self._scan_btn.config, state="normal")
+
+        if total_dtcs > 0:
+            self._ui(self._clear_btn.config, state="normal")
+
+    # ── Clear DTCs ────────────────────────────────────────────────────────────
+
+    def _do_clear_dtcs(self):
+        selected = [m for m, v in self._module_vars.items()
+                    if v.get() and m in self._present]
+        if not selected:
+            self._append_log(self._log, "No modules selected.\n", "warn")
+            return
+        import tkinter.messagebox as mb
+        if not mb.askyesno(
+            "Clear DTCs",
+            f"Clear all DTCs from {len(selected)} module(s)?\n\n"
+            + "\n".join(f"  • {m}" for m in selected)
+            + "\n\nThis cannot be undone.",
+            icon="warning"
+        ):
+            return
+        self._clear_btn.config(state="disabled")
+        self._scan_btn.config(state="disabled")
+        self._dtc_btn.config(state="disabled")
+        self._append_log(self._log,
+            f"\n── Clear DTCs — {len(selected)} module(s) ──────────────────────\n",
+            "hdr")
+        self._run(self._clear_dtcs_task, selected)
+
+    def _clear_dtcs_task(self, selected: list):
+        import udsoncan
+        from udsoncan.client import Client
+        from udsoncan import configs
+
+        def log(msg, tag=""):
+            self._ui(self._append_log, self._log, msg, tag)
+
+        cleared = 0
+        for mod_name in selected:
+            if mod_name not in self._present:
+                continue
+            tx, rx = self._present[mod_name]
+            log(f"\n  {mod_name}\n", "hdr")
+            try:
+                from cp_tools.j533_probe import J533Probe
+                probe = J533Probe(
+                    interface      = self.mw.interface,
+                    interface_path = self.mw.iface_path,
+                    ble_bridge     = getattr(self.mw, "ble_bridge", None),
+                )
+                cfg = dict(configs.default_client_config)
+                cfg["request_timeout"] = 10
+                conn = probe._make_conn(tx, rx)
+                with Client(conn, request_timeout=10, config=cfg) as c:
+                    c.change_session(
+                        udsoncan.services.DiagnosticSessionControl
+                        .Session.extendedDiagnosticSession)
+                    # UDS 0x14 FFFFFF — clear all DTCs
+                    c.clear_dtc(0xFFFFFF)
+                    cleared += 1
+                    self._ui(self._module_rows[mod_name]["dtc_count"].config,
+                             text="0", fg=C["green"])
+                    self._ui(self._module_rows[mod_name]["codes"].config,
+                             text="cleared ✓", fg=C["green"])
+                    log(f"    DTCs cleared ✓\n", "ok")
+            except udsoncan.exceptions.NegativeResponseException as nre:
+                nrc = nre.response.code if hasattr(nre, "response") else 0
+                log(f"    NRC 0x{nrc:02X} — clear rejected\n", "err")
+            except Exception as e:
+                log(f"    Error: {e}\n", "err")
+
+        log(f"\n── Clear complete: {cleared}/{len(selected)} modules cleared ───\n",
+            "ok" if cleared == len(selected) else "warn")
+        self._ui(self._status_var.set,
+                 f"DTCs cleared on {cleared} module(s) — rerun Read DTCs to confirm")
+        self._ui(self._scan_btn.config, state="normal")
+        self._ui(self._dtc_btn.config, state="normal")
+        if self._present:
+            self._ui(self._clear_btn.config, state="normal")
+
+
 # TAB 7 — Raw Sniff
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2612,6 +3104,7 @@ class MainWindow(tk.Tk):
             ("  logger  ",      LoggerTab),
             ("  cp tools  ",    CPToolsTab),
             ("  raw sniff  ",   RawSniffTab),
+            ("  diagnostics",   DiagTab),
             ("  trans  ",         TransLoggerTab),
         ]
 
