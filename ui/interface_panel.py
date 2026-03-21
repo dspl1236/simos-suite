@@ -510,10 +510,34 @@ class InterfacePanel(tk.Frame):
         self._hide_boxes()
 
         def _connect_task():
-            # Real impl: replace with actual connection attempt
-            import time
-            time.sleep(0.8)
-            self.after(0, lambda: self._on_connected(interface, path))
+            err = None
+            if interface == "J2534":
+                # Actually probe the DLL — PassThruOpen must succeed
+                try:
+                    import ctypes
+                    dll = ctypes.WinDLL(path)
+                    dev_id = ctypes.c_ulong(0)
+                    result = dll.PassThruOpen(None, ctypes.byref(dev_id))
+                    if result == 0:
+                        dll.PassThruClose(dev_id)
+                    else:
+                        err = f"Cable not detected (PassThruOpen error 0x{result:08X})"
+                except OSError as e:
+                    if "not a valid Win32 application" in str(e) or "wrong architecture" in str(e).lower():
+                        err = "32-bit DLL cannot load in 64-bit process — use the 64-bit DLL variant"
+                    else:
+                        err = f"DLL load failed: {e}"
+                except Exception as e:
+                    err = f"J2534 error: {e}"
+            elif interface == "BLE":
+                import time; time.sleep(0.5)  # BLE scan handled by ble_bridge
+            else:
+                import time; time.sleep(0.3)
+
+            if err:
+                self.after(0, lambda: self._on_connect_failed(err))
+            else:
+                self.after(0, lambda: self._on_connected(interface, path))
 
         threading.Thread(target=_connect_task, daemon=True).start()
 
@@ -530,6 +554,14 @@ class InterfacePanel(tk.Frame):
             "Use _make_connection(ecu, interface, path) to create udsoncan Client.")
         if self._on_connect:
             self._on_connect(interface, path)
+
+    def _on_connect_failed(self, reason: str):
+        self._connect_btn.config(state="normal", text="connect",
+                                 fg=COLORS["text"], bg=COLORS["btn"],
+                                 activeforeground=COLORS["text"],
+                                 activebackground=COLORS["btn_hover"])
+        self._set_status(COLORS["red"], f"connection failed")
+        self._show_err(reason)
 
     def _do_disconnect(self):
         self._connected = False
