@@ -577,9 +577,24 @@ class InterfacePanel(tk.Frame):
                          "▶ SIMULATION MODE  — Simos8.5 3.0T TFSI CGWB + ZF8HP")
         self._demo_btn.config(state="disabled", text="▶ DEMO (active)")
 
-        # Fire the on_connected callback with DEMO interface
-        # This triggers on_connect() on all tabs
+        # Fire the on_connected callback — enables all tabs
         self.after(200, lambda: self._on_connected("DEMO", "Simos8.5 3.0T TFSI CGWB"))
+
+        # Then auto-populate all tabs with simulated data
+        def _launch_auto_pop():
+            import time; time.sleep(0.5)
+            try:
+                from tests.sim_runner import auto_connect_after_launch
+                # Find the MainWindow by walking up the widget tree
+                mw = self
+                while mw and not hasattr(mw, "_tabs"):
+                    mw = getattr(mw, "master", None) or getattr(mw, "_w", None)
+                if mw and hasattr(mw, "_tabs"):
+                    auto_connect_after_launch(mw, delay=0)
+            except Exception as e:
+                import logging; logging.getLogger(__name__).warning("demo pop: %s", e)
+        import threading
+        threading.Thread(target=_launch_auto_pop, daemon=True).start()
 
     def _set_status(self, dot_color: str, msg: str):
 
