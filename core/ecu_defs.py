@@ -288,7 +288,7 @@ J255_2ZONE = ECUDef(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SIMOS85 = ECUDef(
-    name         = "Simos8.5 — Audi 3.0T TFSI (CGWA/CGWB/CGWC)",
+    name         = "Simos8.5 — Audi 3.0T TFSI (CGWA/CGWB/CGWC/CTUA)",
     project_code = "S85",
     platform     = Platform.PQ46,
     can_tx       = 0x7E0,
@@ -334,6 +334,12 @@ SIMOS85 = ECUDef(
         "3.0T/3.2T block swap: lean diagnosis — check maf_transfer and injector_scaling first."
     ),
 )
+# CTUA alias — same hardware as SIMOS85, different part number family
+# Part: 4G0907551x (vs 4G0906259x for CGWB)
+# VIN WAUGGAFC7DN120188 confirmed CTUA on Simos8.5 via Simos Tools read
+# CAN: 0x7E0/0x7E8  SA2: same bytecode  Blocks: identical layout
+SIMOS85_CTUA = SIMOS85  # treat as identical for all tool operations
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
