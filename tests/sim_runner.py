@@ -283,14 +283,26 @@ def start_sniff_generator(callback, interval: float = 0.2):
 
 def auto_connect_after_launch(mw, delay: float = 1.5):
     """
-    After the MainWindow is visible, automatically trigger a connection
+    After the MainWindow is visible, automatically trigger a DEMO connection
     and pre-populate every tab with simulated data.
+
+    Called by the DEMO MODE button in interface_panel.py.
+
+    Populates:
+      - ECU Info     all 18 VW DIDs from Simos8.5 mock
+      - Flash        synthetic CAL binary ready for Tune tab
+      - Tune         CAL tables loaded and first table displayed
+      - Logger       live DID channels enabled (animates)
+      - CP Tools     constellation + J255/J136 CP active, scan auto-runs
+      - Diagnostics  bus topology from J533, DTCs from J255
+      - Trans        ZF8HP live gear/temp/speed data
+      - Raw Sniff    simulated ISO-TP frame stream
     """
     def _do():
         time.sleep(delay)
         try:
-            mw._on_connected("BLE", "")
-            log.info("[SIM] Auto-connected (BLE simulation)")
+            mw._on_connected("DEMO", "Simos8.5 3.0T TFSI CGWB")
+            log.info("[SIM] Demo connected")
 
             time.sleep(0.4)
             cal = make_synthetic_cal(mw.ecu)
@@ -298,51 +310,87 @@ def auto_connect_after_launch(mw, delay: float = 1.5):
             for tab in getattr(mw, "_tabs", []):
                 cls = type(tab).__name__
 
-                # Flash tab — set cal_bytes and update labels
+                # Flash tab — pre-load cal
                 if cls == "FlashTab":
-                    tab._cal_bytes = cal
-                    fname = "4G0906259E_CGWB_demo.bin"
-                    if hasattr(tab, "_cal_path"):
-                        tab._cal_path.set(fname)
-                    if hasattr(tab, "_file_info"):
-                        tab._file_info.config(
-                            text=f"{len(cal):,} bytes  ({len(cal)/1024:.1f} KB)  [simulation]",
-                            fg="#3fb950")
-                    log.info("[SIM] FlashTab: %d byte synthetic CAL", len(cal))
+                    try:
+                        tab._cal_bytes = cal
+                        tab._cal_label.config(
+                            text="4G0906259E_CGWB_demo.bin  (simulated)")
+                        tab._read_btn.config(state="normal")
+                        tab._write_btn.config(state="normal")
+                        log.info("[SIM] FlashTab: synthetic CAL loaded")
+                    except Exception as e:
+                        log.warning("[SIM] FlashTab: %s", e)
 
-                # Tune tab — call load_bytes() directly
-                elif hasattr(tab, "load_bytes"):
+                # Tune tab — load and display tables
+                elif cls == "TuneTab":
                     try:
                         tab.load_bytes(cal, "4G0906259E_CGWB_demo.bin")
-                        log.info("[SIM] TuneTab: synthetic CAL loaded, %d tables",
-                                 len(getattr(tab, "_entry_widgets", {})) or 14)
+                        log.info("[SIM] TuneTab: tables loaded")
                     except Exception as e:
-                        log.warning("[SIM] TuneTab load_bytes: %s", e)
+                        log.warning("[SIM] TuneTab: %s", e)
 
-                # Raw Sniff tab — start synthetic CAN frame generator
-                elif cls == "RawSniffTab":
+                # CP Tools tab — auto-run scan after short delay
+                elif cls == "CPToolsTab":
                     try:
-                        def _on_frame(raw_frame):
-                            if hasattr(tab, "_hex_log") and tab._hex_log.winfo_exists():
-                                import time as _t
-                                ts = _t.strftime("%H:%M:%S")
-                                can_id = (raw_frame[0] << 8) | raw_frame[1]
-                                dlc    = raw_frame[2]
-                                data   = raw_frame[3:3+dlc]
-                                line   = "[" + ts + "]  " + f"{can_id:03X}  " + "[" + str(dlc) + "]  " + data.hex(" ").upper() + "\n"
-                                tab._append_log(tab._hex_log, line)
-                        stop_fn = start_sniff_generator(_on_frame, interval=0.25)
-                        log.info("[SIM] RawSniffTab: synthetic CAN frames started")
+                        def _cp_scan_deferred(t=tab):
+                            time.sleep(1.2)
+                            if hasattr(t, "_do_scan"):
+                                t.after(0, t._do_scan)
+                        import threading
+                        threading.Thread(target=_cp_scan_deferred,
+                                         daemon=True).start()
+                        log.info("[SIM] CPToolsTab: scan queued")
                     except Exception as e:
-                        log.warning("[SIM] RawSniffTab: %s", e)
+                        log.warning("[SIM] CPToolsTab: %s", e)
+
+                # Diagnostics tab — auto-run bus scan
+                elif cls == "DiagTab":
+                    try:
+                        def _diag_scan_deferred(t=tab):
+                            time.sleep(2.0)
+                            if hasattr(t, "_do_bus_scan"):
+                                t.after(0, t._do_bus_scan)
+                        import threading
+                        threading.Thread(target=_diag_scan_deferred,
+                                         daemon=True).start()
+                        log.info("[SIM] DiagTab: bus scan queued")
+                    except Exception as e:
+                        log.warning("[SIM] DiagTab: %s", e)
+
+                # Trans tab — set ZF8HP
+                elif cls == "TransLoggerTab":
+                    try:
+                        tab._set_trans_by_key("ZF8HP")
+                        log.info("[SIM] TransLoggerTab: ZF8HP set")
+                    except Exception as e:
+                        log.warning("[SIM] TransLoggerTab: %s", e)
+
+                # Logger tab — enable live polling
+                elif cls == "LoggerTab":
+                    try:
+                        # Live data will animate via the mock connection
+                        log.info("[SIM] LoggerTab: ready (click REC)")
+                    except Exception as e:
+                        log.warning("[SIM] LoggerTab: %s", e)
+
+            # Start simulated raw sniff frames
+            def _on_frame(raw_frame):
+                for tab in getattr(mw, "_tabs", []):
+                    if type(tab).__name__ == "RawSniffTab":
+                        try:
+                            tab._on_raw_frame(raw_frame)
+                        except Exception:
+                            pass
+            start_sniff_generator(_on_frame, interval=0.3)
+            log.info("[SIM] Raw sniff generator started")
 
         except Exception as e:
-            log.warning("[SIM] auto-connect: %s", e)
+            log.exception("[SIM] auto_connect error: %s", e)
 
-    threading.Thread(target=_do, daemon=True).start()
+    import threading
+    threading.Thread(target=_do, daemon=True, name="sim-auto-connect").start()
 
-
-# ── Headless smoke test ────────────────────────────────────────────────────────
 
 def run_headless(ecu_key: str = "S85", trans_key: str = "ZF8HP") -> bool:
     """
