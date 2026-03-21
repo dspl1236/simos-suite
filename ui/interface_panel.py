@@ -309,32 +309,17 @@ class InterfacePanel(tk.Frame):
             widget.destroy()
         self._iface_rows.clear()
 
-        available  = self._registry.available()   # hardware physically detected
-        driver_only = [i for i in self._registry.all()
-                       if not i.available and i.interface == "J2534"]
-
-        if not available and not driver_only:
+        # Show all available interfaces (DLL present or hardware detected)
+        available = self._registry.available()
+        if not available:
             tk.Label(self._list_frame,
-                     text="No hardware detected — plug in your interface and click ⟳ scan",
+                     text="No interfaces found — install drivers or plug in your cable",
                      fg=COLORS["text_dim"], bg=COLORS["bg"],
                      font=("Menlo", 9), anchor="w").pack(anchor="w", pady=8)
             return
 
-        # Connected hardware — green
         for iface in available:
             self._add_iface_row(iface)
-
-        # J2534 drivers installed but cable not plugged in — amber hint
-        if driver_only and not available:
-            tk.Label(self._list_frame,
-                     text="Drivers installed — plug in your cable and click ⟳ scan:",
-                     fg=COLORS["amber"], bg=COLORS["bg"],
-                     font=("Menlo", 9), anchor="w").pack(anchor="w", pady=(8,2))
-            for iface in driver_only:
-                self._add_iface_row(iface)
-        elif driver_only:
-            for iface in driver_only:
-                self._add_iface_row(iface)
 
     def _add_iface_row(self, iface: InterfaceInfo):
         row = tk.Frame(self._list_frame,
