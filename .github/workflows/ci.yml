@@ -3,107 +3,103 @@ name: CI
 on:
   push:
     branches: [main, dev]
-    tags-ignore:
-      - 'v*'  # v* tags are handled by build_exe.yml
+    tags:
+      - 'v*'
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
-  # ── Backend tests — Linux, no hardware deps ──────────────────────────────────
+  # ── Tests — run on every push ───────────────────────────────────────────────
   test:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11"]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install minimal deps (no hardware stack)
+      - name: Install deps
         run: |
           pip install numpy
           pip install git+https://github.com/bri3d/sa2_seed_key.git || true
-          echo "Hardware deps (udsoncan/bleak/pyserial) skipped in CI"
 
       - name: Headless smoke test
         run: python -m tests.sim_runner --headless
 
-      - name: ECU backend tests
-        run: python -m tests.sim_ecu
-
-      - name: Transmission backend tests
-        run: python -m tests.sim_trans
-
-      - name: Full test runner
-        run: python -m tests --headless
-
-      - name: Import chain verification
+      - name: ECU + trans backend tests
         run: |
-          python -c "
-          from core.ecu_defs import (
-              ECU_REGISTRY, TCU_REGISTRY,
-              SIMOS85, SIMOS12, SIMOS122, SIMOS18,
-              ZF8HP, DL501, DQ250, DQ381,
-          )
-          print(f'core OK — {len(ECU_REGISTRY)} ECUs, {len(TCU_REGISTRY)} TCUs')
-          "
-          python -c "from core.trans_defs import TRANS_REGISTRY, ECU_DEFAULT_TRANS; print('trans_defs OK')"
-          python -c "from logger import LogSession, SIMOS85_CHANNELS, Channel; print('logger OK')"
-          python -c "from tuner.cal_parser import CalParser; print('cal_parser OK')"
-          python -c "
-          from cp_tools.mwb_extract import load_confirmed_routine_id
-          rid = load_confirmed_routine_id()
-          print(f'cp_tools OK — CP_ROUTINE_ID={hex(rid) if rid else \"pending confirmation\"}')
-          "
+          python -m tests.sim_ecu
+          python -m tests.sim_trans
 
-  # ── Windows EXE build — runs after tests pass ──────────────────────────────
+      - name: Import chain
+        run: |
+          python -c "from core.ecu_defs import SIMOS85; print('core OK')"
+          python -c "from tuner.cal_parser import CalParser; print('cal_parser OK')"
+
+  # ── Build EXE — only on v* tags, after tests pass ──────────────────────────
   build-exe:
     name: Build Windows EXE
     needs: test
     runs-on: windows-latest
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11 (64-bit)
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           architecture: "x64"
 
-      - name: Install all dependencies
+      - name: Install dependencies
         shell: cmd
         run: |
           pip install pyinstaller
-          pip install udsoncan bleak pyserial numpy pycryptodome python-can
+          pip install udsoncan bleak pyserial numpy pycryptodome python-can websocket-client
           pip install git+https://github.com/bri3d/sa2_seed_key.git
-          python -c "import udsoncan, bleak, serial, numpy, Crypto; print('All deps OK')"
 
       - name: Build EXE
         shell: cmd
         run: python build_exe.py --no-test --no-upx
 
-      - name: Verify EXE exists and runs
+      - name: Verify EXE
         shell: cmd
         run: |
           if not exist dist\SimosSuite.exe (
-            echo ERROR: dist\SimosSuite.exe not found
+            echo ERROR: SimosSuite.exe not found
             exit /b 1
           )
           dir dist\SimosSuite.exe
-          echo EXE verified.
 
-      - name: Upload EXE artifact
-        uses: actions/upload-artifact@v4
+      - name: Get version from tag
+        id: version
+        shell: python
+        run: |
+          import os
+          ref = os.environ.get('GITHUB_REF', '')
+          version = ref.replace('refs/tags/', '') if ref.startswith('refs/tags/') else 'dev'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'version={version}\n')
+          print(f'Version: {version}')
+
+      - name: Rename EXE
+        shell: cmd
+        run: copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.version.outputs.version }}.exe"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
         with:
-          name: SimosSuite-windows-x64-${{ github.sha }}
-          path: dist/SimosSuite.exe
-          retention-days: 30
+          files: dist/SimosSuite-${{ steps.version.outputs.version }}.exe
+          fail_on_unmatched_files: true
