@@ -329,14 +329,26 @@ class BLEBridge:
 
     async def _authenticate(self):
         """
-        FunkBridge firmware has PASSWORD_CHECK disabled — no auth needed.
-        This is a no-op kept for interface compatibility.
-        Switchleg v0.90 also needs no auth.
-        Switchleg v1.03+ ignores unknown command flags gracefully.
+        FunkBridge firmware: PASSWORD_CHECK disabled — no auth needed.
+        Sends Switchleg-compatible encoded frames for users with Switchleg v1.03.
         """
-        await asyncio.sleep(0.1)   # brief settle after subscribe
-        log.debug("BLE auth: no password required (FunkBridge firmware)")
-
+        import struct
+        def _enc(pw):
+            i, out = 1234, []
+            for idx, ch in enumerate(pw):
+                out.append((ord(ch) + i) & 0xFF)
+                i += 11 * idx
+            return bytes(out)
+        for pw in ("BLE123", "BLE2"):
+            enc = _enc(pw)
+            hdr = struct.pack("<BBHHH", BLE_HEADER_ID, 0xC7, 0, 0, len(enc))
+            try:
+                await self._client.write_gatt_char(
+                    BLE_CHAR_CMD_UUID, hdr + enc, response=False)
+                await asyncio.sleep(0.15)
+            except Exception:
+                break
+        await asyncio.sleep(0.2)
     def _on_notify(self, char_handle, data: bytearray):
         raw = bytes(data)
         log.debug("RX %d bytes: %s", len(raw), raw.hex())
