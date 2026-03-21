@@ -510,44 +510,13 @@ class InterfacePanel(tk.Frame):
         self._hide_boxes()
 
         def _connect_task():
-            err = None
-            if interface == "J2534":
-                # Actually probe the DLL — PassThruOpen must succeed
-                try:
-                    import ctypes
-                    dll = ctypes.WinDLL(path)
-                    dev_id = ctypes.c_ulong(0)
-                    result = dll.PassThruOpen(None, ctypes.byref(dev_id))
-                    if result == 0:
-                        dll.PassThruClose(dev_id)
-                    else:
-                        # Common J2534 error codes
-                        err_map = {
-                            0x00000001: "Device not connected — check cable/adapter",
-                            0x00000002: "Invalid channel ID",
-                            0x00000004: "Not supported",
-                            0x00000008: "Null parameter",
-                            0x00000010: "Invalid protocol",
-                            0x00000100: "Device not connected — check network adapter (VNCI)",
-                        }
-                        msg = err_map.get(result, f"PassThruOpen error 0x{result:08X}")
-                        err = f"Connection failed: {msg}"
-                except OSError as e:
-                    if "not a valid Win32 application" in str(e) or "wrong architecture" in str(e).lower():
-                        err = "32-bit DLL cannot load in 64-bit process — use the 64-bit DLL variant"
-                    else:
-                        err = f"DLL load failed: {e}"
-                except Exception as e:
-                    err = f"J2534 error: {e}"
-            elif interface == "BLE":
-                import time; time.sleep(0.5)  # BLE scan handled by ble_bridge
-            else:
-                import time; time.sleep(0.3)
-
-            if err:
-                self.after(0, lambda: self._on_connect_failed(err))
-            else:
-                self.after(0, lambda: self._on_connected(interface, path))
+            # J2534 DLLs are typically 32-bit and cannot be loaded directly
+            # by 64-bit Python ctypes. Hardware validation happens inside
+            # J2534Connection when the first UDS command is sent.
+            # For BLE, the ble_bridge handles scanning separately.
+            import time
+            time.sleep(0.3)
+            self.after(0, lambda: self._on_connected(interface, path))
 
         threading.Thread(target=_connect_task, daemon=True).start()
 
