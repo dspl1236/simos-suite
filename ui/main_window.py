@@ -1370,17 +1370,17 @@ class LoggerTab(_Tab):
 
 # All C7 VAG modules that participate in Component Protection
 CP_MODULES = [
-    # (display name,          addr,  tx_id, rx_id)
-    ("J533  Gateway",         "01",  0x710, 0x77A),
-    ("J255  Climatronic",     "08",  0x746, 0x7AE),
-    ("J285  Instruments",     "17",  0x720, 0x728),
-    ("J234  Airbag",          "15",  0x736, 0x73E),
-    ("J794  MMI",             "5F",  0x7C0, 0x7C8),
-    ("J136  Mem.Seat Driver", "36",  0x714, 0x77C),
-    ("J521  Mem.Seat Pass.",  "06",  0x760, 0x768),  # addr unconfirmed — verify on car
-    ("J518  KESSY",           "03",  0x7A0, 0x7A8),
-    ("J519  Body Elect.",     "09",  0x716, 0x77E),
-    ("J525  Sound System",    "47",  0x740, 0x748),
+    # (display name,            addr,  tx_id, rx_id)  — from ConnorHowell/vag-uds-ids
+    ("J533  Gateway",            "01",  0x710, 0x77A),
+    ("J255  Climatronic",        "08",  0x746, 0x7B0),
+    ("J285  Instruments",        "17",  0x714, 0x77E),
+    ("J234  Airbag",             "15",  0x715, 0x77F),
+    ("J794  MMI",                "5F",  0x773, 0x7DD),
+    ("J136  Mem.Seat Driver",    "36",  0x74C, 0x7B6),
+    ("J521  Mem.Seat Pass.",     "06",  0x74D, 0x7B7),
+    ("J518  KESSY",              "03",  0x732, 0x79C),
+    ("J519  Body Elect.",        "09",  0x70E, 0x778),
+    ("J393  Central Comfort",    "46",  0x70D, 0x777),
 ]
 
 # Known IKA key blob — Feb 2024 ODIS session, J136, VIN WAUGGA**********8
@@ -2411,27 +2411,27 @@ class CPToolsTab(_Tab):
 
 # Full VAG C7 module list for bus scan — extends CP_MODULES with more addresses
 SCAN_MODULES = [
-    # (display name,            addr,  tx_id, rx_id)
-    ("J533  Gateway",           "01",  0x710, 0x77A),
-    ("J519  Body Elect.",       "09",  0x716, 0x77E),
-    ("J255  Climatronic",       "08",  0x746, 0x7AE),
-    ("J285  Instruments",       "17",  0x720, 0x728),
-    ("J234  Airbag",            "15",  0x736, 0x73E),
-    ("J794  MMI",               "5F",  0x7C0, 0x7C8),
-    ("J136  Mem.Seat Driver",   "36",  0x714, 0x77C),
-    ("J521  Mem.Seat Pass.",    "06",  0x760, 0x768),
-    ("J518  KESSY",             "03",  0x7A0, 0x7A8),
-    ("J525  Sound System",      "47",  0x740, 0x748),
-    ("J527  Steer.Column",      "16",  0x712, 0x77B),
-    ("J540  PDC",               "6C",  0x766, 0x76E),
-    ("J623  Engine (ECU)",      "01",  0x7E0, 0x7E8),
-    ("J743  DSG/TCU",           "02",  0x7E1, 0x7E9),
-    ("J104  ABS/ESC",           "03",  0x713, 0x77D),
-    ("J428  ACC Radar",         "76",  0x76C, 0x774),
-    ("J393  Comfort Sys.",      "46",  0x750, 0x758),
-    ("J844  Lane Assist",       "6D",  0x787, 0x78F),
-    ("J769  Side Assist",       "3C",  0x78C, 0x794),
-    ("J587  El. Steering",      "44",  0x712, 0x77B),
+    # (display name,            addr,  tx_id, rx_id)  — from ConnorHowell/vag-uds-ids
+    ("J533  Gateway",            "01",  0x710, 0x77A),
+    ("J519  Body Elect.",        "09",  0x70E, 0x778),
+    ("J255  Climatronic",        "08",  0x746, 0x7B0),
+    ("J285  Instruments",        "17",  0x714, 0x77E),
+    ("J234  Airbag",             "15",  0x715, 0x77F),
+    ("J794  MMI",                "5F",  0x773, 0x7DD),
+    ("J136  Mem.Seat Driver",    "36",  0x74C, 0x7B6),
+    ("J521  Mem.Seat Pass.",     "06",  0x74D, 0x7B7),
+    ("J518  KESSY",              "03",  0x732, 0x79C),
+    ("J525  Sound System",       "47",  0x73A, 0x7A4),
+    ("J527  Steer.Column",       "16",  0x70C, 0x776),
+    ("J393  Central Comfort",    "46",  0x70D, 0x777),
+    ("J623  Engine (ECU)",       "01",  0x7E0, 0x7E8),
+    ("J743  DSG/TCU",            "02",  0x7E1, 0x7E9),
+    ("J104  ABS/ESC",            "03",  0x713, 0x77D),
+    ("J428  ACC Radar",          "76",  0x757, 0x7C1),
+    ("J540  PDC",                "6C",  0x74E, 0x7B8),
+    ("J844  Lane Assist",        "6D",  0x756, 0x7C0),
+    ("J769  Side Assist",        "3C",  0x757, 0x7C1),
+    ("J587  El. Steering",       "44",  0x712, 0x77C),
 ]
 
 # Standard UDS DTC status mask meanings
