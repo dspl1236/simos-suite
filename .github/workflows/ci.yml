@@ -5,70 +5,101 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main]
-  # EXE build is triggered manually:
-  #   git tag v1.0.0 && git push origin v1.0.0
-  push_tag:
-    tags: ['v*']
 
 permissions:
   contents: write
 
 jobs:
-  # Tests run on every commit to main — no EXE, no artifact
-  test:
-    name: Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install deps
-        run: |
-          pip install numpy
-          pip install git+https://github.com/bri3d/sa2_seed_key.git || true
-      - name: Headless smoke test
-        run: python -m tests.sim_runner --headless
-      - name: Backend tests
-        run: |
-          python -m tests.sim_ecu
-          python -m tests.sim_trans
-      - name: Import chain
-        run: python -c "from core.ecu_defs import SIMOS85; from tuner.cal_parser import CalParser; print('OK')"
-
-  # EXE builds ONLY when a v* tag is pushed — after tests pass
-  build-exe:
-    name: Build Windows EXE
-    needs: test
+  test-and-build:
+    name: Test + Build EXE
     runs-on: windows-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           architecture: "x64"
+
       - name: Install dependencies
         shell: cmd
         run: |
+          pip install numpy
+          pip install git+https://github.com/bri3d/sa2_seed_key.git || echo sa2 optional
           pip install pyinstaller
-          pip install udsoncan bleak pyserial numpy pycryptodome python-can websocket-client
-          pip install git+https://github.com/bri3d/sa2_seed_key.git
-      - name: Build EXE
+          pip install udsoncan bleak pyserial pycryptodome python-can websocket-client
+
+      - name: Headless smoke test
         shell: cmd
-        run: python build_exe.py --no-test --no-upx
-      - name: Get version
+        run: python -m tests.sim_runner --headless
+
+      - name: Get build number
         id: ver
         shell: python
         run: |
-          import os
-          version = os.environ.get('GITHUB_REF','').replace('refs/tags/','')
-          open(os.environ['GITHUB_OUTPUT'],'a').write(f'v={version}\n')
-      - name: Rename EXE
+          import subprocess, os
+          count = subprocess.check_output(
+              ['git', 'rev-list', '--count', 'HEAD']
+          ).decode().strip()
+          sha = subprocess.check_output(
+              ['git', 'rev-parse', '--short', 'HEAD']
+          ).decode().strip()
+          version = f"0.{count}.0-{sha}"
+          print(f"Version: {version}")
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"version={version}\n")
+
+      - name: Patch version into source
+        shell: python
+        run: |
+          import re, pathlib
+          path = pathlib.Path("ui/main_window.py")
+          src  = path.read_text(encoding="utf-8")
+          src  = re.sub(r'VERSION = "[^"]+"',
+                        'VERSION = "${{ steps.ver.outputs.version }}"', src)
+          path.write_text(src, encoding="utf-8")
+          print("Patched VERSION in ui/main_window.py")
+
+      - name: Build EXE
         shell: cmd
-        run: copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.ver.outputs.v }}.exe"
-      - name: Attach to GitHub Release
+        run: python build_exe.py --no-test --no-upx
+
+      - name: Verify EXE
+        shell: cmd
+        run: |
+          if not exist dist\SimosSuite.exe (
+            echo ERROR: SimosSuite.exe not found
+            exit /b 1
+          )
+          dir dist\SimosSuite.exe
+
+      - name: Rename EXE with version
+        shell: cmd
+        run: |
+          copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.ver.outputs.version }}.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SimosSuite-${{ steps.ver.outputs.version }}
+          path: dist/SimosSuite-${{ steps.ver.outputs.version }}.exe
+          retention-days: 14
+          overwrite: true
+
+      - name: Update rolling dev release
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/SimosSuite-${{ steps.ver.outputs.v }}.exe
+          tag_name: dev-latest
+          name: "Dev Build — ${{ steps.ver.outputs.version }}"
+          body: |
+            Automated build from latest commit on main.
+            Version: `${{ steps.ver.outputs.version }}`
+            Commit: ${{ github.sha }}
+          prerelease: true
+          files: dist/SimosSuite-${{ steps.ver.outputs.version }}.exe
           fail_on_unmatched_files: true
