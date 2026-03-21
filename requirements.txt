@@ -32,6 +32,8 @@ pycryptodome >= 3.18          # AES-CBC for Simos12/18 flash blocks
 #   pip install git+https://github.com/bri3d/sa2_seed_key.git
 # sa2_seed_key
 
-# ── Build tooling (not needed at runtime) ─────────────────────────────────────
+# ── WiFi transport ───────────────────────────────────────────────────────────
+websocket-client >= 1.6      # FunkBridge WiFi WebSocket transport
+
+# ── Build tooling (not needed at runtime) ────────────────────────────────────
 # pyinstaller >= 6.0          # EXE builder — install separately for builds
-websocket-client >= 1.6      # WiFi WebSocket transport for FunkBridge
