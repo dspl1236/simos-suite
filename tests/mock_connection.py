@@ -353,6 +353,7 @@ class MockConnection(BaseConnection):
         self._session       = 0x01   # default session
         self._sa_unlocked   = False
         self._pending_seed  = None
+        self._written_dids: dict = {}   # DID → bytes, persists writes
         self._rx_buf: list[bytes] = []
         self._lock          = threading.Lock()
         self._open          = False
@@ -441,6 +442,9 @@ class MockConnection(BaseConnection):
             if len(req) < 3:
                 return _nrc(sid, _NRC.REQUEST_OUT_OF_RANGE)
             did = (req[1] << 8) | req[2]
+            # Return previously-written value if present
+            if did in self._written_dids:
+                return _did_response(did, self._written_dids[did])
             dids = _DID_TABLE.get(self.ecu, _simos85_dids)(self._state)
             if did in dids:
                 return _did_response(did, dids[did])
@@ -453,6 +457,9 @@ class MockConnection(BaseConnection):
             if len(req) < 3:
                 return _nrc(sid, _NRC.REQUEST_OUT_OF_RANGE)
             did = (req[1] << 8) | req[2]
+            # Persist the written value so readback reflects it
+            if len(req) > 3:
+                self._written_dids[did] = bytes(req[3:])
             return bytes([0x6E, req[1], req[2]])   # positive response
 
         # ── 0x31 RoutineControl ───────────────────────────────────────────────
