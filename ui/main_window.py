@@ -2416,8 +2416,10 @@ class DiagTab(_Tab):
 
     def __init__(self, parent, mw):
         super().__init__(parent, mw)
-        self._present: dict = {}     # mod_name → (tx, rx)
-        self._dtcs:    dict = {}     # mod_name → list of (code, status)
+        self._present:    dict = {}   # mod_name → (tx, rx)
+        self._dtcs:       dict = {}   # mod_name → list of (code, status)
+        self._unenrolled: list = []   # present on bus but not in constellation
+        self._scan_entries: list = [] # raw entries from decode_constellation
         self._module_rows: dict = {}
         self._module_vars: dict = {}
         self._build_ui()
@@ -2447,6 +2449,18 @@ class DiagTab(_Tab):
         self._sel_all_btn = _btn(row1, "☑ Select All",
                                  self._select_all, state="disabled")
         self._sel_all_btn.pack(side="right")
+
+        # Row 2 — retrofit / adopt new modules
+        row2 = _frame(act)
+        row2.pack(fill="x", pady=(6, 0))
+        self._adopt_btn = _btn(
+            row2, "⊕  Adopt New Modules into Constellation",
+            self._do_adopt, state="disabled")
+        self._adopt_btn.pack(side="left")
+        self._adopt_lbl = tk.Label(row2, text="",
+            bg=C["surface"], fg=C["amber"],
+            font=("Courier New", 9))
+        self._adopt_lbl.pack(side="left", padx=(10, 0))
 
         # Status
         self._status_var = tk.StringVar(value="connect to vehicle first")
@@ -2540,8 +2554,189 @@ class DiagTab(_Tab):
         self._dtc_btn.config(state="disabled")
         self._clear_btn.config(state="disabled")
         self._sel_all_btn.config(state="disabled")
+        self._adopt_btn.config(state="disabled")
+        self._adopt_lbl.config(text="")
         self._status_var.set("connect to vehicle first")
         self._reset_rows()
+
+
+    # ── Adopt / Retrofit — enroll new modules into J533 constellation ─────────
+    # Triggered when Bus Scan finds modules present but not in constellation.
+    # Example: OEM Night Vision retrofit, new seat module, any hardware add.
+    # Writes IKA key to each new module then updates J533 DID 0x04A3.
+
+    def _do_adopt(self):
+        if not self._unenrolled:
+            self._append_log(self._log,
+                "No unenrolled modules — run Bus Scan first.\n", "warn")
+            return
+        import tkinter.messagebox as mb
+        names = "\n".join(f"  - {n}" for n,_,_,_ in self._unenrolled)
+        if not mb.askyesno(
+            "Adopt New Modules",
+            f"Enroll {len(self._unenrolled)} new module(s) into J533:\n\n"
+            + names + "\n\n"
+            "Writes IKA key + updates constellation (DID 0x04A3).\n"
+            "Continue?",
+            icon="question"
+        ):
+            return
+        self._adopt_btn.config(state="disabled")
+        self._scan_btn.config(state="disabled")
+        self._clear_log(self._log)
+        self._append_log(self._log,
+            f"-- Adopt {len(self._unenrolled)} New Module(s) -----------------\n",
+            "hdr")
+        self._run(self._adopt_task)
+
+    def _adopt_task(self):
+        import udsoncan
+        from udsoncan.client import Client
+        from udsoncan import configs
+
+        def log(msg, tag=""):
+            self._ui(self._append_log, self._log, msg, tag)
+
+        class _BytesCodec(udsoncan.DidCodec):
+            def encode(self, v): return bytes(v)
+            def decode(self, p): return p
+            def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
+
+        # Get best IKA blob — prefer blob from CP Tools scan, fall back to known
+        ika_blob = KNOWN_IKA_BLOB
+        for tab in self.mw._tabs:
+            if hasattr(tab, "_blob_var"):
+                try:
+                    b = bytes.fromhex(tab._blob_var.get().replace(" ", ""))
+                    if len(b) == 34 and any(x != 0 for x in b):
+                        ika_blob = b
+                        log("  Using IKA blob from CP Tools tab\n", "ok")
+                        break
+                except Exception:
+                    pass
+
+        adopted = []   # (name, tx, rx, slot) successfully written
+
+        # ── Write IKA key to each unenrolled module ───────────────────────────
+        for mod_name, tx, rx, slot in self._unenrolled:
+            log(f"\n  {mod_name}  TX=0x{tx:03X}\n", "hdr")
+            try:
+                from cp_tools.j533_probe import J533Probe
+                probe = J533Probe(
+                    interface      = self.mw.interface,
+                    interface_path = self.mw.iface_path,
+                    ble_bridge     = getattr(self.mw, "ble_bridge", None),
+                )
+                cfg = dict(configs.default_client_config)
+                cfg["data_identifiers"] = {0x00BE: _BytesCodec}
+                cfg["request_timeout"]  = 10
+                conn = probe._make_conn(tx, rx)
+                with Client(conn, request_timeout=10, config=cfg) as c:
+                    c.change_session(
+                        udsoncan.services.DiagnosticSessionControl
+                        .Session.extendedDiagnosticSession)
+
+                    # SA2 unlock
+                    try:
+                        from sa2_seed_key.sa2_script import Sa2Algorithm
+                        sr = c.request_seed(0x03)
+                        key = Sa2Algorithm().compute_key(bytes(sr.service_data.seed))
+                        c.send_key(0x04, key)
+                        log("    SA2 unlocked\n", "ok")
+                    except Exception as e:
+                        log(f"    SA2 error: {e}\n", "err")
+                        continue
+
+                    # Check existing key — if populated skip write
+                    try:
+                        rv = c.read_data_by_identifier([0x00BE])
+                        existing = bytes(rv.service_data.values[0x00BE])
+                        if any(x != 0 for x in existing):
+                            log("    Already has IKA key - skipping write\n", "ok")
+                            adopted.append((mod_name, tx, rx, slot))
+                            continue
+                    except Exception:
+                        pass
+
+                    # Write IKA key
+                    c.write_data_by_identifier(0x00BE, ika_blob)
+                    # Verify readback
+                    rv2 = c.read_data_by_identifier([0x00BE])
+                    rb  = bytes(rv2.service_data.values[0x00BE])
+                    if rb == ika_blob:
+                        log(f"    IKA key written + verified\n", "ok")
+                        adopted.append((mod_name, tx, rx, slot))
+                    else:
+                        log("    Verify mismatch\n", "err")
+            except Exception as e:
+                log(f"    Error: {e}\n", "err")
+
+        if not adopted:
+            log("\nNo modules written — aborting constellation update.\n", "err")
+            self._ui(self._scan_btn.config, state="normal")
+            return
+
+        # ── Update J533 constellation — set bit for each adopted slot ─────────
+        log(f"\n  Updating constellation for {len(adopted)} adopted module(s)\n",
+            "hdr")
+        try:
+            from cp_tools.j533_probe import J533Probe
+            p533 = J533Probe(
+                interface      = self.mw.interface,
+                interface_path = self.mw.iface_path,
+                ble_bridge     = getattr(self.mw, "ble_bridge", None),
+            )
+            cfg2 = dict(configs.default_client_config)
+            cfg2["data_identifiers"] = {0x04A3: _BytesCodec}
+            cfg2["request_timeout"]  = 10
+            conn2 = p533._make_conn(0x710, 0x77A)
+            with Client(conn2, request_timeout=10, config=cfg2) as c2:
+                c2.change_session(
+                    udsoncan.services.DiagnosticSessionControl
+                    .Session.extendedDiagnosticSession)
+
+                # Read current constellation
+                rc = c2.read_data_by_identifier([0x04A3])
+                const = bytearray(rc.service_data.values[0x04A3])
+                log(f"  Before: {const.hex().upper()}\n", "dim")
+
+                # Set the bit for each adopted module slot
+                for _, _, _, slot in adopted:
+                    byte_i = slot // 8
+                    bit_i  = slot % 8
+                    if byte_i < len(const):
+                        const[byte_i] |= (1 << bit_i)
+                        log(f"  Slot {slot}: byte[{byte_i}] bit {bit_i} set\n",
+                            "ok")
+
+                # SA2 unlock J533
+                from sa2_seed_key.sa2_script import Sa2Algorithm
+                sr = c2.request_seed(0x03)
+                key = Sa2Algorithm().compute_key(bytes(sr.service_data.seed))
+                c2.send_key(0x04, key)
+
+                # Write updated constellation
+                c2.write_data_by_identifier(0x04A3, bytes(const))
+
+                # Verify
+                rv = c2.read_data_by_identifier([0x04A3])
+                rb = bytearray(rv.service_data.values[0x04A3])
+                log(f"  After:  {rb.hex().upper()}\n", "ok")
+
+                if rb == const:
+                    log("  Constellation updated\n", "ok")
+                    log("\nAdoption complete - cycle ignition then run Bus Scan.\n",
+                        "ok")
+                    self._ui(self._adopt_lbl.config,
+                             text=f"{len(adopted)} module(s) adopted",
+                             fg=C["green"])
+                else:
+                    log("  Verify mismatch\n", "err")
+
+        except Exception as e:
+            log(f"  Constellation error: {e}\n", "err")
+
+        self._ui(self._scan_btn.config, state="normal")
 
     def _reset_rows(self):
         for mod_name, row in self._module_rows.items():
@@ -2743,8 +2938,38 @@ class DiagTab(_Tab):
         source = "J533 topology" if j533_query_ok else "known address list"
         log(f"\n── Scan complete: {present_count} present  [{source}] ──────\n",
             "ok")
+        # Find unenrolled — present on bus but bit not set in constellation
+        self._unenrolled = []
+        self._scan_entries = entries if j533_query_ok and "entries" in dir() else []
+        if j533_query_ok and self._scan_entries:
+            for entry in self._scan_entries:
+                if entry.get("present") and not entry.get("coded"):
+                    can_id = entry.get("can_id")
+                    if can_id and can_id >= 0x700:
+                        name = entry.get("ecu_name_label", "unknown")
+                        slot = entry.get("slot", 0)
+                        self._unenrolled.append((f"{name} [s{slot}]",
+                                                  can_id, can_id + 8, slot))
+            if self._unenrolled:
+                n = len(self._unenrolled)
+                log(f"\n  ⊕ {n} module(s) on bus but NOT in constellation:\n",
+                    "warn")
+                for nm, tx, _, sl in self._unenrolled:
+                    log(f"    {nm}  TX=0x{tx:03X}\n", "warn")
+                log("  Click ⊕ Adopt to enroll in J533 constellation.\n",
+                    "hdr")
+                self._ui(self._adopt_btn.config, state="normal")
+                self._ui(self._adopt_lbl.config,
+                         text=f"{n} new module(s) not enrolled",
+                         fg=C["amber"])
+            else:
+                self._ui(self._adopt_lbl.config,
+                         text="all present modules enrolled",
+                         fg=C["green"])
+
         self._ui(self._summary_var.set,
-                 f"{'✓' if present_count else '—'}  {present_count} module(s) on bus")
+                 ("{} {} module(s) on bus".format(
+                   "✓" if present_count else "—", present_count)))
         self._ui(self._summary_lbl.config,
                  fg=C["green"] if present_count else C["muted"])
         self._ui(self._status_var.set,
