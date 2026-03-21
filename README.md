@@ -14,7 +14,7 @@ Companion repos:
 
 ## Download
 
-**[SimosSuite.exe — v0.2.0](https://github.com/dspl1236/simos-suite/releases/download/v0.2.0/SimosSuite.exe)**  (Windows x64, 27 MB)
+**[SimosSuite.exe — latest](https://github.com/dspl1236/simos-suite/releases/latest)**  (Windows x64, ~30 MB)
 
 Windows x64, single file, no install required. SmartScreen will flag an
 unsigned binary on first run — click "More info" → "Run anyway". Source is
@@ -94,9 +94,8 @@ pip install git+https://github.com/bri3d/sa2_seed_key.git
 python build_exe.py
 ```
 
-GitHub Actions builds the EXE automatically on every push to `main` and
-attaches it as a downloadable artifact. Tagged releases (`v*`) publish to
-GitHub Releases automatically.
+GitHub Actions builds the EXE on every tagged release (`v*`) and publishes
+it to GitHub Releases automatically.
 
 ---
 
