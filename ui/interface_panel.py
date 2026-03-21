@@ -284,6 +284,26 @@ class InterfacePanel(tk.Frame):
                                       command=self._do_connect)
         self._connect_btn.pack(side="left")
 
+        # DEMO MODE button — simulates 3.0T TFSI CGWB + ZF8HP
+        self._demo_btn = tk.Button(
+            bottom,
+            text="▶  DEMO",
+            fg="#d29922",
+            bg=COLORS["btn"],
+            activeforeground="#d29922",
+            activebackground=COLORS["btn_hover"],
+            font=("Courier New", 10, "bold"),
+            relief="solid", bd=1,
+            highlightbackground="#d29922",
+            highlightthickness=1,
+            padx=10, pady=4,
+            cursor="hand2",
+            command=self._do_demo)
+        self._demo_btn.pack(side="left", padx=(6, 0))
+        tk.Label(bottom, text="Simos8.5 3.0T TFSI + ZF8HP simulation",
+                 fg=COLORS["text_dim"], bg=COLORS["surface"],
+                 font=("Courier New", 8)).pack(side="left", padx=(4, 0))
+
     # ── Interface list population ─────────────────────────────────────────────
 
     def _populate_list(self):
@@ -527,7 +547,42 @@ class InterfacePanel(tk.Frame):
 
     # ── Status / note helpers ─────────────────────────────────────────────────
 
+    # ── Demo Mode ─────────────────────────────────────────────────────────────
+
+    def _do_demo(self):
+        """
+        Launch simulation mode — Simos8.5 3.0T TFSI CGWB + ZF8HP.
+        Patches the mock connection into the suite so all tabs work
+        with realistic simulated data. No hardware needed.
+        """
+        if self._connected:
+            self._do_disconnect()
+
+        try:
+            from tests.sim_runner import (_install_mock_patch,
+                                           _install_interface_patch,
+                                           make_synthetic_cal,
+                                           start_sniff_generator)
+        except ImportError:
+            self._set_status(COLORS["red"],
+                             "Demo unavailable — tests/sim_runner.py not found")
+            return
+
+        # Install mock patches — routes all connections to MockConnection
+        _install_mock_patch("S85", "ZF8HP")
+        _install_interface_patch()
+
+        # Show demo banner in status
+        self._set_status(COLORS["amber"],
+                         "▶ SIMULATION MODE  — Simos8.5 3.0T TFSI CGWB + ZF8HP")
+        self._demo_btn.config(state="disabled", text="▶ DEMO (active)")
+
+        # Fire the on_connected callback with DEMO interface
+        # This triggers on_connect() on all tabs
+        self.after(200, lambda: self._on_connected("DEMO", "Simos8.5 3.0T TFSI CGWB"))
+
     def _set_status(self, dot_color: str, msg: str):
+
         self._status_dot.config(fg=dot_color)
         self._status_var.set(msg)
 
