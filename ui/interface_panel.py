@@ -124,13 +124,11 @@ class InterfacePanel(tk.Frame):
             tk.Label(title_left, text="●", fg=color,
                      bg=COLORS["surface"], font=("Menlo", 9)).pack(side="left")
 
-        tk.Label(title_bar, text="  hardware interface",
+        tk.Label(title_bar, text="  connect to vehicle",
                  fg=COLORS["text_muted"], bg=COLORS["surface"],
                  font=("Menlo", 11, "bold")).pack(side="left")
 
-        tk.Label(title_bar, text="transport/interfaces.py  ",
-                 fg=COLORS["text_dim"], bg=COLORS["surface"],
-                 font=("Menlo", 9)).pack(side="right")
+        # path label removed — not useful to end users
 
         # Body
         body = tk.Frame(self, bg=COLORS["bg"], padx=14, pady=12)
@@ -311,14 +309,16 @@ class InterfacePanel(tk.Frame):
             widget.destroy()
         self._iface_rows.clear()
 
-        all_ifaces = self._registry.all()
-        if not all_ifaces:
-            tk.Label(self._list_frame, text="no interfaces found — check drivers",
+        # Only show physically present / available interfaces
+        available = self._registry.available()
+        if not available:
+            tk.Label(self._list_frame,
+                     text="No hardware detected — plug in your interface and click ⟳ scan",
                      fg=COLORS["text_dim"], bg=COLORS["bg"],
-                     font=("Menlo", 9)).pack(anchor="w", pady=4)
+                     font=("Menlo", 9), anchor="w").pack(anchor="w", pady=8)
             return
 
-        for iface in all_ifaces:
+        for iface in available:
             self._add_iface_row(iface)
 
     def _add_iface_row(self, iface: InterfaceInfo):
@@ -481,13 +481,16 @@ class InterfacePanel(tk.Frame):
         self._populate_list()
         n = len(self._registry.available())
         self._refresh_btn.config(text="⟳  refresh", fg=COLORS["blue"])
-        self._set_status(COLORS["text_dim"],
-                         f"scan complete — {n} interface{'s' if n!=1 else ''} detected")
+        if n == 0:
+            self._set_status(COLORS["text_dim"],
+                             "no hardware detected — check connections")
+        else:
+            names = ", ".join(i.interface.split("_")[0]
+                              for i in self._registry.available())
+            self._set_status(COLORS["green"] if n else COLORS["text_dim"],
+                             f"{n} interface{'s' if n!=1 else ''} found: {names}")
         self._connect_btn.config(state="disabled")
-        self._show_note(
-            f"InterfaceRegistry.refresh() complete. "
-            f"{n} available: " +
-            ", ".join(i.interface for i in self._registry.available()))
+        self._hide_boxes()
 
     # ── Connect / Disconnect ──────────────────────────────────────────────────
 
