@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: [main, dev]
+    tags-ignore:
+      - 'v*'  # v* tags are handled by build_exe.yml
   pull_request:
     branches: [main]
 
