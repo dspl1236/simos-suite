@@ -301,12 +301,15 @@ class InterfaceRegistry:
                 notes     = "Connect ESP32 bridge via USB and check Device Manager.",
             ))
 
-        # J2534 DLLs — show all installed adapters as available (selectable)
-        # Cable detection happens at connect time, not scan time.
-        # This matches how VCDS/ODIS work — list drivers, fail gracefully if cable absent.
-        # Note: PassThruOpen probing is unreliable with 32-bit DLLs in 64-bit Python.
+        # J2534 DLLs — show all installed adapters, deduplicated by path
+        # Cable/hardware detection happens at connect time via PassThruOpen
         j2534_dlls = detect_j2534_dlls()
+        seen_paths = set()
         for name, dll_path in j2534_dlls:
+            norm = dll_path.lower()
+            if norm in seen_paths:
+                continue
+            seen_paths.add(norm)
             self._interfaces.append(InterfaceInfo(
                 name      = name,
                 interface = "J2534",
