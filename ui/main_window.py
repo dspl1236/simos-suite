@@ -2576,6 +2576,22 @@ class DiagTab(_Tab):
         self._run(self._bus_scan_task)
 
     def _bus_scan_task(self):
+        """
+        Smart bus scan — ask J533 first, fall back to hardcoded list.
+
+        Step 1: Query J533 DIDs:
+          0x2A2A  allocation table  — ECU IDs + name codes per slot
+          0x2A26  present bitmap    — which slots are online right now
+          0x2A2C  TP-Identifier     — TX CAN ID per slot
+
+        Step 2: decode_constellation() builds the real module list.
+          RX = TX + 8  (standard VAG UDS response offset).
+
+        Step 3: For each discovered module, attempt a diagnostic session.
+          Any response (positive or NRC) confirms presence.
+
+        Step 4: Fall back to SCAN_MODULES hardcoded list if J533 query fails.
+        """
         import udsoncan
         from udsoncan.client import Client
         from udsoncan import configs
@@ -2583,12 +2599,112 @@ class DiagTab(_Tab):
         def log(msg, tag=""):
             self._ui(self._append_log, self._log, msg, tag)
 
-        present_count = 0
-        seen_addrs = set()  # deduplicate by TX address
+        class _BytesCodec(udsoncan.DidCodec):
+            def encode(self, v): return bytes(v)
+            def decode(self, p): return p
+            def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
 
-        for mod_name, addr, tx, rx in SCAN_MODULES:
-            if tx in seen_addrs:
-                continue  # skip duplicate TX addresses
+        # ── Step 1: Query J533 topology ──────────────────────────────────────
+        gateway_modules = []   # [(display_name, tx, rx)]  from J533
+        j533_query_ok   = False
+
+        log("  Querying J533 topology (0x2A2A / 0x2A26 / 0x2A2C)...\n", "hdr")
+        try:
+            from cp_tools.j533_probe import J533Probe, ECU_NAME_MAP
+            probe_j533 = J533Probe(
+                interface      = self.mw.interface,
+                interface_path = self.mw.iface_path,
+                ble_bridge     = getattr(self.mw, "ble_bridge", None),
+            )
+            cfg = dict(configs.default_client_config)
+            cfg["data_identifiers"] = {
+                0x2A2A: _BytesCodec,
+                0x2A26: _BytesCodec,
+                0x2A2C: _BytesCodec,
+                0x04A3: _BytesCodec,
+            }
+            cfg["request_timeout"] = 5
+            conn = probe_j533._make_conn(0x710, 0x77A)
+            with Client(conn, request_timeout=5, config=cfg) as c:
+                c.change_session(
+                    udsoncan.services.DiagnosticSessionControl
+                    .Session.extendedDiagnosticSession)
+
+                alloc_raw   = None
+                present_raw = None
+                tp_id_raw   = None
+                coded_raw   = bytes(10)
+
+                for did, label in [(0x04A3, "constellation"),
+                                   (0x2A2A, "allocation"),
+                                   (0x2A26, "present bitmap"),
+                                   (0x2A2C, "TP-IDs")]:
+                    try:
+                        r = c.read_data_by_identifier([did])
+                        raw = bytes(r.service_data.values[did])
+                        if did == 0x04A3: coded_raw   = raw
+                        if did == 0x2A2A: alloc_raw   = raw
+                        if did == 0x2A26: present_raw = raw
+                        if did == 0x2A2C: tp_id_raw   = raw
+                        log(f"    0x{did:04X} {label}: "
+                            f"{raw.hex().upper()[:32]}{'...' if len(raw)>16 else ''}\n",
+                            "ok")
+                    except Exception as e:
+                        log(f"    0x{did:04X} {label}: {e}\n", "warn")
+
+            # Decode into module list
+            from cp_tools.j533_probe import J533Probe
+            entries = J533Probe.decode_constellation(
+                coded_raw, alloc_raw, present_raw, tp_id_raw)
+
+            for entry in entries:
+                can_id = entry.get("can_id")
+                if not can_id or can_id < 0x700:
+                    continue  # no valid CAN ID
+                tx = can_id
+                rx = can_id + 8   # standard VAG UDS response offset
+                label = entry.get("ecu_name_label", "?")
+                slot  = entry.get("slot", "?")
+                present = entry.get("present", False)
+                name = f"{label}  [slot {slot}]"
+                gateway_modules.append((name, tx, rx, present))
+
+            if gateway_modules:
+                j533_query_ok = True
+                log(f"  J533 reports {len(gateway_modules)} module slot(s)\n", "ok")
+            else:
+                log("  J533 returned empty topology — falling back\n", "warn")
+
+        except Exception as e:
+            log(f"  J533 topology query failed: {e}\n  Falling back to known address list\n",
+                "warn")
+
+        # ── Step 2: Build scan list ───────────────────────────────────────────
+        if j533_query_ok:
+            # Use J533's list — these are the real modules on this car
+            scan_list = [(name, tx, rx) for name, tx, rx, _ in gateway_modules]
+            log(f"\n  Scanning {len(scan_list)} module(s) from J533 topology:\n",
+                "hdr")
+        else:
+            # Fallback to hardcoded VAG C7 list
+            scan_list = [(name, tx, rx) for name, _, tx, rx in SCAN_MODULES]
+            log(f"\n  Scanning {len(scan_list)} known VAG C7 addresses (fallback):\n",
+                "hdr")
+
+        # ── Step 3: Probe each module ─────────────────────────────────────────
+        # For J533-discovered modules we build dynamic rows, not using the
+        # pre-built grid rows. Reset grid and rebuild dynamically.
+        if j533_query_ok:
+            self._ui(self._rebuild_grid_dynamic, gateway_modules)
+            import time; time.sleep(0.1)  # let UI rebuild
+
+        present_count = 0
+        seen_tx = set()
+
+        for mod_name, tx, rx in scan_list:
+            if tx in seen_tx:
+                continue
+            seen_tx.add(tx)
 
             try:
                 from cp_tools.j533_probe import J533Probe
@@ -2597,60 +2713,92 @@ class DiagTab(_Tab):
                     interface_path = self.mw.iface_path,
                     ble_bridge     = getattr(self.mw, "ble_bridge", None),
                 )
-                cfg = dict(configs.default_client_config)
-                cfg["request_timeout"] = 2  # short timeout for bus scan
-                conn = probe._make_conn(tx, rx)
-                with Client(conn, request_timeout=2, config=cfg) as c:
-                    # Try default session — any response means module is present
-                    c.change_session(
+                cfg2 = dict(configs.default_client_config)
+                cfg2["request_timeout"] = 2
+                conn2 = probe._make_conn(tx, rx)
+                with Client(conn2, request_timeout=2, config=cfg2) as c2:
+                    c2.change_session(
                         udsoncan.services.DiagnosticSessionControl
                         .Session.defaultSession)
-                    # Module responded
-                    present_count += 1
-                    seen_addrs.add(tx)
-                    self._present[mod_name] = (tx, rx)
-                    self._ui(self._module_rows[mod_name]["status"].config,
-                             text="present", fg=C["green"])
-                    self._ui(self._module_rows[mod_name]["cb"].config,
-                             state="normal")
-                    self._ui(self._module_vars[mod_name].set, True)
-                    log(f"  ✓ {mod_name:<28} TX=0x{tx:03X}\n", "ok")
+                present_count += 1
+                self._present[mod_name] = (tx, rx)
+                self._ui(self._set_row_status, mod_name,
+                         "present", C["green"], enable_cb=True)
+                log(f"  ✓ {mod_name:<35} TX=0x{tx:03X}\n", "ok")
 
             except udsoncan.exceptions.NegativeResponseException:
-                # Got a response (even negative) — module IS present
                 present_count += 1
-                seen_addrs.add(tx)
                 self._present[mod_name] = (tx, rx)
-                self._ui(self._module_rows[mod_name]["status"].config,
-                         text="present", fg=C["green"])
-                self._ui(self._module_rows[mod_name]["cb"].config,
-                         state="normal")
-                self._ui(self._module_vars[mod_name].set, True)
-                log(f"  ✓ {mod_name:<28} TX=0x{tx:03X} (NRC response)\n", "ok")
+                self._ui(self._set_row_status, mod_name,
+                         "present", C["green"], enable_cb=True)
+                log(f"  ✓ {mod_name:<35} TX=0x{tx:03X} (NRC)\n", "ok")
 
             except Exception as e:
-                err = str(e).lower()
-                if "timeout" in err:
-                    self._ui(self._module_rows[mod_name]["status"].config,
-                             text="absent", fg=C["dim"])
+                if "timeout" in str(e).lower():
+                    self._ui(self._set_row_status, mod_name, "absent", C["dim"])
                 else:
-                    self._ui(self._module_rows[mod_name]["status"].config,
-                             text="error", fg=C["amber"])
-                    log(f"  ? {mod_name:<28} {str(e)[:40]}\n", "warn")
+                    self._ui(self._set_row_status, mod_name, "error", C["amber"])
+                    log(f"  ? {mod_name:<35} {str(e)[:35]}\n", "warn")
 
-        log(f"\n── Scan complete: {present_count} modules present ──────────────\n",
+        source = "J533 topology" if j533_query_ok else "known address list"
+        log(f"\n── Scan complete: {present_count} present  [{source}] ──────\n",
             "ok")
         self._ui(self._summary_var.set,
-                 f"{'✓' if present_count else '—'}  {present_count} module(s) found on bus")
+                 f"{'✓' if present_count else '—'}  {present_count} module(s) on bus")
         self._ui(self._summary_lbl.config,
                  fg=C["green"] if present_count else C["muted"])
         self._ui(self._status_var.set,
-                 f"{present_count} modules — click Read DTCs")
+                 f"{present_count} modules found — click Read DTCs")
         self._ui(self._scan_btn.config, state="normal")
-
         if present_count:
             self._ui(self._dtc_btn.config, state="normal")
             self._ui(self._sel_all_btn.config, state="normal")
+
+    def _rebuild_grid_dynamic(self, gateway_modules):
+        """Rebuild module grid rows from J533 topology (dynamic — any car)."""
+        # Clear existing rows
+        for widget in self._grid_frame.winfo_children():
+            widget.destroy()
+        self._module_rows.clear()
+        self._module_vars.clear()
+
+        for name, tx, rx, present in gateway_modules:
+            var = tk.BooleanVar(value=False)
+            self._module_vars[name] = var
+            row = _frame(self._grid_frame, bg=C["surface"])
+            row.pack(fill="x", pady=1)
+            cb = tk.Checkbutton(row, variable=var,
+                                bg=C["surface"], fg=C["green"],
+                                activebackground=C["surface"],
+                                selectcolor=C["bg"], state="disabled")
+            cb.grid(row=0, column=0, padx=2)
+            tk.Label(row, text=name, bg=C["surface"], fg=C["muted"],
+                     font=("Courier New", 10), width=35,
+                     anchor="w").grid(row=0, column=1, padx=2, sticky="w")
+            status_lbl = tk.Label(row,
+                text="online" if present else "—",
+                fg=C["green"] if present else C["dim"],
+                bg=C["surface"], font=("Courier New", 10), width=8, anchor="w")
+            status_lbl.grid(row=0, column=2, padx=2)
+            dtc_lbl = tk.Label(row, text="—", bg=C["surface"], fg=C["muted"],
+                                font=("Courier New", 10), width=8, anchor="w")
+            dtc_lbl.grid(row=0, column=3, padx=2)
+            codes_lbl = tk.Label(row, text="—", bg=C["surface"], fg=C["dim"],
+                                  font=("Courier New", 9), anchor="w", width=55)
+            codes_lbl.grid(row=0, column=4, padx=2, sticky="w")
+            self._module_rows[name] = {
+                "cb": cb, "status": status_lbl,
+                "dtc_count": dtc_lbl, "codes": codes_lbl
+            }
+
+    def _set_row_status(self, mod_name, text, color, enable_cb=False):
+        row = self._module_rows.get(mod_name)
+        if not row:
+            return
+        row["status"].config(text=text, fg=color)
+        if enable_cb:
+            row["cb"].config(state="normal")
+            self._module_vars[mod_name].set(True)
 
     # ── Read DTCs ─────────────────────────────────────────────────────────────
 
