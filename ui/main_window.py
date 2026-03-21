@@ -204,6 +204,20 @@ def _scrolled_text(parent, height=8, **kw):
     return f, t
 
 
+def _log_widget(parent, height=10, **kw):
+    """Create a scrolled log text widget. Returns the tk.Text widget directly."""
+    frame, text = _scrolled_text(parent, height=height, **kw)
+    frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+    # Tag colours for log entries
+    for tag, fg in [("ok",  C["green"]),
+                    ("err", C["red"]),
+                    ("warn",C["amber"]),
+                    ("hdr", C["blue"]),
+                    ("dim", C["dim"])]:
+        text.tag_config(tag, foreground=fg)
+    return text
+
+
 # ── Tab base ───────────────────────────────────────────────────────────────────
 
 class _Tab(tk.Frame):
