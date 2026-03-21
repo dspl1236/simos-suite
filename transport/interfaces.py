@@ -113,6 +113,32 @@ J2534_DLL_CANDIDATES = [
         "VNCI 6154A (drewlinq variant)",
         r"C:\Windows\SysWOW64\RP1210\drewlinq.dll",
     ),
+    # MongoosePro product line (Drew Technologies newer J2534 devices)
+    (
+        "MongoosePro ISO2",
+        r"C:\Program Files (x86)\Drew Technologies, Inc\J2534\MongoosePro ISO2\MongooseProISO2.dll",
+    ),
+    (
+        "MongoosePro VW",
+        r"C:\Program Files (x86)\Drew Technologies, Inc\J2534\MongoosePro VW\MongooseProVW.dll",
+    ),
+    (
+        "MongoosePro ISO2 (alt path)",
+        r"C:\Drew Technologies, Inc\J2534\MongoosePro ISO2\MongooseProISO2.dll",
+    ),
+    (
+        "MongoosePro VW (alt path)",
+        r"C:\Drew Technologies, Inc\J2534\MongoosePro VW\MongooseProVW.dll",
+    ),
+    # SL1 J2534 (Switchleg dongle)
+    (
+        "SL1 J2534 (32-bit)",
+        r"C:\Program Files (x86)\SL1 J2534\sl1j2534.dll",
+    ),
+    (
+        "SL1 J2534 (64-bit)",
+        r"C:\Program Files (x86)\SL1 J2534\sl1j2534x64.dll",
+    ),
     # Ross-Tech HEX-NET and HEX-V2 are NOT J2534 compatible.
     # They are proprietary VCDS-only devices. Ross-Tech explicitly states
     # the HEX-NET cannot emulate a PassThru interface and is unlikely to
