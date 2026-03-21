@@ -488,9 +488,7 @@ class HardwareTab(ttk.Frame):
                 if t == "BLE":
                     from transport.ble_bridge import BLEBridgeSync
                     bridge = BLEBridgeSync()
-                    # v1.03+ firmware requires password auth
-                    pw = getattr(self, "_ble_pw_var", None)
-                    if pw: bridge.set_password(pw.get())
+                    # BLE2 password sent automatically during connect
                     devices = bridge.scan(timeout=6.0)
                     if not devices:
                         raise RuntimeError("No BLE device found — is ESP32 powered?")
