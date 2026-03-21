@@ -23,6 +23,10 @@
 import sys
 import os
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules
+
+# Collect all email submodules — pkg_resources runtime hook needs them
+_email_imports = collect_submodules('email')
 
 block_cipher = None
 
@@ -44,15 +48,8 @@ a = Analysis(
         ('LICENSE',                    '.'),
     ],
     hiddenimports=[
-          # stdlib — pkg_resources needs these explicitly in PyInstaller
-          'email',
-          'email.mime',
-          'email.mime.text',
-          'email.mime.multipart',
-          'email.mime.base',
-          'email.generator',
-          'email.parser',
-          'email.policy',
+          # stdlib — pkg_resources runtime hook needs all email submodules
+          *_email_imports,
           'pkg_resources',
           'pkg_resources._vendor',
           'pkg_resources.extern',
@@ -143,11 +140,9 @@ a = Analysis(
         # large unused modules
         'tkinter.test',
         'xmlrpc',
-        'email',
-        'html',
-        'http',
-        'urllib3',
         'multiprocessing',
+        # NOTE: do NOT exclude email, html, http, urllib3 —
+        # pkg_resources runtime hook (pyi_rth_pkgres.py) needs them
     ],
     noarchive=False,
     optimize=1,
