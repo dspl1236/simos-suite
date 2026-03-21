@@ -114,8 +114,6 @@ RAW_SNIFF_CAN_ID       = 0xCAFE  # txID/rxID used for raw CAN sniff frames
 
 # ─── State ───────────────────────────────────────────────────────────────────
 
-BLE_DEFAULT_PASSWORD = "BLE2"   # v1.03+ firmware default
-
 class BridgeState(Enum):
     DISCONNECTED  = auto()
     SCANNING      = auto()
@@ -329,9 +327,8 @@ class BLEBridge:
         await self._client.write_gatt_char(BLE_CHAR_CMD_UUID, payload,
                                            response=False)
 
-    async def _authenticate(self, password: str = None):
-        if password is None:
-            password = getattr(self, "_password", BLE_DEFAULT_PASSWORD)
+    async def _authenticate(self):
+        password = "BLE2"  # Switchleg v1.03+ default — public in firmware repo
         """
         Send password to v1.03+ firmware before any UDS traffic.
         v1.03 release notes: 'BLE is now password protected'.
