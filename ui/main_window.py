@@ -125,6 +125,51 @@ def _btn(parent, text, cmd, primary=False, **kw):
     return b
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tooltip — lightweight hover hint for any widget
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _Tooltip:
+    """Shows a small popup when mouse hovers over a widget."""
+    def __init__(self, widget, text, delay=600):
+        self._w, self._text, self._delay = widget, text, delay
+        self._id = self._win = None
+        widget.bind("<Enter>",  self._enter, add="+")
+        widget.bind("<Leave>",  self._leave, add="+")
+        widget.bind("<Button>", self._leave, add="+")
+
+    def _enter(self, _=None):
+        self._id = self._w.after(self._delay, self._show)
+
+    def _leave(self, _=None):
+        if self._id:
+            self._w.after_cancel(self._id)
+            self._id = None
+        if self._win:
+            self._win.destroy()
+            self._win = None
+
+    def _show(self):
+        if self._win:
+            return
+        x = self._w.winfo_rootx() + self._w.winfo_width() // 2
+        y = self._w.winfo_rooty() + self._w.winfo_height() + 4
+        self._win = tw = tk.Toplevel(self._w)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.configure(bg=C["border"])
+        f = tk.Frame(tw, bg=C["surface"], padx=6, pady=3)
+        f.pack(padx=1, pady=1)
+        tk.Label(f, text=self._text, bg=C["surface"], fg=C["text"],
+                 font=("Courier New", 8), justify="left",
+                 wraplength=300).pack()
+
+
+def tip(widget, text):
+    """Attach a hover tooltip to any widget."""
+    _Tooltip(widget, text)
+
+
 def _frame(parent, bg=None, **kw):
     return tk.Frame(parent, bg=bg or C["bg"], **kw)
 
@@ -293,6 +338,7 @@ class EcuInfoTab(_Tab):
         self._read_btn = _btn(bot, "read ECU info", self._do_read,
                               primary=True, state="disabled")
         self._read_btn.pack(side="left")
+        tip(self._read_btn, 'Read calibration block from ECU into Tune tab.\nRequires extended session + SA2 unlock.')
         self._status = tk.Label(bot, text="not connected",
                                 fg=C["dim"], bg=C["bg"],
                                 font=("Menlo", 10))
@@ -384,6 +430,8 @@ class FlashTab(_Tab):
                                self._do_write_cal, primary=True,
                                state="disabled")
         self._write_btn.pack(side="left", padx=(0, 8))
+        tip(self._write_btn, 'Write modified calibration back to ECU.\nRequires extended session + SA2 unlock.\nDo not interrupt once started.')
+        tip(self._write_btn, 'SA2 unlock + WriteDataByIdentifier(0x00BE).\nWrites IKA key to checked modules.\nVerifies readback after each write.')
 
         self._verify_btn = _btn(op_row, "verify checksum",
                                 self._do_verify, state="disabled")
@@ -1172,6 +1220,7 @@ class LoggerTab(_Tab):
                                self._toggle_log, primary=True,
                                state="disabled")
         self._start_btn.pack(side="left")
+        tip(self._start_btn, 'Start live DID polling. Data displays in gauges and exports to CSV.\nECU must be in extended diagnostic session.')
         _btn(bot, "clear log", lambda: self._clear_log(self._log)
              ).pack(side="left", padx=8)
         _btn(bot, "save CSV", self._save_csv).pack(side="left")
@@ -1384,6 +1433,7 @@ class CPToolsTab(_Tab):
         self._scan_btn = _btn(row1, "⟳  Scan All Modules",
                               self._do_scan, primary=True, state="disabled")
         self._scan_btn.pack(side="left")
+        tip(self._scan_btn, 'Reads DID 0x00BE from all CP modules.\nAuto-checks CP-active modules (all-zero key).\nRun with ignition on, ESP32 in OBD port.')
 
         self._write_btn = _btn(row1, "✎  Write IKA Key to Selected",
                                self._do_write, state="disabled")
@@ -1392,10 +1442,12 @@ class CPToolsTab(_Tab):
         self._const_btn = _btn(row1, "⊞  Update Constellation",
                                self._do_update_constellation, state="disabled")
         self._const_btn.pack(side="left", padx=(8, 0))
+        tip(self._const_btn, 'Writes known-good constellation to J533 DID 0x04A3.\nEnrols all fixed modules in the gateway.\nSA2 unlock on J533 required.')
 
         self._sel_all_btn = _btn(row1, "☑ Select All CP",
                                  self._select_all_cp, state="disabled")
         self._sel_all_btn.pack(side="right")
+        tip(self._sel_all_btn, "Tick all modules currently showing CP ACTIVE.\nUncheck any you don't want to fix.")
 
         # Row 2 — experimental options
         row2 = _frame(act)
@@ -1409,6 +1461,7 @@ class CPToolsTab(_Tab):
             self._do_zero_constellation,
             state="disabled")
         self._zero_const_btn.pack(side="left", padx=(8, 0))
+        tip(self._zero_const_btn, 'EXPERIMENTAL: writes 00x10 to DID 0x04A3.\nTests if J533 has a CP-disabled state.\nKnown-good value can always be restored.')
         tk.Label(row2,
                  text="writes 00×10 to DID 0x04A3 — tests if J533 has a CP-disabled state",
                  bg=C["surface"], fg=C["dim"],
@@ -1433,6 +1486,7 @@ class CPToolsTab(_Tab):
         self._ign_btn = _btn(self, "⚡  Cycle Ignition (guided)",
                              self._do_ignition_cycle, state="disabled")
         self._ign_btn.pack(fill="x", padx=14, pady=(2, 0))
+        tip(self._ign_btn, 'Guided ignition cycle with countdown timers.\nKey OFF (12s) then key ON (10s).\nAuto-rescans after J533 reinitialises.')
 
         # ── Constellation banner ───────────────────────────────────────────────
         const_card = _card(self, padx=10, pady=6)
@@ -2441,10 +2495,12 @@ class DiagTab(_Tab):
         self._dtc_btn = _btn(row1, "◈  Read DTCs",
                              self._do_read_dtcs, state="disabled")
         self._dtc_btn.pack(side="left", padx=(8, 0))
+        tip(self._dtc_btn, 'UDS 0x19 02 09 - reads stored and pending DTCs.\nShows P/C/B/U codes with confirmed/pending status.')
 
         self._clear_btn = _btn(row1, "✕  Clear DTCs (selected)",
                                self._do_clear_dtcs, state="disabled")
         self._clear_btn.pack(side="left", padx=(8, 0))
+        tip(self._clear_btn, 'UDS 0x14 FFFFFF - clears all DTCs from selected modules.\nConfirmation required. Re-run Read DTCs to confirm.')
 
         self._sel_all_btn = _btn(row1, "☑ Select All",
                                  self._select_all, state="disabled")
@@ -2457,6 +2513,7 @@ class DiagTab(_Tab):
             row2, "⊕  Adopt New Modules into Constellation",
             self._do_adopt, state="disabled")
         self._adopt_btn.pack(side="left")
+        tip(self._adopt_btn, 'Enroll modules present on bus but not in J533 constellation.\nUse after retrofitting hardware (night vision, new ECU etc).\nWrites IKA key + sets constellation bit per slot.')
         self._adopt_lbl = tk.Label(row2, text="",
             bg=C["surface"], fg=C["amber"],
             font=("Courier New", 9))
