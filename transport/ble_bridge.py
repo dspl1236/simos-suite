@@ -327,46 +327,16 @@ class BLEBridge:
         await self._client.write_gatt_char(BLE_CHAR_CMD_UUID, payload,
                                            response=False)
 
-    def _build_password(self, password: str) -> bytes:
-        """
-        Encode password using Simos Tools buildPassword() algorithm.
-        Reverse-engineered from ConnectionService.java (apk decompile).
-        i = 1234; for idx, ch: encoded = (ord(ch) + i) & 0xFF; i += 11 * idx
-        """
-        i = 1234
-        out = []
-        for idx, ch in enumerate(password):
-            out.append((ord(ch) + i) & 0xFF)
-            i += 11 * idx
-        return bytes(out)
-
     async def _authenticate(self):
         """
-        Send encoded password to v1.03+ firmware on CMD char (0xABF3).
-        Simos Tools does NOT send raw password — uses buildPassword() encoding.
-        cmdFlags = SETTINGS(0x80) | SET_GET(0x40) | PASSWORD(0x07) = 0xC7.
-        Frame: [0xF1][0xC7][0x00 0x00][0x00 0x00][len][0x00][encoded_pw...]
-        "BLE2" encodes to: 14 1E 22 25
+        FunkBridge firmware has PASSWORD_CHECK disabled — no auth needed.
+        This is a no-op kept for interface compatibility.
+        Switchleg v0.90 also needs no auth.
+        Switchleg v1.03+ ignores unknown command flags gracefully.
         """
-        import struct
-        password = "BLE2"   # v1.03 default; change if custom password set
-        encoded = self._build_password(password)
-        cmd_flags = 0x80 | 0x40 | 0x07   # SETTINGS | SET_GET | PASSWORD = 0xC7
-        header = struct.pack("<BBHHH",
-            BLE_HEADER_ID,
-            cmd_flags,
-            0,              # rxID = 0 for settings frames
-            0,              # txID = 0 for settings frames
-            len(encoded)
-        )
-        payload = header + encoded
-        try:
-            await self._client.write_gatt_char(BLE_CHAR_CMD_UUID, payload,
-                                               response=False)
-            await asyncio.sleep(0.4)
-            log.debug("BLE password sent (encoded): %s", encoded.hex())
-        except Exception as e:
-            log.warning("BLE password send failed (older firmware?): %s", e)
+        await asyncio.sleep(0.1)   # brief settle after subscribe
+        log.debug("BLE auth: no password required (FunkBridge firmware)")
+
     def _on_notify(self, char_handle, data: bytearray):
         raw = bytes(data)
         log.debug("RX %d bytes: %s", len(raw), raw.hex())
