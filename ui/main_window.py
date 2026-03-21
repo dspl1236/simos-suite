@@ -3431,7 +3431,7 @@ class MainWindow(tk.Tk):
         self.ble_bridge   — BLEBridgeSync instance or None
     """
 
-    VERSION = "0.3.1"
+    VERSION = "0.3.2"
 
     def __init__(self, ecu_key: Optional[str] = None):
         super().__init__()
