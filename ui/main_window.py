@@ -762,7 +762,7 @@ class TuneTab(_Tab):
                  fg=C["muted"], bg=C["bg"], font=("Menlo", 9), anchor="w",
                  padx=14).pack(fill="x")
         tk.Label(self, textvariable=self._notes_var,
-                 fg="#3fb95090", bg=C["bg"], font=("Menlo", 9),
+                 fg="#3fb950", bg=C["bg"], font=("Menlo", 9),
                  anchor="w", padx=14, wraplength=900).pack(fill="x")
 
         # Chart area (shown only for 1×N tables)
