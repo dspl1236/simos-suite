@@ -3,103 +3,72 @@ name: CI
 on:
   push:
     branches: [main, dev]
-    tags:
-      - 'v*'
   pull_request:
     branches: [main]
+  # EXE build is triggered manually:
+  #   git tag v1.0.0 && git push origin v1.0.0
+  push_tag:
+    tags: ['v*']
 
 permissions:
   contents: write
 
 jobs:
-  # ── Tests — run on every push ───────────────────────────────────────────────
+  # Tests run on every commit to main — no EXE, no artifact
   test:
-    name: Tests (Python ${{ matrix.python-version }})
+    name: Tests
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11"]
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-
+          python-version: "3.11"
       - name: Install deps
         run: |
           pip install numpy
           pip install git+https://github.com/bri3d/sa2_seed_key.git || true
-
       - name: Headless smoke test
         run: python -m tests.sim_runner --headless
-
-      - name: ECU + trans backend tests
+      - name: Backend tests
         run: |
           python -m tests.sim_ecu
           python -m tests.sim_trans
-
       - name: Import chain
-        run: |
-          python -c "from core.ecu_defs import SIMOS85; print('core OK')"
-          python -c "from tuner.cal_parser import CalParser; print('cal_parser OK')"
+        run: python -c "from core.ecu_defs import SIMOS85; from tuner.cal_parser import CalParser; print('OK')"
 
-  # ── Build EXE — only on v* tags, after tests pass ──────────────────────────
+  # EXE builds ONLY when a v* tag is pushed — after tests pass
   build-exe:
     name: Build Windows EXE
     needs: test
     runs-on: windows-latest
     if: startsWith(github.ref, 'refs/tags/v')
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           architecture: "x64"
-
       - name: Install dependencies
         shell: cmd
         run: |
           pip install pyinstaller
           pip install udsoncan bleak pyserial numpy pycryptodome python-can websocket-client
           pip install git+https://github.com/bri3d/sa2_seed_key.git
-
       - name: Build EXE
         shell: cmd
         run: python build_exe.py --no-test --no-upx
-
-      - name: Verify EXE
-        shell: cmd
-        run: |
-          if not exist dist\SimosSuite.exe (
-            echo ERROR: SimosSuite.exe not found
-            exit /b 1
-          )
-          dir dist\SimosSuite.exe
-
-      - name: Get version from tag
-        id: version
+      - name: Get version
+        id: ver
         shell: python
         run: |
           import os
-          ref = os.environ.get('GITHUB_REF', '')
-          version = ref.replace('refs/tags/', '') if ref.startswith('refs/tags/') else 'dev'
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f'version={version}\n')
-          print(f'Version: {version}')
-
+          version = os.environ.get('GITHUB_REF','').replace('refs/tags/','')
+          open(os.environ['GITHUB_OUTPUT'],'a').write(f'v={version}\n')
       - name: Rename EXE
         shell: cmd
-        run: copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.version.outputs.version }}.exe"
-
-      - name: Attach to release
+        run: copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.ver.outputs.v }}.exe"
+      - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/SimosSuite-${{ steps.version.outputs.version }}.exe
+          files: dist/SimosSuite-${{ steps.ver.outputs.v }}.exe
           fail_on_unmatched_files: true
