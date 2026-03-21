@@ -104,10 +104,28 @@ J2534_DLL_CANDIDATES = [
         "Mongoose J2534 (Bosch alt path)",
         r"C:\Program Files\Bosch\Mongoose\monj2534.dll",
     ),
-    # VNCI 6154A (OpenShell / clone)
+    # VNCI / SVCI 6154A — installs as VAS6154A network adapter
+    # Communicates over virtual network interface, not COM port
+    # DLL handles network transport internally — PassThruOpen works normally
     (
         "VNCI 6154A (OpenShell)",
         r"C:\Program Files (x86)\OpenShell\vcdc.dll",
+    ),
+    (
+        "VNCI 6154A (OpenShell x64)",
+        r"C:\Program Files\OpenShell\vcdc.dll",
+    ),
+    (
+        "VNCI 6154A (STIC variant)",
+        r"C:\Program Files (x86)\STIC\VAS6154\vcdc.dll",
+    ),
+    (
+        "VNCI 6154A (System32 variant)",
+        r"C:\Windows\System32\vcdc.dll",
+    ),
+    (
+        "VNCI 6154A (SysWOW64 variant)",
+        r"C:\Windows\SysWOW64\vcdc.dll",
     ),
     (
         "VNCI 6154A (drewlinq variant)",

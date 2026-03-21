@@ -521,7 +521,17 @@ class InterfacePanel(tk.Frame):
                     if result == 0:
                         dll.PassThruClose(dev_id)
                     else:
-                        err = f"Cable not detected (PassThruOpen error 0x{result:08X})"
+                        # Common J2534 error codes
+                        err_map = {
+                            0x00000001: "Device not connected — check cable/adapter",
+                            0x00000002: "Invalid channel ID",
+                            0x00000004: "Not supported",
+                            0x00000008: "Null parameter",
+                            0x00000010: "Invalid protocol",
+                            0x00000100: "Device not connected — check network adapter (VNCI)",
+                        }
+                        msg = err_map.get(result, f"PassThruOpen error 0x{result:08X}")
+                        err = f"Connection failed: {msg}"
                 except OSError as e:
                     if "not a valid Win32 application" in str(e) or "wrong architecture" in str(e).lower():
                         err = "32-bit DLL cannot load in 64-bit process — use the 64-bit DLL variant"
