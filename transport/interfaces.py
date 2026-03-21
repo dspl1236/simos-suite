@@ -301,36 +301,18 @@ class InterfaceRegistry:
                 notes     = "Connect ESP32 bridge via USB and check Device Manager.",
             ))
 
-        # J2534 DLLs — probe each to check if hardware is physically connected
-        # available=True means DLL loaded AND PassThruOpen succeeded (cable present)
-        # available=False means DLL found on disk but no hardware detected
+        # J2534 DLLs — show all installed adapters as available (selectable)
+        # Cable detection happens at connect time, not scan time.
+        # This matches how VCDS/ODIS work — list drivers, fail gracefully if cable absent.
+        # Note: PassThruOpen probing is unreliable with 32-bit DLLs in 64-bit Python.
         j2534_dlls = detect_j2534_dlls()
         for name, dll_path in j2534_dlls:
-            hw_present = False
-            try:
-                import ctypes, platform as _plat
-                if _plat.system() == "Windows":
-                    dll = ctypes.WinDLL(dll_path)
-                    # PassThruOpen(pName=NULL, pDeviceID)
-                    dev_id = ctypes.c_ulong(0)
-                    result = dll.PassThruOpen(None, ctypes.byref(dev_id))
-                    if result == 0:  # STATUS_NOERROR
-                        hw_present = True
-                        # Close it immediately
-                        try:
-                            dll.PassThruClose(dev_id)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
             self._interfaces.append(InterfaceInfo(
                 name      = name,
                 interface = "J2534",
                 path      = dll_path,
-                available = hw_present,
-                notes     = ("Cable detected — ready to connect"
-                             if hw_present
-                             else "Driver installed — cable not detected"),
+                available = True,
+                notes     = "J2534 PassThru — plug in cable then connect",
             ))
 
         # FunkBridge WiFi (AP or Station mode)
