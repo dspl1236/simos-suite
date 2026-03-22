@@ -1724,7 +1724,9 @@ class CPToolsTab(_Tab):
                 # open() only starts the rxthread. __enter__ returns self (no-op).
                 # Must call conn.open() explicitly so the rxthread starts and
                 # responses from PassThruReadMsgs are delivered to udsoncan.
-                conn.open()
+                # `with Client(conn) as client` calls Client.__enter__ → conn.open()
+                # Do NOT call conn.open() explicitly — double-open creates two
+                # rxthreads competing on the same J2534 channel → deadlock.
                 with Client(conn, request_timeout=10, config=cfg) as client:
                     client.change_session(
                         udsoncan.services.DiagnosticSessionControl
