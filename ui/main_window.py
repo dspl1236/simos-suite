@@ -3145,7 +3145,7 @@ class DiagTab(_Tab):
                 "dtc_count": dtc_lbl, "codes": codes_lbl
             }
 
-    def _set_row_status(self, mod_name, text, color, False):
+    def _set_row_status(self, mod_name, text, color, enable_cb=False):
         row = self._module_rows.get(mod_name)
         if not row:
             return
