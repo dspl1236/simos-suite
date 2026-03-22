@@ -189,23 +189,58 @@ def _make_security_algo(sa2_script: bytes):
 
 # ─── Block crypto ────────────────────────────────────────────────────────────
 
-def _prepare_block_data(ecu: ECUDef, block_num: int, raw_bytes: bytes) -> bytes:
+def _prepare_block_data(ecu: ECUDef, block_num: int, raw_bytes: bytes,
+                         asw1_bytes: bytes = None) -> bytes:
     """
-    Encrypt a block for transmission.
-    Simos8: XOR counter (in-place, symmetric).
-    Simos12/18: AES-CBC.
+    Prepare a block for UDS TransferData:
+      1. Fix ECM3 checksum (CAL only, 64-bit summation)
+      2. Fix CRC32 checksum (VW 0x4C11DB7 poly, all blocks)
+      3. LZSS compress
+      4. XOR encrypt (Simos8) or AES-CBC (Simos12/18)
+
+    DataFormatIdentifier sent in RequestDownload: compression=0xA, encryption=0xA
+    Both flags mean the same algorithm (LZSS then XOR for Simos8).
     """
+    from flasher.checksum_simos import fix_crc32, fix_ecm3, xor_encrypt
+    from flasher.lzss_compress  import lzss_compress
+
+    data = raw_bytes
+
+    # Step 1: Fix ECM3 checksum for CAL block
+    if ecu.crypto == CryptoType.XOR_COUNTER and block_num == 3:
+        try:
+            data = fix_ecm3(data, asw1_bytes)
+            log.debug("ECM3 checksum fixed for block %d", block_num)
+        except Exception as e:
+            log.warning("ECM3 fix failed (block %d): %s — continuing", block_num, e)
+
+    # Step 2: Fix CRC32 checksum
+    if block_num < 6:
+        try:
+            data = fix_crc32(data, block_num)
+            log.debug("CRC32 fixed for block %d", block_num)
+        except Exception as e:
+            log.warning("CRC32 fix failed (block %d): %s — continuing", block_num, e)
+
+    # Step 3: LZSS compress
+    try:
+        compressed = lzss_compress(data)
+        log.debug("LZSS: block %d: %d -> %d bytes", block_num, len(data), len(compressed))
+    except Exception as e:
+        log.warning("LZSS failed (block %d): %s — sending uncompressed", block_num, e)
+        compressed = data
+
+    # Step 4: Encrypt
     if ecu.crypto == CryptoType.XOR_COUNTER:
-        return ecu.xor_encrypt(raw_bytes)
+        return xor_encrypt(compressed)
     elif ecu.crypto == CryptoType.AES_CBC:
         from Crypto.Cipher import AES
+        pad = (16 - len(compressed) % 16) % 16
+        padded = compressed + b"\x00" * pad
         cipher = AES.new(ecu.crypto_key, AES.MODE_CBC, ecu.crypto_iv)
-        # Pad to 16-byte boundary
-        pad = (16 - len(raw_bytes) % 16) % 16
-        padded = raw_bytes + b"\x00" * pad
         return cipher.encrypt(padded)
     else:
-        return raw_bytes
+        return compressed
 
 
 # ─── Main flash routine ───────────────────────────────────────────────────────
@@ -325,10 +360,12 @@ def flash_cal(
             callback(FlashProgress("ERROR", f"Security access denied: {e}", 0)); return False
         client.tester_present()
 
-        # 5. Write workshop code 0xF15A (VW_Flash)
+        # 5. Write workshop code 0xF15A (dynamic: date + ASW CRC8 + CAL fingerprint)
         try:
-            client.write_data_by_identifier(
-                0xF15A, bytes([0x20,0x04,0x20,0x42,0x04,0x20,0x42,0xB1,0x3D]))
+            from flasher.workshop_code import build_workshop_code
+            wc = build_workshop_code(cal_data=cal_bytes)
+            client.write_data_by_identifier(0xF15A, wc)
+            log.info("Workshop code written: %s", wc.hex().upper())
         except Exception as e:
             log.debug("Workshop code: %s", e)
         client.tester_present()
@@ -345,6 +382,7 @@ def flash_cal(
             log.info("[DRY RUN] Would erase block %d", cal_block.number)
 
         # 7. RequestDownload — address_format=8 (1-byte block ID, matches VW_Flash)
+        # Prepare block: ECM3 fix + CRC32 fix + LZSS compress + XOR encrypt
         encrypted = _prepare_block_data(ecu, cal_block.number, cal_bytes)
         total = len(encrypted)
         callback(FlashProgress("TRANSFER", "Requesting download…", 30, "CAL"))
