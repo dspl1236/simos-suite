@@ -25,6 +25,11 @@ import os
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 
+# Collect all submodules from our own packages
+_core_imports = collect_submodules('core')
+_ui_imports   = collect_submodules('ui')
+_tests_imports = collect_submodules('tests')
+
 # Collect all email submodules — pkg_resources runtime hook needs them
 _email_imports = collect_submodules('email')
 
@@ -50,6 +55,9 @@ a = Analysis(
     hiddenimports=[
           # stdlib — pkg_resources runtime hook needs all email submodules
           *_email_imports,
+          *_core_imports,
+          *_ui_imports,
+          *_tests_imports,
           'pkg_resources',
           'pkg_resources._vendor',
           'pkg_resources.extern',
