@@ -1706,13 +1706,14 @@ class CPToolsTab(_Tab):
                 # the bus scan topology query just used this channel.
                 log(f"\n  {mod_name}  TX=0x{tx:03X}  (gateway — skipped)\n", "dim")
                 continue
-            log(f"\n  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}\n", "hdr")
-            _mt.sleep(2.0)   # let previous J2534 channel fully close before opening next
+            log(f"\n  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}  probing...\n", "dim")
+            _mt.sleep(1.0)   # let previous J2534 channel fully close
             try:
                 from cp_tools.j533_probe import J533Probe
                 cfg = dict(configs.default_client_config)
                 cfg["data_identifiers"] = {IKA_DID: _BytesCodec}
-                cfg["request_timeout"]  = 10
+                cfg["request_timeout"]  = 3    # 3s per module — 9 modules = ~30s total
+                cfg["p2_timeout"]       = 1.0  # 1s for first response byte (Convenience CAN via J533)
 
                 conn = J533Probe(
                     interface      = self.mw.interface,
@@ -1738,6 +1739,8 @@ class CPToolsTab(_Tab):
                     all_zeros = all(b == 0 for b in raw)
                     short     = raw[:8].hex().upper() + "..."
 
+                    # Overwrite the "probing..." line header with the real result header
+                    log(f"  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}\n", "hdr")
                     if all_zeros:
                         cp_count += 1
                         set_row(mod_name,
