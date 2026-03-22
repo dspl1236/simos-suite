@@ -398,7 +398,8 @@ class EcuInfoTab(_Tab):
 
     def _show_error(self, msg: str):
         self._read_btn.config(state="normal")
-        self._status.config(text=f"error: {msg[:60]}", fg=C["red"])
+        self._status.config(text=f"error: {msg}", fg=C["red"])
+        import logging; logging.getLogger("SimosSuite.GUI").error("ECU info error: %s", msg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -688,7 +689,8 @@ class FlashTab(_Tab):
     def _flash_error(self, msg: str):
         self._set_buttons(True)
         self._log_line(f"exception: {msg}\n", "err")
-        self._prog_label.config(text=f"error: {msg[:50]}", fg=C["red"])
+        self._prog_label.config(text=f"error: {msg}", fg=C["red"])
+        import logging; logging.getLogger("SimosSuite.GUI").error("Flash error: %s", msg)
 
     def _set_buttons(self, enabled: bool):
         s = "normal" if enabled else "disabled"
