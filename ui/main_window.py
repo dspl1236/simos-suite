@@ -1712,11 +1712,16 @@ class CPToolsTab(_Tab):
                 from cp_tools.j533_probe import J533Probe
                 cfg = dict(configs.default_client_config)
                 cfg["data_identifiers"] = {IKA_DID: _BytesCodec}
-                # ISO 14229-2 timing: P2=50-100ms, P2*=1-5s, S3=5-10s
-                # use_server_timing=False: use our values, not ECU-reported timing
-                cfg["request_timeout"]   = 5    # overall per-request timeout
-                cfg["p2_timeout"]        = 0.15 # 150ms — 3x VAG P2 spec (50-100ms)
-                cfg["p2_star_timeout"]   = 5.0  # 5s for NRC 0x78 pending responses
+                # ISO 14229-2 timing for GATEWAY-ROUTED communication:
+                # Direct P2 = 50-100ms, but through J533 gateway add routing overhead:
+                #   Convenience CAN = 100kbps (5x slower than Diagnostic CAN 500kbps)
+                #   Routing: J255→100kbps→J533→500kbps→Mongoose adds ~60ms each way
+                #   NRC 0x25 = NoResponseFromSubnetComponent = gateway timeout
+                # Effective P2 for routed modules = ~250ms minimum, use 500ms for margin.
+                # use_server_timing=False: use our values, not ECU-reported ones
+                cfg["request_timeout"]   = 8    # 8s overall (includes J533 routing time)
+                cfg["p2_timeout"]        = 0.5  # 500ms — accounts for Convenience CAN routing
+                cfg["p2_star_timeout"]   = 5.0  # 5s for NRC 0x78 response pending
                 cfg["use_server_timing"] = False # ignore ECU-reported timing overrides
 
                 conn = J533Probe(
