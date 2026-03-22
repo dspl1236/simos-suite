@@ -172,15 +172,26 @@ class J2534Connection(BaseConnection):
 
                 if data is not None:
                     self.rxqueue.put(data)
-            except Exception:
-                self.logger.critical("Exiting J2534 rx thread")
+            except Exception as _e:
+                if not self.exit_requested:
+                    self.logger.warning("J2534 rxthread error: %s", _e)
                 self.exit_requested = True
 
     def close(self):
         self.exit_requested = True
-        self.rxthread.join()
-        self.interface.PassThruDisconnect(self.channelID)
-        self.interface.PassThruClose(self.devID)
+        # Disconnect BEFORE join so PassThruReadMsgs in rxthread gets an error
+        # and the thread exits cleanly. join() with timeout prevents infinite block.
+        try:
+            self.interface.PassThruDisconnect(self.channelID)
+        except Exception:
+            pass
+        try:
+            self.interface.PassThruClose(self.devID)
+        except Exception:
+            pass
+        self.rxthread.join(timeout=2.0)
+        if self.rxthread.is_alive():
+            self.logger.warning("J2534 rxthread still alive after close — daemon thread will be killed")
         self.opened = False
         self.logger.info("J2534 Connection closed")
 
