@@ -265,7 +265,10 @@ def flash_cal(
             callback(FlashProgress("ERROR", f"Session refused: {e}", 0))
             return False
 
-        client.session_timing["p2_server_max"] = 30
+        try:
+            client.session_timing["p2_server_max"] = 30
+        except TypeError:
+            client.session_timing.p2_server_max = 30
 
         # ── Read VIN for confirmation ─────────────────────────────────────────
         vin = "UNKNOWN"
@@ -457,7 +460,10 @@ def read_ecu_info(
     with Client(conn, request_timeout=10, config=cfg) as client:
         client.change_session(
             services.DiagnosticSessionControl.Session.extendedDiagnosticSession)
-        client.session_timing["p2_server_max"] = 30
+        try:
+            client.session_timing["p2_server_max"] = 30
+        except TypeError:
+            client.session_timing.p2_server_max = 30
         client.config["request_timeout"] = 30
 
         for did in ecu.info_dids:
