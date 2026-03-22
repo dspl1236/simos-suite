@@ -33,7 +33,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple
 
 import udsoncan
-from udsoncan.client import Client
+from udsoncan.client import Client  # noqa: F401
 from udsoncan import services, configs, exceptions
 
 log = logging.getLogger("SimosSuite.J533Probe")

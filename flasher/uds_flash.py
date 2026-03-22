@@ -23,7 +23,7 @@ from typing import Optional, Callable, Dict
 from dataclasses import dataclass
 
 import udsoncan
-from udsoncan.client import Client
+from udsoncan.client import Client  # noqa: F401
 from udsoncan import services, configs, exceptions
 
 from sa2_seed_key.sa2_seed_key import Sa2SeedKey

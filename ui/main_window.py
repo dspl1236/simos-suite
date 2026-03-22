@@ -559,7 +559,7 @@ class FlashTab(_Tab):
             cfg = dict(udsoncan.configs.default_client_config)
             cfg["request_timeout"] = 30
 
-            with udsoncan.Client(conn, request_timeout=30, config=cfg) as client:
+            with __import__("udsoncan").client.Client(conn, request_timeout=30, config=cfg) as client:
                 cb(FlashProgress("CONNECT", "Opening extended session...", 5))
                 client.change_session(
                     udsoncan.services.DiagnosticSessionControl
@@ -1667,7 +1667,7 @@ class CPToolsTab(_Tab):
 
     def _scan_task(self):
         import udsoncan
-        from udsoncan.client import Client
+        from udsoncan.client import Client  # noqa: F401
         from udsoncan import configs
 
         def log(msg, tag=""):
@@ -1924,7 +1924,7 @@ class CPToolsTab(_Tab):
 
     def _write_task(self, selected: list, blob: bytes):
         import udsoncan
-        from udsoncan.client import Client
+        from udsoncan.client import Client  # noqa: F401
         from udsoncan import configs
 
         def log(msg, tag=""):
@@ -2021,7 +2021,7 @@ class CPToolsTab(_Tab):
 
     def _constellation_task(self):
         import udsoncan
-        from udsoncan.client import Client
+        from udsoncan.client import Client  # noqa: F401
         from udsoncan import configs
 
         def log(msg, tag=""):
@@ -2145,7 +2145,7 @@ class CPToolsTab(_Tab):
 
     def _zero_constellation_task(self):
         import udsoncan
-        from udsoncan.client import Client
+        from udsoncan.client import Client  # noqa: F401
         from udsoncan import configs
 
         def log(msg, tag=""):
@@ -2714,7 +2714,7 @@ class DiagTab(_Tab):
 
     def _adopt_task(self):
         import udsoncan
-        from udsoncan.client import Client
+        from udsoncan.client import Client  # noqa: F401
         from udsoncan import configs
 
         def log(msg, tag=""):
@@ -2911,7 +2911,7 @@ class DiagTab(_Tab):
         Step 4: Fall back to SCAN_MODULES hardcoded list if J533 query fails.
         """
         import udsoncan
-        from udsoncan.client import Client
+        from udsoncan.client import Client  # noqa: F401
         from udsoncan import configs
 
         def log(msg, tag=""):
@@ -3174,7 +3174,7 @@ class DiagTab(_Tab):
 
     def _read_dtcs_task(self, selected: list):
         import udsoncan
-        from udsoncan.client import Client
+        from udsoncan.client import Client  # noqa: F401
         from udsoncan import configs
 
         def log(msg, tag=""):
@@ -3294,7 +3294,7 @@ class DiagTab(_Tab):
 
     def _clear_dtcs_task(self, selected: list):
         import udsoncan
-        from udsoncan.client import Client
+        from udsoncan.client import Client  # noqa: F401
         from udsoncan import configs
 
         def log(msg, tag=""):

@@ -264,7 +264,7 @@ class LogSession:
         }
         cfg["request_timeout"] = max(2.0, self.interval * 3)
 
-        with udsoncan.Client(conn, request_timeout=5, config=cfg) as client:
+        with __import__("udsoncan").client.Client(conn, request_timeout=5, config=cfg) as client:
             try:
                 client.change_session(
                     udsoncan.services.DiagnosticSessionControl
