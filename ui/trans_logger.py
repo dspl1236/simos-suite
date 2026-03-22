@@ -442,7 +442,7 @@ class TransLoggerTab(tk.Frame):
             C["green"], f"polling  {trans.project}  {trans.can_tx:#05x}→{trans.can_rx:#05x}"))
 
         try:
-            with UdsClient(conn, request_timeout=5, config=cfg) as client:
+            with __import__("udsoncan").client.Client(conn, request_timeout=5, config=cfg) as client:
                 try:
                     client.change_session(
                         udsoncan.services.DiagnosticSessionControl

@@ -1691,31 +1691,38 @@ class CPToolsTab(_Tab):
             def decode(self, p): return p
             def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
 
-        # Read J533 constellation first
-        try:
-            from cp_tools.j533_probe import J533Probe
-            probe_j533 = J533Probe(
-                interface      = self.mw.interface,
-                interface_path = self.mw.iface_path,
-                ble_bridge     = getattr(self.mw, "ble_bridge", None),
-            )
-            cfg_j533 = dict(configs.default_client_config)
-            cfg_j533["data_identifiers"] = {CONST_DID: _BytesCodec}
-            cfg_j533["request_timeout"]  = 5
-            conn_j533 = probe_j533._make_conn(0x710, 0x77A)
-            with Client(conn_j533, request_timeout=5, config=cfg_j533) as c:
-                c.change_session(
-                    udsoncan.services.DiagnosticSessionControl
-                    .Session.extendedDiagnosticSession)
-                r = c.read_data_by_identifier([CONST_DID])
-                const_bytes = bytes(r.service_data.values[CONST_DID])
-                self._const_before = const_bytes
-                self._ui(self._const_var.set,
-                         " ".join(f"{b:02X}" for b in const_bytes))
-                log(f"  J533 constellation: "
-                    f"{' '.join(f'{b:02X}' for b in const_bytes)}\n", "ok")
-        except Exception as e:
-            log(f"  J533 constellation read failed: {e}\n", "err")
+        # Read J533 constellation — retry once on failure
+        import time as _t
+        for _attempt in range(2):
+            try:
+                from cp_tools.j533_probe import J533Probe
+                _p533 = J533Probe(
+                    interface      = self.mw.interface,
+                    interface_path = self.mw.iface_path,
+                    ble_bridge     = getattr(self.mw, "ble_bridge", None),
+                )
+                _cfg533 = dict(configs.default_client_config)
+                _cfg533["data_identifiers"] = {CONST_DID: _BytesCodec}
+                _cfg533["request_timeout"]  = 8
+                _conn533 = _p533._make_conn(0x710, 0x77A)
+                with Client(_conn533, request_timeout=8, config=_cfg533) as _c:
+                    _c.change_session(
+                        udsoncan.services.DiagnosticSessionControl
+                        .Session.extendedDiagnosticSession)
+                    _r = _c.read_data_by_identifier([CONST_DID])
+                    const_bytes = bytes(_r.service_data.values[CONST_DID])
+                    self._const_before = const_bytes
+                    self._ui(self._const_var.set,
+                             " ".join(f"{b:02X}" for b in const_bytes))
+                    log(f"  J533 constellation: "
+                        f"{' '.join(f'{b:02X}' for b in const_bytes)}\n", "ok")
+                break
+            except Exception as e:
+                if _attempt == 0:
+                    log(f"  J533 constellation retry: {e}\n", "warn")
+                    _t.sleep(1.0)
+                else:
+                    log(f"  J533 constellation failed: {e} — continuing\n", "warn")
 
         # Scan each module
         self._scan_results = {}
@@ -1732,7 +1739,8 @@ class CPToolsTab(_Tab):
                 )
                 cfg = dict(configs.default_client_config)
                 cfg["data_identifiers"] = {IKA_DID: _BytesCodec}
-                cfg["request_timeout"]  = 5
+                cfg["request_timeout"]  = 8
+                import time as _mt; _mt.sleep(0.3)
                 conn   = probe._make_conn(tx, rx)
                 client = Client(conn, request_timeout=5, config=cfg)
                 client.__enter__()
