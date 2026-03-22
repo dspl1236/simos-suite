@@ -442,7 +442,53 @@ def read_ecu_info(
             return p.hex().upper()
         def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
 
+    # Per-DID codecs — handle binary/numeric DIDs correctly
+    class _VoltageCodec(udsoncan.DidCodec):
+        """0xF442 — uint16 big-endian, 0.001V per bit"""
+        def encode(self, v): return bytes(v)
+        def decode(self, p):
+            if len(p) >= 2:
+                return f"{int.from_bytes(p[:2], 'big') / 1000:.3f} V"
+            return p.hex()
+        def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
+
+    class _MileageCodec(udsoncan.DidCodec):
+        """0x295A/0x295B — uint32 big-endian, km"""
+        def encode(self, v): return bytes(v)
+        def decode(self, p):
+            if len(p) >= 4:
+                km = int.from_bytes(p[:4], 'big')
+                return f"{km:,} km"
+            if len(p) >= 2:
+                return f"{int.from_bytes(p, 'big'):,} km"
+            return p.hex()
+        def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
+
+    class _ByteCodec(udsoncan.DidCodec):
+        """Single-byte numeric DIDs"""
+        def encode(self, v): return bytes(v)
+        def decode(self, p): return str(p[0]) if p else "0"
+        def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
+
+    class _CounterCodec(udsoncan.DidCodec):
+        """Program attempt counters — uint16 or uint32"""
+        def encode(self, v): return bytes(v)
+        def decode(self, p):
+            if len(p) == 1: return str(p[0])
+            if len(p) == 2: return str(int.from_bytes(p, 'big'))
+            if len(p) >= 4: return str(int.from_bytes(p[:4], 'big'))
+            return str(int.from_bytes(p, 'big'))
+        def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
+
     did_codecs = {did: _StrCodec for did in ecu.info_dids}
+    # Override with specific codecs
+    did_codecs[0xF442] = _VoltageCodec
+    did_codecs[0x295A] = _MileageCodec
+    did_codecs[0x295B] = _MileageCodec
+    did_codecs[0x0405] = _ByteCodec
+    did_codecs[0x0407] = _CounterCodec
+    did_codecs[0x0408] = _CounterCodec
+    did_codecs[0xF186] = _ByteCodec
 
     DID_LABELS = {
         0xF190: "VIN",
