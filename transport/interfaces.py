@@ -360,6 +360,16 @@ class InterfaceRegistry:
         except Exception:
             pass
 
+        # Virtual mock — always available, routes to MockConnection (Simos8.5 sim)
+        self._interfaces.append(InterfaceInfo(
+            name      = "Virtual ECU (Simos8.5 3.0T simulation)",
+            interface = "MOCK",
+            path      = "mock://simos85",
+            available = True,
+            notes     = "Simulated Simos8.5 ECU — no hardware needed. "
+                        "Full UDS stack, CP Tools, live data all work.",
+        ))
+
         # SocketCAN (Linux only)
         if platform.system() == "Linux":
             can_ifaces = self._scan_socketcan()

@@ -510,11 +510,17 @@ class InterfacePanel(tk.Frame):
         self._hide_boxes()
 
         def _connect_task():
-            # J2534 DLLs are typically 32-bit and cannot be loaded directly
-            # by 64-bit Python ctypes. Hardware validation happens inside
-            # J2534Connection when the first UDS command is sent.
-            # For BLE, the ble_bridge handles scanning separately.
             import time
+            if interface == "MOCK":
+                # Install mock patches so all tabs use simulated data
+                try:
+                    from tests.sim_runner import (
+                        _install_mock_patch, _install_interface_patch,
+                        auto_connect_after_launch)
+                    _install_mock_patch("S85", "ZF8HP")
+                    _install_interface_patch()
+                except Exception:
+                    pass
             time.sleep(0.3)
             self.after(0, lambda: self._on_connected(interface, path))
 

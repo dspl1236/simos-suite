@@ -99,6 +99,15 @@ def _make_connection(ecu: ECUDef, interface: str, interface_path: Optional[str] 
         conn.tpsock.set_opts(txpad=0x55, tx_stmin=st_min_us)
         return conn
 
+    elif interface.upper() == "MOCK":
+        # Virtual mock connection — Simos8.5 simulation, no hardware needed
+        from tests.mock_connection import MockConnection, MockECU
+        from tests.sim_runner import _install_mock_patch
+        _install_mock_patch("S85", "ZF8HP")
+        conn = MockConnection(MockECU.SIMOS85)
+        conn.open()
+        return conn
+
     elif interface.upper() == "J2534":
         # J2534 PassThru DLL — Windows only, 32-bit DLL
         #
