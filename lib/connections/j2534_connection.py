@@ -132,6 +132,26 @@ class J2534Connection(BaseConnection):
         self.exit_requested = False
         self.opened = False
 
+    def reset_for_module(self, txid: int, rxid: int):
+        """
+        Retarget this connection to a different module without reopening the device.
+        Changes TX/RX filter and clears RX buffer only — no PassThruOpen/Connect.
+        This is the VW_Flash pattern for scanning multiple modules efficiently.
+        """
+        self.txid = txid
+        self.rxid = rxid
+        self.interface.txid = txid.to_bytes(4, "big")
+        self.interface.rxid = rxid.to_bytes(4, "big")
+        self.interface.PassThruStartMsgFilter(self.channelID, self.protocol.value)
+        self.interface.PassThruIoctl(self.channelID, Ioctl_ID.CLEAR_RX_BUFFER)
+        # Drain pending frames from previous module
+        while True:
+            try:
+                self.rxqueue.get_nowait()
+            except Exception:
+                break
+        self.logger.info("J2534 retargeted TX=0x%03X RX=0x%03X", txid, rxid)
+
     def resetCable(self):
         self.logger.info("Resetting cable/filter with Txid: " + str(hex(self.txid)))
         self.logger.info("Resetting cable/filter with rxid: " + str(hex(self.rxid)))
