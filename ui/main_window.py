@@ -1716,6 +1716,15 @@ class CPToolsTab(_Tab):
                              " ".join(f"{b:02X}" for b in const_bytes))
                     log(f"  J533 constellation: "
                         f"{' '.join(f'{b:02X}' for b in const_bytes)}\n", "ok")
+                # Return J533 to default session — extended session blocks
+                # forwarding of UDS messages to other modules via gateway
+                try:
+                    _c.change_session(
+                        udsoncan.services.DiagnosticSessionControl
+                        .Session.defaultSession)
+                    log("  J533 returned to default session\n", "dim")
+                except Exception:
+                    pass
                 break
             except Exception as e:
                 if _attempt == 0:
@@ -1724,9 +1733,10 @@ class CPToolsTab(_Tab):
                 else:
                     log(f"  J533 constellation failed: {e} — continuing\n", "warn")
 
-        # Let J533 session close and J2534 channel settle before module scan
+        # Wait for J533 to fully exit extended session (5s timeout)
+        # J533 as gateway blocks forwarded UDS while in extended diagnostic session
         import time as _t
-        _t.sleep(2.0)
+        _t.sleep(5.0)
 
         # Per-module scan — fresh connection each time with delay between.
         # The bus scan confirms individual J2534 connections work fine.
@@ -1740,7 +1750,7 @@ class CPToolsTab(_Tab):
                 log(f"\n  {mod_name}  (skipped — constellation already read)\n", "dim")
                 continue
             log(f"\n  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}\n", "hdr")
-            _mt.sleep(1.5)   # let previous J2534 channel fully close before opening next
+            _mt.sleep(2.0)   # let previous J2534 channel fully close before opening next
             try:
                 from cp_tools.j533_probe import J533Probe
                 cfg = dict(configs.default_client_config)
