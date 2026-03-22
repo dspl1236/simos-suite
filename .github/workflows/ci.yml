@@ -10,96 +10,139 @@ permissions:
   contents: write
 
 jobs:
-  test-and-build:
-    name: Test + Build EXE
-    runs-on: windows-latest
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          pip install numpy
+          pip install git+https://github.com/bri3d/sa2_seed_key.git || true
+      - name: Headless smoke test
+        run: python -m tests.sim_runner --headless
+      - name: Backend tests
+        run: python -m tests.sim_ecu && python -m tests.sim_trans
+      - name: Import chain
+        run: python -c "from core.ecu_defs import SIMOS85; from core.trans_defs import TRANS_REGISTRY; print('OK')"
 
+  build-exe:
+    name: Build Windows EXE (x86 + x64)
+    needs: test
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Python 3.11
+      - name: Get build version
+        id: ver
+        shell: python
+        run: |
+          import subprocess, os
+          count = subprocess.check_output(['git','rev-list','--count','HEAD']).decode().strip()
+          sha   = subprocess.check_output(['git','rev-parse','--short','HEAD']).decode().strip()
+          v = f"0.{count}.0-{sha}"
+          open(os.environ['GITHUB_OUTPUT'],'a').write(f"version={v}\n")
+          print(f"Version: {v}")
+
+      # ── x86 (32-bit) — required for 32-bit J2534 DLLs ────────────────────────
+      # All VAG J2534 cables (Mongoose, Tactrix, VNCI) ship 32-bit DLLs.
+      # A 32-bit Python process is required to load them via ctypes.
+      # This is the same requirement as VW_Flash and VCDS.
+      - name: Set up Python 3.11 x86
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x86"
+
+      - name: Install dependencies x86
+        shell: cmd
+        run: |
+          pip install pyinstaller
+          pip install udsoncan pyserial numpy pycryptodome python-can websocket-client
+          pip install git+https://github.com/bri3d/sa2_seed_key.git
+          pip install bleak || echo "bleak optional on x86"
+
+      - name: Patch version x86
+        shell: python
+        run: |
+          import re, pathlib
+          p = pathlib.Path("ui/main_window.py")
+          src = p.read_text(encoding="utf-8")
+          src = re.sub(r'VERSION = "[^"]+"', 'VERSION = "${{ steps.ver.outputs.version }}-x86"', src)
+          p.write_text(src, encoding="utf-8")
+
+      - name: Build x86 EXE
+        shell: cmd
+        run: python build_exe.py --no-test --no-upx
+
+      - name: Verify x86 EXE
+        shell: cmd
+        run: |
+          if not exist dist\SimosSuite.exe (echo MISSING && exit /b 1)
+          dir dist\SimosSuite.exe
+
+      - name: Rename x86 EXE
+        shell: cmd
+        run: copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.ver.outputs.version }}-x86.exe"
+
+      # ── x64 (64-bit) — for BLE, WiFi, SocketCAN ──────────────────────────────
+      - name: Set up Python 3.11 x64
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           architecture: "x64"
 
-      - name: Install dependencies
+      - name: Install dependencies x64
         shell: cmd
         run: |
-          pip install numpy
-          pip install git+https://github.com/bri3d/sa2_seed_key.git || echo sa2 optional
           pip install pyinstaller
-          pip install udsoncan bleak pyserial pycryptodome python-can websocket-client
+          pip install udsoncan bleak pyserial numpy pycryptodome python-can websocket-client
+          pip install git+https://github.com/bri3d/sa2_seed_key.git
 
-      - name: Headless smoke test
-        shell: cmd
-        run: python -m tests.sim_runner --headless
-
-      - name: Get build number
-        id: ver
-        shell: python
-        run: |
-          import subprocess, os
-          count = subprocess.check_output(
-              ['git', 'rev-list', '--count', 'HEAD']
-          ).decode().strip()
-          sha = subprocess.check_output(
-              ['git', 'rev-parse', '--short', 'HEAD']
-          ).decode().strip()
-          version = f"0.{count}.0-{sha}"
-          print(f"Version: {version}")
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"version={version}\n")
-
-      - name: Patch version into source
+      - name: Patch version x64
         shell: python
         run: |
           import re, pathlib
-          path = pathlib.Path("ui/main_window.py")
-          src  = path.read_text(encoding="utf-8")
-          src  = re.sub(r'VERSION = "[^"]+"',
-                        'VERSION = "${{ steps.ver.outputs.version }}"', src)
-          path.write_text(src, encoding="utf-8")
-          print("Patched VERSION in ui/main_window.py")
+          p = pathlib.Path("ui/main_window.py")
+          src = p.read_text(encoding="utf-8")
+          src = re.sub(r'VERSION = "[^"]+"', 'VERSION = "${{ steps.ver.outputs.version }}-x64"', src)
+          p.write_text(src, encoding="utf-8")
 
-      - name: Build EXE
+      - name: Build x64 EXE
         shell: cmd
         run: python build_exe.py --no-test --no-upx
 
-      - name: Verify EXE
+      - name: Verify x64 EXE
         shell: cmd
         run: |
-          if not exist dist\SimosSuite.exe (
-            echo ERROR: SimosSuite.exe not found
-            exit /b 1
-          )
+          if not exist dist\SimosSuite.exe (echo MISSING && exit /b 1)
           dir dist\SimosSuite.exe
 
-      - name: Rename EXE with version
+      - name: Rename x64 EXE
         shell: cmd
-        run: |
-          copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.ver.outputs.version }}.exe"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: SimosSuite-${{ steps.ver.outputs.version }}
-          path: dist/SimosSuite-${{ steps.ver.outputs.version }}.exe
-          retention-days: 14
-          overwrite: true
+        run: copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.ver.outputs.version }}-x64.exe"
 
       - name: Update rolling dev release
-        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: dev-latest
           name: "Dev Build — ${{ steps.ver.outputs.version }}"
           body: |
-            Automated build from latest commit on main.
-            Version: `${{ steps.ver.outputs.version }}`
+            ## Download the right version
+
+            | File | Use when |
+            |------|----------|
+            | **x86** | J2534 cable (Mongoose, Tactrix, VNCI) — **use this for the car** |
+            | **x64** | BLE dongle, WiFi, SocketCAN, Virtual ECU demo |
+
             Commit: ${{ github.sha }}
           prerelease: true
-          files: dist/SimosSuite-${{ steps.ver.outputs.version }}.exe
+          files: |
+            dist/SimosSuite-${{ steps.ver.outputs.version }}-x86.exe
+            dist/SimosSuite-${{ steps.ver.outputs.version }}-x64.exe
           fail_on_unmatched_files: true
