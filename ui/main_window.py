@@ -1712,8 +1712,12 @@ class CPToolsTab(_Tab):
                 from cp_tools.j533_probe import J533Probe
                 cfg = dict(configs.default_client_config)
                 cfg["data_identifiers"] = {IKA_DID: _BytesCodec}
-                cfg["request_timeout"]  = 3    # 3s per module — 9 modules = ~30s total
-                cfg["p2_timeout"]       = 1.0  # 1s for first response byte (Convenience CAN via J533)
+                # ISO 14229-2 timing: P2=50-100ms, P2*=1-5s, S3=5-10s
+                # use_server_timing=False: use our values, not ECU-reported timing
+                cfg["request_timeout"]   = 5    # overall per-request timeout
+                cfg["p2_timeout"]        = 0.15 # 150ms — 3x VAG P2 spec (50-100ms)
+                cfg["p2_star_timeout"]   = 5.0  # 5s for NRC 0x78 pending responses
+                cfg["use_server_timing"] = False # ignore ECU-reported timing overrides
 
                 conn = J533Probe(
                     interface      = self.mw.interface,
@@ -1801,7 +1805,9 @@ class CPToolsTab(_Tab):
                 )
                 _cfg533 = dict(configs.default_client_config)
                 _cfg533["data_identifiers"] = {CONST_DID: _BytesCodec}
-                _cfg533["request_timeout"]  = 8
+                _cfg533["request_timeout"]   = 5
+                _cfg533["p2_timeout"]        = 0.15
+                _cfg533["use_server_timing"] = False
                 _conn533 = _p533._make_conn(0x710, 0x77A)
                 with Client(_conn533, request_timeout=8, config=_cfg533) as _c:
                     _c.change_session(
