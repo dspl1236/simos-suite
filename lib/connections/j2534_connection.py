@@ -150,7 +150,40 @@ class J2534Connection(BaseConnection):
                 self.rxqueue.get_nowait()
             except Exception:
                 break
+        # Make sure rxthread is still alive after retarget
+        if not self.rxthread.is_alive():
+            self.exit_requested = False
+            self.rxthread = threading.Thread(target=self.rxthread_task)
+            self.rxthread.daemon = True
+            self.rxthread.start()
         self.logger.info("J2534 retargeted TX=0x%03X RX=0x%03X", txid, rxid)
+
+    def close_hard(self):
+        """Full close — PassThruDisconnect + PassThruClose. Use at end of scan."""
+        self.exit_requested = True
+        try: self.rxthread.join(timeout=2.0)
+        except Exception: pass
+        try: self.interface.PassThruDisconnect(self.channelID)
+        except Exception: pass
+        try: self.interface.PassThruClose(self.devID)
+        except Exception: pass
+        self.opened = False
+
+    def close(self):
+        """
+        Soft close — only stops the rx thread and marks closed.
+        Does NOT call PassThruDisconnect/Close so the channel stays alive
+        for the next reset_for_module() call in a multi-module scan.
+        Call close_hard() when the scan is completely done.
+        """
+        if getattr(self, "_hard_close", False):
+            self.close_hard()
+            return
+        # Soft: just stop the thread, keep PassThru channel open
+        self.exit_requested = True
+        try: self.rxthread.join(timeout=1.0)
+        except Exception: pass
+        self.opened = False
 
     def resetCable(self):
         self.logger.info("Resetting cable/filter with Txid: " + str(hex(self.txid)))

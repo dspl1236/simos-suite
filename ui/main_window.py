@@ -1766,6 +1766,7 @@ class CPToolsTab(_Tab):
 
                 if _j2534_mode and _shared_conn is not None:
                     _shared_conn.reset_for_module(tx, rx)
+                    _shared_conn.open()   # restart rxthread after soft-close
                     conn = _shared_conn
                 else:
                     _mt.sleep(0.5)
@@ -1832,10 +1833,11 @@ class CPToolsTab(_Tab):
                             err_str, C["amber"])
                     log(f"    ! error: {err_str}\n", "warn")
 
-        # Close shared J2534 connection
+        # Hard-close the shared J2534 connection now that scan is done
         if _shared_conn is not None:
             try:
-                _shared_conn.exit_requested = True
+                _shared_conn._hard_close = True
+                _shared_conn.close_hard()
             except Exception: pass
 
         # Summary
@@ -3045,14 +3047,14 @@ class DiagTab(_Tab):
                 present_count += 1
                 self._present[mod_name] = (tx, rx)
                 self._ui(self._set_row_status, mod_name,
-                         "present", C["green"], enable_cb=True)
+                         "present", C["green"], True)
                 log(f"  ✓ {mod_name:<35} TX=0x{tx:03X}\n", "ok")
 
             except udsoncan.exceptions.NegativeResponseException:
                 present_count += 1
                 self._present[mod_name] = (tx, rx)
                 self._ui(self._set_row_status, mod_name,
-                         "present", C["green"], enable_cb=True)
+                         "present", C["green"], True)
                 log(f"  ✓ {mod_name:<35} TX=0x{tx:03X} (NRC)\n", "ok")
 
             except Exception as e:
@@ -3143,7 +3145,7 @@ class DiagTab(_Tab):
                 "dtc_count": dtc_lbl, "codes": codes_lbl
             }
 
-    def _set_row_status(self, mod_name, text, color, enable_cb=False):
+    def _set_row_status(self, mod_name, text, color, False):
         row = self._module_rows.get(mod_name)
         if not row:
             return
