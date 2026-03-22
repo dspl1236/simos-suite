@@ -1691,7 +1691,6 @@ class CPToolsTab(_Tab):
             def decode(self, p): return p
             def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
 
-        log("\n── CP Module Scan ─────────────────────────────────────\n", "hdr")
         # Per-module scan — fresh connection each time with delay between.
         # The bus scan confirms individual J2534 connections work fine.
         # The shared-connection approach deadlocks due to udsoncan Client internals.
@@ -1701,8 +1700,9 @@ class CPToolsTab(_Tab):
 
         for mod_name, addr, tx, rx in CP_MODULES:
             if tx == 0x710:
-                log(f"\n  {mod_name}  (skipped — constellation already read)\n", "dim")
-                continue
+                # J533 itself — read its 0x00BE IKA key like any other module
+                # (constellation is now read separately at the end)
+                pass  # fall through to scan
             log(f"\n  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}\n", "hdr")
             _mt.sleep(2.0)   # let previous J2534 channel fully close before opening next
             try:
@@ -1717,10 +1717,12 @@ class CPToolsTab(_Tab):
                     ble_bridge     = getattr(self.mw, "ble_bridge", None),
                 )._make_conn(tx, rx)
 
-                client = Client(conn, request_timeout=10, config=cfg)
-                client.__enter__()
-
-                try:
+                # J2534Connection.__init__ already calls PassThruOpen/Connect/Filter.
+                # open() only starts the rxthread. __enter__ returns self (no-op).
+                # Must call conn.open() explicitly so the rxthread starts and
+                # responses from PassThruReadMsgs are delivered to udsoncan.
+                conn.open()
+                with Client(conn, request_timeout=10, config=cfg) as client:
                     client.change_session(
                         udsoncan.services.DiagnosticSessionControl
                         .Session.extendedDiagnosticSession)
@@ -1746,9 +1748,6 @@ class CPToolsTab(_Tab):
                         tag = "ok" if same else "warn"
                         lbl = "matches known blob" if same else "different blob"
                         log(f"    ✓ CP clear  {short}  ({lbl})\n", tag)
-                finally:
-                    try: client.__exit__(None, None, None)
-                    except Exception: pass
 
             except udsoncan.exceptions.NegativeResponseException as nre:
                 nrc = nre.response.code if hasattr(nre, "response") else 0
