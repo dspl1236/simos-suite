@@ -1700,9 +1700,12 @@ class CPToolsTab(_Tab):
 
         for mod_name, addr, tx, rx in CP_MODULES:
             if tx == 0x710:
-                # J533 itself — read its 0x00BE IKA key like any other module
-                # (constellation is now read separately at the end)
-                pass  # fall through to scan
+                # Skip J533 — it's the gateway, not a CP slave module.
+                # Its constellation (0x04A3) is read separately at the end.
+                # Scanning J533's 0x00BE here causes BusyRepeatRequest because
+                # the bus scan topology query just used this channel.
+                log(f"\n  {mod_name}  TX=0x{tx:03X}  (gateway — skipped)\n", "dim")
+                continue
             log(f"\n  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}\n", "hdr")
             _mt.sleep(2.0)   # let previous J2534 channel fully close before opening next
             try:
