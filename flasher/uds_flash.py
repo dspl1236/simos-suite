@@ -426,21 +426,29 @@ def read_ecu_info(
         def encode(self, v): return bytes(v)
         def decode(self, p):
             # Try ASCII for string DIDs (VIN, part numbers etc)
-            # Fall back to hex for binary/numeric DIDs
             try:
                 s = p.decode("ascii").strip("\x00 \t\r\n")
                 if s and all(32 <= ord(c) < 127 for c in s):
                     return s
             except Exception:
                 pass
-            # Format numeric single-byte DIDs as decimal, multi-byte as hex
             if len(p) == 1:
                 return str(p[0])
             if len(p) <= 4:
-                val = int.from_bytes(p, "big")
-                return str(val)
+                return str(int.from_bytes(p, "big"))
             return p.hex().upper()
         def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
+
+    # DID-specific post-processing for known numeric DIDs
+    DID_SCALE = {
+        0xF442: lambda v: f"{int(v)/1000:.3f} V",     # Module voltage mV→V
+        0x0407: lambda v: str(int(v)),                  # Program attempts
+        0x0408: lambda v: str(int(v)),                  # Successful programs
+        0x295A: lambda v: f"{int(v):,} km",             # Vehicle mileage
+        0x295B: lambda v: f"{int(v):,} km",             # Module mileage
+        0xF186: lambda v: {1:"default",3:"extended",
+                           2:"programming"}.get(int(v), str(v)),  # Active session
+    }
 
     # Per-DID codecs — handle binary/numeric DIDs correctly
     class _VoltageCodec(udsoncan.DidCodec):
@@ -529,7 +537,14 @@ def read_ecu_info(
             label = DID_LABELS.get(did, f"DID_{did:04X}")
             try:
                 val = client.read_data_by_identifier_first(did)
-                result[label] = str(val)
+                # Apply known scaling for numeric DIDs
+                if did in DID_SCALE:
+                    try:
+                        result[label] = DID_SCALE[did](val)
+                    except Exception:
+                        result[label] = str(val)
+                else:
+                    result[label] = str(val)
             except Exception as e:
                 result[label] = f"<{type(e).__name__}>"
 
