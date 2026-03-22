@@ -95,13 +95,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          architecture: "x64"
+          architecture: "x86"
 
       - name: Install dependencies x64
         shell: cmd
         run: |
           pip install pyinstaller
           pip install udsoncan bleak pyserial numpy pycryptodome python-can websocket-client
+          python -c "import struct; print('Python arch:', struct.calcsize('P')*8, 'bit')"
           pip install git+https://github.com/bri3d/sa2_seed_key.git
 
       - name: Patch version x64
