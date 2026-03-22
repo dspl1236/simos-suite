@@ -1691,53 +1691,7 @@ class CPToolsTab(_Tab):
             def decode(self, p): return p
             def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
 
-        # Read J533 constellation — retry once on failure
-        import time as _t
-        for _attempt in range(2):
-            try:
-                from cp_tools.j533_probe import J533Probe
-                _p533 = J533Probe(
-                    interface      = self.mw.interface,
-                    interface_path = self.mw.iface_path,
-                    ble_bridge     = getattr(self.mw, "ble_bridge", None),
-                )
-                _cfg533 = dict(configs.default_client_config)
-                _cfg533["data_identifiers"] = {CONST_DID: _BytesCodec}
-                _cfg533["request_timeout"]  = 8
-                _conn533 = _p533._make_conn(0x710, 0x77A)
-                with Client(_conn533, request_timeout=8, config=_cfg533) as _c:
-                    _c.change_session(
-                        udsoncan.services.DiagnosticSessionControl
-                        .Session.extendedDiagnosticSession)
-                    _r = _c.read_data_by_identifier([CONST_DID])
-                    const_bytes = bytes(_r.service_data.values[CONST_DID])
-                    self._const_before = const_bytes
-                    self._ui(self._const_var.set,
-                             " ".join(f"{b:02X}" for b in const_bytes))
-                    log(f"  J533 constellation: "
-                        f"{' '.join(f'{b:02X}' for b in const_bytes)}\n", "ok")
-                # Return J533 to default session — extended session blocks
-                # forwarding of UDS messages to other modules via gateway
-                try:
-                    _c.change_session(
-                        udsoncan.services.DiagnosticSessionControl
-                        .Session.defaultSession)
-                    log("  J533 returned to default session\n", "dim")
-                except Exception:
-                    pass
-                break
-            except Exception as e:
-                if _attempt == 0:
-                    log(f"  J533 constellation retry: {e}\n", "warn")
-                    _t.sleep(1.0)
-                else:
-                    log(f"  J533 constellation failed: {e} — continuing\n", "warn")
-
-        # Wait for J533 to fully exit extended session (5s timeout)
-        # J533 as gateway blocks forwarded UDS while in extended diagnostic session
-        import time as _t
-        _t.sleep(5.0)
-
+        log("\n── CP Module Scan ─────────────────────────────────────\n", "hdr")
         # Per-module scan — fresh connection each time with delay between.
         # The bus scan confirms individual J2534 connections work fine.
         # The shared-connection approach deadlocks due to udsoncan Client internals.
@@ -1824,6 +1778,56 @@ class CPToolsTab(_Tab):
 
 
         # Summary
+
+        # ── Read J533 constellation LAST (after modules scanned) ──────────────
+        # J533 extended session blocks J2534 forwarding to slave modules.
+        # Reading constellation after module scan avoids this entirely.
+        # Read J533 constellation — retry once on failure
+        import time as _t
+        for _attempt in range(2):
+            try:
+                from cp_tools.j533_probe import J533Probe
+                _p533 = J533Probe(
+                    interface      = self.mw.interface,
+                    interface_path = self.mw.iface_path,
+                    ble_bridge     = getattr(self.mw, "ble_bridge", None),
+                )
+                _cfg533 = dict(configs.default_client_config)
+                _cfg533["data_identifiers"] = {CONST_DID: _BytesCodec}
+                _cfg533["request_timeout"]  = 8
+                _conn533 = _p533._make_conn(0x710, 0x77A)
+                with Client(_conn533, request_timeout=8, config=_cfg533) as _c:
+                    _c.change_session(
+                        udsoncan.services.DiagnosticSessionControl
+                        .Session.extendedDiagnosticSession)
+                    _r = _c.read_data_by_identifier([CONST_DID])
+                    const_bytes = bytes(_r.service_data.values[CONST_DID])
+                    self._const_before = const_bytes
+                    self._ui(self._const_var.set,
+                             " ".join(f"{b:02X}" for b in const_bytes))
+                    log(f"  J533 constellation: "
+                        f"{' '.join(f'{b:02X}' for b in const_bytes)}\n", "ok")
+                # Return J533 to default session — extended session blocks
+                # forwarding of UDS messages to other modules via gateway
+                try:
+                    _c.change_session(
+                        udsoncan.services.DiagnosticSessionControl
+                        .Session.defaultSession)
+                    log("  J533 returned to default session\n", "dim")
+                except Exception:
+                    pass
+                break
+            except Exception as e:
+                if _attempt == 0:
+                    log(f"  J533 constellation retry: {e}\n", "warn")
+                    _t.sleep(1.0)
+                else:
+                    log(f"  J533 constellation failed: {e} — continuing\n", "warn")
+
+        # Wait for J533 to fully exit extended session (5s timeout)
+        # J533 as gateway blocks forwarded UDS while in extended diagnostic session
+        import time as _t
+        _t.sleep(5.0)
         log(f"\n── Scan complete: {cp_count} module(s) CP active ───────────────\n",
             "ok" if cp_count == 0 else "warn")
 
