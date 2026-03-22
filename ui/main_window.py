@@ -1765,8 +1765,8 @@ class CPToolsTab(_Tab):
                 cfg["request_timeout"]  = 10
 
                 if _j2534_mode and _shared_conn is not None:
+                    # Retarget filter only — never close/reopen the device
                     _shared_conn.reset_for_module(tx, rx)
-                    _shared_conn.open()   # restart rxthread after soft-close
                     conn = _shared_conn
                 else:
                     _mt.sleep(0.5)
@@ -1776,8 +1776,10 @@ class CPToolsTab(_Tab):
                         ble_bridge     = getattr(self.mw, "ble_bridge", None),
                     )._make_conn(tx, rx)
 
+                # Do NOT use context manager — it calls conn.close() which
+                # destroys the J2534 channel we need for the next module.
                 client = Client(conn, request_timeout=10, config=cfg)
-                client.__enter__()
+                client.open()
 
                 try:
                     client.change_session(
@@ -1806,7 +1808,10 @@ class CPToolsTab(_Tab):
                         lbl = "matches known blob" if same else "different blob"
                         log(f"    ✓ CP clear  {short}  ({lbl})\n", tag)
                 finally:
-                    client.__exit__(None, None, None)
+                    # Don't close — keeps J2534 channel alive for next module
+                    if not _j2534_mode:
+                        try: client.close()
+                        except Exception: pass
 
             except udsoncan.exceptions.NegativeResponseException as nre:
                 nrc = nre.response.code if hasattr(nre, "response") else 0
