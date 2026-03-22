@@ -101,9 +101,8 @@ def _make_connection(ecu: ECUDef, interface: str, interface_path: Optional[str] 
 
     elif interface.upper() == "MOCK":
         # Virtual mock connection — Simos8.5 simulation, no hardware needed
+        # _install_mock_patch already called by interface_panel before connect
         from tests.mock_connection import MockConnection, MockECU
-        from tests.sim_runner import _install_mock_patch
-        _install_mock_patch("S85", "ZF8HP")
         conn = MockConnection(MockECU.SIMOS85)
         conn.open()
         return conn

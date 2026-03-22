@@ -74,31 +74,6 @@ def _install_mock_patch(ecu_key: str = "S85", trans_key: str = "ZF8HP"):
     log.info("[SIM] _make_connection patched with MockConnection")
 
 
-    _real_make = flash_mod._make_connection
-
-    def _mock_make(ecu_or_proxy, interface, interface_path=None,
-                   st_min_us=350_000, ble_bridge=None):
-        # Detect TCU proxy vs ECU by can_tx address
-        # TCUs use 0x7E1; ECUs use 0x7E0 (Simos) or other
-        can_tx = getattr(ecu_or_proxy, "can_tx", 0)
-        if can_tx == 0x7E1:
-            # This is a TCU call
-            trans = TRANS_REGISTRY.get(trans_key)
-            conn = make_mock_tcu_connection(trans)
-            log.info("[SIM] TCU MockConnection → %s", trans_key)
-        else:
-            # ECU call
-            from core.ecu_defs import get_ecu
-            ecu = (get_ecu(ecu_key) if isinstance(ecu_or_proxy, str)
-                   else ecu_or_proxy)
-            conn = make_mock_ecu_connection(ecu)
-            log.info("[SIM] ECU MockConnection → %s  (CAN TX %#05x)",
-                     ecu_key, can_tx)
-        conn.open()
-        return conn
-
-    flash_mod._make_connection = _mock_make
-    log.info("[SIM] _make_connection patched with MockConnection")
 
 
 def _install_interface_patch():

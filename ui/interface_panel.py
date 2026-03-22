@@ -512,13 +512,9 @@ class InterfacePanel(tk.Frame):
         def _connect_task():
             import time
             if interface == "MOCK":
-                # Install mock patches so all tabs use simulated data
                 try:
-                    from tests.sim_runner import (
-                        _install_mock_patch, _install_interface_patch,
-                        auto_connect_after_launch)
+                    from tests.sim_runner import _install_mock_patch
                     _install_mock_patch("S85", "ZF8HP")
-                    _install_interface_patch()
                 except Exception:
                     pass
             time.sleep(0.3)
