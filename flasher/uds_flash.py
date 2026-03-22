@@ -244,82 +244,109 @@ def flash_cal(
 
     callback(FlashProgress("CONNECT", f"Connecting to {ecu.name}…", 0))
 
+    # Clear DTCs via OBD2 before flash (VW_Flash pattern)
+    def _obd_clear(iface, ipath):
+        try:
+            import types
+            proxy = types.SimpleNamespace(can_tx=0x700, can_rx=0x7E8,
+                                          sa2_script=b"", crypto=None)
+            c = _make_connection(proxy, iface, ipath)
+            c.open()
+            c.specific_send(bytes([0x04]))
+            try: c.specific_wait_frame(timeout=1.0)
+            except Exception: pass
+            c.close()
+        except Exception as e:
+            log.debug("OBD DTC clear: %s", e)
+    _obd_clear(interface, interface_path)
+
     conn = _make_connection(ecu, interface, interface_path)
 
     cfg = dict(configs.default_client_config)
-    cfg["security_algo"]     = _make_security_algo(ecu.sa2_script)
+    cfg["security_algo"]        = _make_security_algo(ecu.sa2_script)
     cfg["security_algo_params"] = None
-    cfg["data_identifiers"]  = {}  # we don't need DID codecs for flashing
-    cfg["request_timeout"]   = 30
-    cfg["p2_timeout"]        = 30
-    cfg["p2_star_timeout"]   = 30
+    cfg["data_identifiers"]     = {}
+    cfg["request_timeout"]      = 30
 
     with Client(conn, request_timeout=30, config=cfg) as client:
 
-        # ── 1. Extended diagnostic session ───────────────────────────────────
+        def _st(t=30):
+            try: client.session_timing["p2_server_max"] = t
+            except TypeError: client.session_timing.p2_server_max = t
+            client.config["request_timeout"] = t
+
+        # 1. Extended session
         callback(FlashProgress("CONNECT", "Opening extended session…", 5))
         try:
             client.change_session(
                 services.DiagnosticSessionControl.Session.extendedDiagnosticSession)
         except exceptions.NegativeResponseException as e:
-            callback(FlashProgress("ERROR", f"Session refused: {e}", 0))
-            return False
+            callback(FlashProgress("ERROR", f"Session refused: {e}", 0)); return False
+        _st(30)
 
-        try:
-            client.session_timing["p2_server_max"] = 30
-        except TypeError:
-            client.session_timing.p2_server_max = 30
-
-        # ── Read VIN for confirmation ─────────────────────────────────────────
+        # Read VIN
         vin = "UNKNOWN"
         try:
-            class _StrCodec(udsoncan.DidCodec):
+            class _SC(udsoncan.DidCodec):
                 def encode(self, v): return bytes(v)
                 def decode(self, p): return p.decode("ascii", errors="replace")
                 def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
-            client.config["data_identifiers"][0xF190] = _StrCodec
+            client.config["data_identifiers"][0xF190] = _SC
             vin = client.read_data_by_identifier_first(0xF190)
-        except Exception:
-            pass
+        except Exception: pass
         callback(FlashProgress("CONNECT", f"VIN: {vin}", 10))
 
         if verify_only:
             return _verify_checksum(client, cal_block, callback)
 
-        # ── 2. Programming session + security access ──────────────────────────
+        # 2. Programming precondition check 0x0203 (VW_Flash)
+        callback(FlashProgress("CONNECT", "Checking programming precondition…", 12))
+        try:
+            client.start_routine(0x0203)
+        except Exception as e:
+            log.warning("Precondition 0x0203: %s (continuing)", e)
+        client.tester_present()
+
+        # 3. Programming session
         callback(FlashProgress("CONNECT", "Entering programming session…", 15))
         try:
             client.change_session(
                 services.DiagnosticSessionControl.Session.programmingSession)
         except exceptions.NegativeResponseException as e:
-            callback(FlashProgress("ERROR", f"Programming session refused: {e}", 0))
-            return False
+            callback(FlashProgress("ERROR", f"Programming session refused: {e}", 0)); return False
+        _st(30)
+        client.tester_present()
 
-        callback(FlashProgress("CONNECT", "Security access (SA2)…", 20))
+        # 4. Security access SA2 level 17
+        callback(FlashProgress("CONNECT", "Security access SA2…", 20))
         try:
-            client.unlock_security_access(0x11)   # Level 0x11 for Simos programming
+            client.unlock_security_access(0x11)
         except exceptions.NegativeResponseException as e:
-            callback(FlashProgress("ERROR", f"Security access denied: {e}", 0))
-            return False
+            callback(FlashProgress("ERROR", f"Security access denied: {e}", 0)); return False
+        client.tester_present()
 
-        # ── 3. Erase CAL block ────────────────────────────────────────────────
+        # 5. Write workshop code 0xF15A (VW_Flash)
+        try:
+            client.write_data_by_identifier(
+                0xF15A, bytes([0x20,0x04,0x20,0x42,0x04,0x20,0x42,0xB1,0x3D]))
+        except Exception as e:
+            log.debug("Workshop code: %s", e)
+        client.tester_present()
+
+        # 6. Erase block
         callback(FlashProgress("ERASE", f"Erasing CAL block {cal_block.number}…", 25))
         if not dry_run:
             try:
-                client.start_routine(
-                    udsoncan.Routine.EraseMemory,
-                    data=bytes([0x01, cal_block.number])
-                )
+                client.start_routine(udsoncan.Routine.EraseMemory,
+                                     data=bytes([0x01, cal_block.number]))
             except exceptions.NegativeResponseException as e:
-                callback(FlashProgress("ERROR", f"Erase failed: {e}", 0))
-                return False
+                callback(FlashProgress("ERROR", f"Erase failed: {e}", 0)); return False
         else:
             log.info("[DRY RUN] Would erase block %d", cal_block.number)
 
-        # ── 4. RequestDownload ────────────────────────────────────────────────
+        # 7. RequestDownload — address_format=8 (1-byte block ID, matches VW_Flash)
         encrypted = _prepare_block_data(ecu, cal_block.number, cal_bytes)
-        total     = len(encrypted)
-
+        total = len(encrypted)
         callback(FlashProgress("TRANSFER", "Requesting download…", 30, "CAL"))
         if not dry_run:
             try:
@@ -328,87 +355,80 @@ def flash_cal(
                     encryption=0xA  if ecu.crypto != CryptoType.XOR_COUNTER else 0x0,
                 )
                 mem_loc = udsoncan.MemoryLocation(
-                    address=cal_block.base_addr,
-                    memorysize=total,
-                    address_format=32,
-                    memorysize_format=32,
+                    address=cal_block.number, memorysize=total,
+                    address_format=8, memorysize_format=32,
                 )
                 resp = client.request_download(mem_loc, dfi)
                 max_block = resp.service_data.max_length
             except Exception as e:
-                callback(FlashProgress("ERROR", f"RequestDownload failed: {e}", 0))
-                return False
+                callback(FlashProgress("ERROR", f"RequestDownload failed: {e}", 0)); return False
         else:
             max_block = 0xFFD
-            log.info("[DRY RUN] Would RequestDownload %d bytes to %#010x",
-                     total, cal_block.base_addr)
 
-        # ── 5. TransferData ───────────────────────────────────────────────────
-        block_size = max_block - 2   # minus 1 byte SID + 1 byte block counter
-        counter    = 1
-        offset     = 0
-        sent       = 0
-
+        # 8. TransferData
+        block_size = max_block - 2
+        counter = 1
+        offset = 0
         while offset < total:
             chunk = encrypted[offset:offset + block_size]
-            pct   = 30 + int(60 * offset / total)
-            callback(FlashProgress(
-                "TRANSFER",
-                f"Writing {offset:#08x}/{total:#08x} ({pct}%)",
-                pct, "CAL"))
-
+            pct = 30 + int(60 * offset / total)
+            callback(FlashProgress("TRANSFER",
+                                   f"Writing {offset:#08x}/{total:#08x} ({pct}%)", pct, "CAL"))
             if not dry_run:
                 try:
                     client.transfer_data(counter, chunk)
                 except exceptions.NegativeResponseException as e:
-                    callback(FlashProgress("ERROR",
-                                           f"TransferData failed at {offset:#x}: {e}", 0))
+                    callback(FlashProgress("ERROR", f"TransferData failed at {offset:#x}: {e}", 0))
                     return False
+            offset += len(chunk)
+            counter = (counter + 1) & 0xFF
+            if counter == 0: counter = 1
 
-            offset  += len(chunk)
-            sent    += len(chunk)
-            counter  = (counter + 1) & 0xFF
-            if counter == 0:
-                counter = 1
-
-        # ── 6. RequestTransferExit ────────────────────────────────────────────
+        # 9. RequestTransferExit
         callback(FlashProgress("TRANSFER", "Transfer complete, exiting…", 92, "CAL"))
         if not dry_run:
             try:
                 client.request_transfer_exit()
             except exceptions.NegativeResponseException as e:
-                callback(FlashProgress("ERROR", f"TransferExit failed: {e}", 0))
-                return False
+                callback(FlashProgress("ERROR", f"TransferExit failed: {e}", 0)); return False
+        client.tester_present()
 
-        # ── 7. Verify checksum ────────────────────────────────────────────────
+        # 10. Checksum routine 0x0202 (VW_Flash — not 0xFF01)
         if not dry_run:
             ok = _verify_checksum(client, cal_block, callback)
-            if not ok:
-                return False
+            if not ok: return False
 
-        # ── Done ──────────────────────────────────────────────────────────────
-        callback(FlashProgress("DONE",
-                               f"CAL block flashed successfully to {vin}", 100, "CAL"))
-        log.info("Flash complete — VIN %s, block %d, %d bytes",
-                 vin, cal_block.number, total)
+        # 11. CheckProgrammingDependencies 0xFF01
+        try:
+            client.start_routine(udsoncan.Routine.CheckProgrammingDependencies)
+        except Exception as e:
+            log.warning("CheckProgrammingDependencies: %s", e)
+        client.tester_present()
+
+        # 12. ECU hard reset
+        callback(FlashProgress("DONE", f"Flash complete — resetting ECU", 99, "CAL"))
+        try:
+            client.ecu_reset(services.ECUReset.ResetType.hardReset)
+        except Exception as e:
+            log.debug("ECU reset: %s", e)
+
+        callback(FlashProgress("DONE", f"CAL flashed — {vin}", 100, "CAL"))
+        log.info("Flash complete — VIN %s, block %d, %d bytes", vin, cal_block.number, total)
+        _obd_clear(interface, interface_path)
         return True
-
 
 def _verify_checksum(client: Client, block: BlockDef,
                      callback: ProgressCallback) -> bool:
-    callback(FlashProgress("VERIFY", "Running checksum verification routine…", 95))
+    """Checksum via routine 0x0202 (VW_Flash pattern)."""
+    callback(FlashProgress("VERIFY", "Running checksum routine 0x0202…", 95))
     try:
-        client.start_routine(
-            udsoncan.Routine.CheckProgrammingDependencies,  # 0xFF01
-            data=bytes([0x01, block.number])
-        )
+        data = bytearray([0x01, block.number, 0x00, 0x04]) + bytes(4)
+        client.start_routine(0x0202, data=bytes(data))
         callback(FlashProgress("VERIFY", "Checksum OK", 98))
         return True
     except exceptions.NegativeResponseException as e:
-        callback(FlashProgress("ERROR", f"Checksum verification failed: {e}", 0))
+        callback(FlashProgress("ERROR", f"Checksum failed: {e}", 0))
         return False
-
-
 # ─── Read ECU info ────────────────────────────────────────────────────────────
 
 def read_ecu_info(
