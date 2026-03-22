@@ -64,6 +64,12 @@ class J2534:
         global dllPassThruStartMsgFilter
         global dllPassThruIoctl
 
+        # Add the DLL's own directory to the search path so Windows can
+        # resolve its dependencies (MSVC runtimes etc) when running frozen.
+        import os, pathlib
+        dll_dir = str(pathlib.Path(windll).parent)
+        if hasattr(os, 'add_dll_directory'):
+            os.add_dll_directory(dll_dir)  # Python 3.8+ Windows only
         self.hDLL = ctypes.cdll.LoadLibrary(windll)
         self.rxid = rxid.to_bytes(4, "big")
         self.txid = txid.to_bytes(4, "big")
