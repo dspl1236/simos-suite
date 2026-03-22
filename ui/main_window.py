@@ -1724,11 +1724,19 @@ class CPToolsTab(_Tab):
                 else:
                     log(f"  J533 constellation failed: {e} — continuing\n", "warn")
 
-        # Scan each module
+        # Let J533 session close and J2534 channel settle before module scan
+        import time as _t
+        _t.sleep(2.0)
+
+        # Scan each module — skip J533 Gateway (already read constellation above)
+        # J533 is at TX=0x710 — reopening same channel immediately causes J2534 hang
         self._scan_results = {}
         cp_count = 0
 
         for mod_name, addr, tx, rx in CP_MODULES:
+            if tx == 0x710:   # J533 Gateway — skip, constellation already read
+                log(f"\n  {mod_name}  (skipped — constellation read above)\n", "dim")
+                continue
             log(f"\n  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}\n", "hdr")
             try:
                 from cp_tools.j533_probe import J533Probe
@@ -1739,8 +1747,8 @@ class CPToolsTab(_Tab):
                 )
                 cfg = dict(configs.default_client_config)
                 cfg["data_identifiers"] = {IKA_DID: _BytesCodec}
-                cfg["request_timeout"]  = 8
-                import time as _mt; _mt.sleep(0.3)
+                cfg["request_timeout"]  = 10
+                import time as _mt; _mt.sleep(0.5)  # J2534 inter-module settle
                 conn   = probe._make_conn(tx, rx)
                 client = Client(conn, request_timeout=5, config=cfg)
                 client.__enter__()
@@ -2975,7 +2983,13 @@ class DiagTab(_Tab):
             import time; time.sleep(0.1)  # let UI rebuild
 
         present_count = 0
+        # Let J533 session close before probing individual modules
+        import time as _bt
+        _bt.sleep(2.0)
+
         seen_tx = set()
+        # J533 already queried above for topology — skip to avoid J2534 channel conflict
+        seen_tx.add(0x710)
 
         for mod_name, tx, rx in scan_list:
             if tx in seen_tx:
