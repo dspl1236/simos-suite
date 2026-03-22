@@ -425,8 +425,21 @@ def read_ecu_info(
     class _StrCodec(udsoncan.DidCodec):
         def encode(self, v): return bytes(v)
         def decode(self, p):
-            try: return p.decode("ascii").strip("\x00").strip()
-            except: return p.hex()
+            # Try ASCII for string DIDs (VIN, part numbers etc)
+            # Fall back to hex for binary/numeric DIDs
+            try:
+                s = p.decode("ascii").strip("\x00 \t\r\n")
+                if s and all(32 <= ord(c) < 127 for c in s):
+                    return s
+            except Exception:
+                pass
+            # Format numeric single-byte DIDs as decimal, multi-byte as hex
+            if len(p) == 1:
+                return str(p[0])
+            if len(p) <= 4:
+                val = int.from_bytes(p, "big")
+                return str(val)
+            return p.hex().upper()
         def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
 
     did_codecs = {did: _StrCodec for did in ecu.info_dids}

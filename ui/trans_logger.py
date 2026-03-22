@@ -394,6 +394,7 @@ class TransLoggerTab(tk.Frame):
     def _poll_loop(self):
         import time as _time
         import udsoncan
+from udsoncan.client import Client as UdsClient
 
         trans = self._trans
 
@@ -442,7 +443,7 @@ class TransLoggerTab(tk.Frame):
             C["green"], f"polling  {trans.project}  {trans.can_tx:#05x}→{trans.can_rx:#05x}"))
 
         try:
-            with udsoncan.Client(conn, request_timeout=5, config=cfg) as client:
+            with UdsClient(conn, request_timeout=5, config=cfg) as client:
                 try:
                     client.change_session(
                         udsoncan.services.DiagnosticSessionControl
