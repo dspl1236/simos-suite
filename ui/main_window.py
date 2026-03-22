@@ -1728,58 +1728,33 @@ class CPToolsTab(_Tab):
         import time as _t
         _t.sleep(2.0)
 
-        # Open ONE shared J2534 connection and retarget filter per module.
-        # Opening a new PassThruOpen/Connect per module causes Mongoose to hang.
-        # VW_Flash pattern: reset_for_module() changes filter, no device reopen.
+        # Per-module scan — fresh connection each time with delay between.
+        # The bus scan confirms individual J2534 connections work fine.
+        # The shared-connection approach deadlocks due to udsoncan Client internals.
         self._scan_results = {}
         cp_count = 0
         import time as _mt
-
-        _shared_conn = None
-        _j2534_mode  = self.mw.interface.upper() == "J2534"
-
-        if _j2534_mode:
-            try:
-                from cp_tools.j533_probe import J533Probe as _JP
-                _shared_conn = _JP(
-                    interface      = self.mw.interface,
-                    interface_path = self.mw.iface_path,
-                    ble_bridge     = getattr(self.mw, "ble_bridge", None),
-                )._make_conn(0x746, 0x7B0)  # open to J255 (first non-J533 module)
-                _shared_conn.open()
-                log("  J2534 shared channel open\n", "dim")
-            except Exception as _e:
-                log(f"  J2534 channel open failed: {_e}\n", "err")
-                _shared_conn = None
-                _j2534_mode  = False
 
         for mod_name, addr, tx, rx in CP_MODULES:
             if tx == 0x710:
                 log(f"\n  {mod_name}  (skipped — constellation already read)\n", "dim")
                 continue
             log(f"\n  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}\n", "hdr")
+            _mt.sleep(1.5)   # let previous J2534 channel fully close before opening next
             try:
                 from cp_tools.j533_probe import J533Probe
                 cfg = dict(configs.default_client_config)
                 cfg["data_identifiers"] = {IKA_DID: _BytesCodec}
                 cfg["request_timeout"]  = 10
 
-                if _j2534_mode and _shared_conn is not None:
-                    # Retarget filter only — never close/reopen the device
-                    _shared_conn.reset_for_module(tx, rx)
-                    conn = _shared_conn
-                else:
-                    _mt.sleep(0.5)
-                    conn = J533Probe(
-                        interface      = self.mw.interface,
-                        interface_path = self.mw.iface_path,
-                        ble_bridge     = getattr(self.mw, "ble_bridge", None),
-                    )._make_conn(tx, rx)
+                conn = J533Probe(
+                    interface      = self.mw.interface,
+                    interface_path = self.mw.iface_path,
+                    ble_bridge     = getattr(self.mw, "ble_bridge", None),
+                )._make_conn(tx, rx)
 
-                # Do NOT use context manager — it calls conn.close() which
-                # destroys the J2534 channel we need for the next module.
                 client = Client(conn, request_timeout=10, config=cfg)
-                client.open()
+                client.__enter__()
 
                 try:
                     client.change_session(
@@ -1808,10 +1783,8 @@ class CPToolsTab(_Tab):
                         lbl = "matches known blob" if same else "different blob"
                         log(f"    ✓ CP clear  {short}  ({lbl})\n", tag)
                 finally:
-                    # Don't close — keeps J2534 channel alive for next module
-                    if not _j2534_mode:
-                        try: client.close()
-                        except Exception: pass
+                    try: client.__exit__(None, None, None)
+                    except Exception: pass
 
             except udsoncan.exceptions.NegativeResponseException as nre:
                 nrc = nre.response.code if hasattr(nre, "response") else 0
@@ -1838,12 +1811,7 @@ class CPToolsTab(_Tab):
                             err_str, C["amber"])
                     log(f"    ! error: {err_str}\n", "warn")
 
-        # Hard-close the shared J2534 connection now that scan is done
-        if _shared_conn is not None:
-            try:
-                _shared_conn._hard_close = True
-                _shared_conn.close_hard()
-            except Exception: pass
+
 
         # Summary
         log(f"\n── Scan complete: {cp_count} module(s) CP active ───────────────\n",
@@ -2947,6 +2915,7 @@ class DiagTab(_Tab):
                 0x04A3: _BytesCodec,
             }
             cfg["request_timeout"] = 5
+            cfg["p2_timeout"]      = 2.0   # J533 topology DIDs need extra time
             conn = probe_j533._make_conn(0x710, 0x77A)
             with Client(conn, request_timeout=5, config=cfg) as c:
                 c.change_session(
