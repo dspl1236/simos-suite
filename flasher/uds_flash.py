@@ -519,6 +519,7 @@ def read_ecu_info(
     did_codecs[0xF186] = _ByteCodec
 
     DID_LABELS = {
+        # Standard VW identification DIDs (from VW_Flash constants)
         0xF190: "VIN",
         0xF18C: "ECU Serial",
         0xF187: "Part Number",
@@ -530,13 +531,22 @@ def read_ecu_info(
         0xF17C: "FAZIT",
         0xF19E: "ASAM File ID",
         0xF1A2: "ASAM File Version",
+        0xF1F4: "Boot Loader ID",
+        0xF1AB: "SW Block Version",
+        0xF1F1: "Tuning Protection SO2",
+        0xF15B: "Programming Date",
+        0xF1A5: "Coding Fingerprint",
         0x0405: "Flash State",
         0x0407: "Program Attempts",
         0x0408: "Successful Programs",
+        0x0600: "VW Coding Value",
+        0xEF90: "Immobilizer Status",
+        0xF1DF: "ECU Programming Info",
         0xF186: "Active Session",
         0xF442: "Module Voltage",
         0x295A: "Vehicle Mileage",
         0x295B: "Module Mileage",
+        0xF15A: "Flash Tool Log",
     }
 
     cfg = dict(configs.default_client_config)
