@@ -394,7 +394,6 @@ class TransLoggerTab(tk.Frame):
     def _poll_loop(self):
         import time as _time
         import udsoncan
-from udsoncan.client import Client as UdsClient
 
         trans = self._trans
 
