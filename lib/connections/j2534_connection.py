@@ -178,23 +178,30 @@ class J2534Connection(BaseConnection):
                 self.exit_requested = True
 
     def close(self):
+        """
+        Close J2534 connection safely.
+        PassThruDisconnect can itself hang if the DLL is waiting for a CAN
+        response. Run ALL cleanup in a daemon thread with a 3s hard timeout.
+        """
+        import threading as _t
         self.exit_requested = True
-        # Disconnect BEFORE join so PassThruReadMsgs in rxthread gets an error
-        # and the thread exits cleanly. join() with timeout prevents infinite block.
-        try:
-            self.interface.PassThruDisconnect(self.channelID)
-        except Exception:
-            pass
-        try:
-            self.interface.PassThruClose(self.devID)
-        except Exception:
-            pass
-        self.rxthread.join(timeout=2.0)
-        if self.rxthread.is_alive():
-            self.logger.warning("J2534 rxthread still alive after close — daemon thread will be killed")
         self.opened = False
-        self.logger.info("J2534 Connection closed")
 
+        def _cleanup():
+            try: self.interface.PassThruDisconnect(self.channelID)
+            except Exception: pass
+            try: self.interface.PassThruClose(self.devID)
+            except Exception: pass
+            try: self.rxthread.join(timeout=1.0)
+            except Exception: pass
+
+        _ct = _t.Thread(target=_cleanup, daemon=True)
+        _ct.start()
+        _ct.join(timeout=3.0)
+        if _ct.is_alive():
+            self.logger.warning("J2534 close timed out — DLL stuck, abandoning")
+        else:
+            self.logger.info("J2534 Connection closed")
     def specific_send(self, payload):
         self.interface.PassThruWriteMsgs(self.channelID, payload, self.protocol.value)
 
