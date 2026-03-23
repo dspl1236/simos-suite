@@ -583,36 +583,44 @@ class J533Probe:
         Read standard and confirmed CP DIDs from J533.
         Returns (std_results, cp_results) dicts keyed by DID.
 
-        Confirmed DID addresses from AU57X EV_GatewPKOUDS_001 MWB dump:
-          0x04A3  Gateway Component List (coded bitmap) — primary constellation
-          0x2A2A  Allocation table (ECU IDs + name codes)
-          0x2A26  Present bitmap
-          0x2A27  Sleep bitmap
-          0x2A28  DTC bitmap
-          0x2A29  DiagProt per module
-          0x2A2C  TP-Identifier (CAN IDs)
-          0x0438  Stored keys for theft protection slaves
-          0x0439  KS ECUs currently authenticated incorrect
-          0x043D  Number of successful key downloads
-          0x043E  Theftprotection Showroom Mode
-          0x2CA9  Service key 2 sampling status
-          0x00BE  IKA Key (readable in extended session)
-        All in extended diagnostic session (0x10 0x03), no SA2 required.
+        If connect() was called first, reuses the existing J2534 session to
+        avoid opening a second device/channel (which causes filter conflicts
+        on Mongoose and similar single-channel PassThru adapters).
         """
         self._raw_log.append("\n=== J533 PROBE ===")
         std_results: Dict[int, DIDResult] = {}
         cp_results:  Dict[int, DIDResult] = {}
 
-        with self._make_client(J533_TX, J533_RX) as client:
-            self._raw_log.append("→ DiagSessionControl extendedDiagnosticSession")
+        # Reuse existing client if connect() was already called — avoids
+        # double PassThruOpen which deadlocks single-channel J2534 adapters.
+        reuse = self._client_j533 is not None
+        if reuse:
+            client = self._client_j533
+            self._raw_log.append("(reusing existing J533 session)")
+            log.info("probe_j533: reusing existing client (avoiding double-open)")
+            # Ensure extended session + generous timeouts
             try:
                 client.change_session(
                     services.DiagnosticSessionControl.Session.extendedDiagnosticSession)
-                client.session_timing["p2_server_max"] = 30
-                client.config["request_timeout"] = 30
-            except Exception as e:
-                log.error("J533: failed to open extended session: %s", e)
-                return std_results, cp_results
+            except Exception:
+                pass  # may already be in extended session
+            client.session_timing["p2_server_max"] = 30
+            client.config["request_timeout"] = 30
+        else:
+            client = self._make_client(J533_TX, J533_RX)
+            client.__enter__()
+
+        try:
+            if not reuse:
+                self._raw_log.append("→ DiagSessionControl extendedDiagnosticSession")
+                try:
+                    client.change_session(
+                        services.DiagnosticSessionControl.Session.extendedDiagnosticSession)
+                    client.session_timing["p2_server_max"] = 30
+                    client.config["request_timeout"] = 30
+                except Exception as e:
+                    log.error("J533: failed to open extended session: %s", e)
+                    return std_results, cp_results
 
             # Standard identity DIDs
             self._raw_log.append("--- Standard DIDs ---")
@@ -633,6 +641,12 @@ class J533Probe:
                     raw_hex=raw.hex() if raw else "",
                     decoded=self._decode_did(did, raw) if raw else None,
                     error=err)
+        finally:
+            if not reuse:
+                try:
+                    client.__exit__(None, None, None)
+                except Exception:
+                    pass
 
         return std_results, cp_results
 
@@ -689,6 +703,9 @@ class J533Probe:
           0xF1DF  ECU Programming Information
           0x00BD  GKA-Key (34 bytes)
           0x00BE  IKA-Key (34 bytes)
+
+        On J2534, waits 1.5s before opening the connection to ensure any
+        prior channel (e.g. J533 probe) has fully released the device.
         """
         self._raw_log.append("\n=== J255 PROBE ===")
         serial, vin, cp_status = "", "", "UNKNOWN"
@@ -705,6 +722,11 @@ class J533Probe:
             0x00BD: "GKA-Key (34 bytes)",
             0x00BE: "IKA-Key (34 bytes)",
         }
+
+        # Allow previous J2534 channel to fully close before opening a new one.
+        # Mongoose / single-channel PassThru adapters need the device handle
+        # released before a new PassThruOpen succeeds.
+        time.sleep(1.5)
 
         with self._make_client(J255_TX, J255_RX) as client:
             try:
@@ -763,6 +785,23 @@ class J533Probe:
 
         # J533
         std_dids, cp_dids = self.probe_j533()
+
+        # Close J533 session before opening J255 on J2534.
+        # On single-channel adapters (Mongoose), only one device handle can
+        # be open at a time.  probe_j255() opens its own connection.
+        if self._client_j533 is not None:
+            try:
+                # Return J533 to default session so gateway resumes forwarding
+                self._client_j533.change_session(
+                    services.DiagnosticSessionControl.Session.defaultSession)
+            except Exception:
+                pass
+            try:
+                self._client_j533.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._client_j533 = None
+            self._raw_log.append("(J533 session closed — releasing J2534 for J255)")
 
         # J255
         j255_serial, j255_vin, j255_cp, j255_dids = self.probe_j255()
