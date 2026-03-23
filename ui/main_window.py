@@ -1591,7 +1591,7 @@ class CPToolsTab(_Tab):
         self._report = None
 
     def _build_module_rows(self):
-        for mod_name, addr, tx, rx in CP_MODULES:
+        for mod_name, addr, tx, rx, proto in CP_MODULES:
             var = tk.BooleanVar(value=False)
             self._module_vars[mod_name] = var
 
