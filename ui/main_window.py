@@ -1719,68 +1719,55 @@ class CPToolsTab(_Tab):
                 log(f"\n  {mod_name}  TX=0x{tx:03X}  KWP2000 module — skip UDS scan\n", "warn")
                 continue
             log(f"\n  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}  probing...\n", "dim")
-            _mt.sleep(1.0)   # let previous J2534 channel fully close
-            try:
-                from cp_tools.j533_probe import J533Probe
-                cfg = dict(configs.default_client_config)
-                cfg["data_identifiers"] = {IKA_DID: _BytesCodec}
-                # ISO 14229-2 timing for GATEWAY-ROUTED communication:
-                # Direct P2 = 50-100ms, but through J533 gateway add routing overhead:
-                #   Convenience CAN = 100kbps (5x slower than Diagnostic CAN 500kbps)
-                #   Routing: J255→100kbps→J533→500kbps→Mongoose adds ~60ms each way
-                #   NRC 0x25 = NoResponseFromSubnetComponent = gateway timeout
-                # Effective P2 for routed modules = ~250ms minimum, use 500ms for margin.
-                # use_server_timing=False: use our values, not ECU-reported ones
-                cfg["request_timeout"]   = 8    # 8s overall (includes J533 routing time)
-                cfg["p2_timeout"]        = 0.5  # 500ms — accounts for Convenience CAN routing
-                cfg["p2_star_timeout"]   = 5.0  # 5s for NRC 0x78 response pending
-                cfg["use_server_timing"] = False # ignore ECU-reported timing overrides
+            _mt.sleep(1.0)
 
-                conn = J533Probe(
-                    interface      = self.mw.interface,
-                    interface_path = self.mw.iface_path,
-                    ble_bridge     = getattr(self.mw, "ble_bridge", None),
-                )._make_conn(tx, rx)
+            # SSP 238: J255/J285/J234/J794 on Convenience or Drive-Train CAN via J533.
+            # Multi-frame ISO-TP (34-byte DID) can deadlock PassThruReadMsgs in the
+            # Mongoose DLL. Run probe in daemon thread with 15s hard timeout.
+            import threading as _thr
+            _probe_result = [None]
+            _probe_done   = _thr.Event()
 
-                # J2534Connection.__init__ already calls PassThruOpen/Connect/Filter.
-                # open() only starts the rxthread. __enter__ returns self (no-op).
-                # Must call conn.open() explicitly so the rxthread starts and
-                # responses from PassThruReadMsgs are delivered to udsoncan.
-                # `with Client(conn) as client` calls Client.__enter__ → conn.open()
-                # Do NOT call conn.open() explicitly — double-open creates two
-                # rxthreads competing on the same J2534 channel → deadlock.
-                with Client(conn, request_timeout=10, config=cfg) as client:
-                    client.change_session(
-                        udsoncan.services.DiagnosticSessionControl
-                        .Session.extendedDiagnosticSession)
-                    result = client.read_data_by_identifier([IKA_DID])
-                    raw = bytes(result.service_data.values[IKA_DID])
-                    self._scan_results[mod_name] = raw
+            def _run_probe(mod=mod_name, _tx=tx, _rx=rx):
+                try:
+                    from cp_tools.j533_probe import J533Probe
+                    _cfg = dict(configs.default_client_config)
+                    _cfg["data_identifiers"] = {IKA_DID: _BytesCodec}
+                    _cfg["request_timeout"]   = 8
+                    _cfg["p2_timeout"]        = 0.5
+                    _cfg["p2_star_timeout"]   = 5.0
+                    _cfg["use_server_timing"] = False
+                    _conn = J533Probe(
+                        interface      = self.mw.interface,
+                        interface_path = self.mw.iface_path,
+                        ble_bridge     = getattr(self.mw, "ble_bridge", None),
+                    )._make_conn(_tx, _rx)
+                    with Client(_conn, request_timeout=8, config=_cfg) as _c:
+                        _c.change_session(
+                            udsoncan.services.DiagnosticSessionControl
+                            .Session.extendedDiagnosticSession)
+                        _resp = _c.read_data_by_identifier([IKA_DID])
+                        _probe_result[0] = bytes(_resp.service_data.values[IKA_DID])
+                except Exception as _ex:
+                    _probe_result[0] = _ex
+                finally:
+                    _probe_done.set()
 
-                    all_zeros = all(b == 0 for b in raw)
-                    short     = raw[:8].hex().upper() + "..."
+            _thr.Thread(target=_run_probe, daemon=True).start()
+            _probe_done.wait(timeout=15)
 
-                    # Overwrite the "probing..." line header with the real result header
-                    log(f"  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}\n", "hdr")
-                    if all_zeros:
-                        cp_count += 1
-                        set_row(mod_name,
-                                "CP ACTIVE", C["red"],
-                                "all zeros — key not installed", C["red"],
-                                cp_active=True)
-                        log(f"    ✗ CP ACTIVE — IKA key all zeros\n", "err")
-                    else:
-                        same = (raw == KNOWN_IKA_BLOB)
-                        set_row(mod_name,
-                                "CP clear", C["green"],
-                                short, C["green"] if same else C["amber"])
-                        tag = "ok" if same else "warn"
-                        lbl = "matches known blob" if same else "different blob"
-                        log(f"    ✓ CP clear  {short}  ({lbl})\n", tag)
+            if not _probe_done.is_set():
+                # DLL deadlocked in PassThruReadMsgs — abandon daemon thread
+                set_row(mod_name, "DLL hang", C["amber"],
+                        "Convenience CAN multi-frame hang", C["amber"])
+                log(f"    ! PassThruReadMsgs deadlock — skipped\n", "warn")
+                continue
 
-            except udsoncan.exceptions.NegativeResponseException as nre:
-                nrc = nre.response.code if hasattr(nre, "response") else 0
-                if nrc in (0x22, 0x31):  # conditionsNotCorrect / requestOutOfRange
+            _val = _probe_result[0]
+
+            if isinstance(_val, udsoncan.exceptions.NegativeResponseException):
+                nrc = getattr(getattr(_val, "response", None), "code", 0)
+                if nrc in (0x22, 0x31):
                     set_row(mod_name, "CP ACTIVE", C["red"],
                             f"NRC 0x{nrc:02X} — CP preventing read",
                             C["red"], cp_active=True)
@@ -1791,17 +1778,36 @@ class CPToolsTab(_Tab):
                     set_row(mod_name, "NRC error", C["amber"],
                             f"NRC 0x{nrc:02X}", C["amber"])
                     log(f"    ? NRC 0x{nrc:02X}\n", "warn")
+                continue
 
-            except Exception as e:
-                err_str = str(e)[:50]
-                if "timeout" in err_str.lower():
-                    set_row(mod_name, "not present", C["muted"],
-                            "no response", C["muted"])
+            if isinstance(_val, Exception):
+                _err = str(_val)[:60]
+                if "timeout" in _err.lower():
+                    set_row(mod_name, "not present", C["muted"], "no response", C["muted"])
                     log(f"    — not present (timeout)\n", "dim")
                 else:
-                    set_row(mod_name, "error", C["amber"],
-                            err_str, C["amber"])
-                    log(f"    ! error: {err_str}\n", "warn")
+                    set_row(mod_name, "error", C["amber"], _err, C["amber"])
+                    log(f"    ! error: {_err}\n", "warn")
+                continue
+
+            # Success — raw is the IKA key bytes
+            raw = _val
+            self._scan_results[mod_name] = raw
+            all_zeros = all(b == 0 for b in raw)
+            short     = raw[:8].hex().upper() + "..."
+            log(f"  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}\n", "hdr")
+            if all_zeros:
+                cp_count += 1
+                set_row(mod_name, "CP ACTIVE", C["red"],
+                        "all zeros — key not installed", C["red"], cp_active=True)
+                log(f"    ✗ CP ACTIVE — IKA key all zeros\n", "err")
+            else:
+                same = (raw == KNOWN_IKA_BLOB)
+                set_row(mod_name, "CP clear", C["green"],
+                        short, C["green"] if same else C["amber"])
+                tag = "ok" if same else "warn"
+                lbl = "matches known blob" if same else "different blob"
+                log(f"    ✓ CP clear  {short}  ({lbl})\n", tag)
 
 
 
