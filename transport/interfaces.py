@@ -137,7 +137,14 @@ J2534_DLL_CANDIDATES = [
         r"C:\Program Files (x86)\Drew Technologies, Inc\J2534\MongoosePro ISO2\MongooseProISO2.dll",
     ),
     (
-        "MongoosePro VW",
+        # MongoosePro VW — REQUIRED for Convenience CAN modules (J255, J136, J521 etc.)
+        # OBD-II has TWO CAN bus pairs (PJRC forum / SSP 238):
+        #   Pins 6+14 = High-Speed CAN 500kbps → ECU, TCU, ABS, Airbag
+        #   Pins 3+11 = Low-Speed Convenience CAN 100kbps → Climate, Seats, Body
+        # MongoosePro ISO2 only speaks to pins 6+14.
+        # MongoosePro VW speaks to BOTH pairs — direct Convenience CAN without J533 routing.
+        # Use VW DLL for CP scan/write on J255 Climatronic and seat modules.
+        "MongoosePro VW (Convenience CAN — use for J255/J136/J521 CP)",
         r"C:\Program Files (x86)\Drew Technologies, Inc\J2534\MongoosePro VW\MongooseProVW.dll",
     ),
     (
@@ -145,7 +152,7 @@ J2534_DLL_CANDIDATES = [
         r"C:\Drew Technologies, Inc\J2534\MongoosePro ISO2\MongooseProISO2.dll",
     ),
     (
-        "MongoosePro VW (alt path)",
+        "MongoosePro VW alt path (Convenience CAN)",
         r"C:\Drew Technologies, Inc\J2534\MongoosePro VW\MongooseProVW.dll",
     ),
     # SL1 J2534 (Switchleg dongle)
@@ -418,6 +425,29 @@ class InterfaceRegistry:
 # ── Mongoose-specific notes ───────────────────────────────────────────────────
 
 MONGOOSE_NOTES = """
+Two-bus VW architecture — which DLL to use
+==========================================
+OBD-II connector has two separate CAN bus pairs (confirmed SSP 238, PJRC forum):
+
+  Pins 6+14  High-Speed / Drive Train CAN  500kbps
+             → ECU (J623), TCU (J217), ABS (J104), Airbag (J234), Instruments (J285)
+             → Use: MongoosePro ISO2  (what you use for ECU tuning)
+
+  Pins 3+11  Low-Speed / Convenience CAN  100kbps
+             → Climatronic (J255), Seat Driver (J136), Seat Pass (J521)
+             → Body Elect (J519), Central Comfort (J393), KESSY (J518)
+             → Use: MongoosePro VW  (connects to pins 3+11 directly)
+
+The ISO2 DLL routes Convenience CAN requests through J533 (gateway bridging from
+500kbps to 100kbps). This works for short single-frame exchanges (bus scan)
+but deadlocks PassThruReadMsgs on multi-frame ISO-TP (34-byte DID reads/writes).
+
+The VW DLL connects to the Convenience CAN bus directly on pins 3+11, bypassing
+J533 entirely. No speed bridging, no timing mismatch, no multi-frame hang.
+
+For CP operations on J255/J136/J521: select MongoosePro VW in the Connect tab.
+For ECU flash/tune/read: use MongoosePro ISO2 as before.
+
 Mongoose J2534 — compatibility notes
 ─────────────────────────────────────
 The Mongoose Pro VAG (Drew Technologies, later Bosch) is a legacy cable but
