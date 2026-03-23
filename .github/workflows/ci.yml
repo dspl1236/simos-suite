@@ -30,7 +30,7 @@ jobs:
         run: python -c "from core.ecu_defs import SIMOS85; from core.trans_defs import TRANS_REGISTRY; print('OK')"
 
   build-exe:
-    name: Build Windows EXE (x86 + x64)
+    name: Build Windows EXE (x86)
     needs: test
     runs-on: windows-latest
     steps:
@@ -49,9 +49,9 @@ jobs:
           open(os.environ['GITHUB_OUTPUT'],'a').write(f"version={v}\n")
           print(f"Version: {v}")
 
-      # ── x86 (32-bit) — required for 32-bit J2534 DLLs ────────────────────────
-      # All VAG J2534 cables (Mongoose, Tactrix, VNCI) ship 32-bit DLLs.
-      # A 32-bit Python process is required to load them via ctypes.
+      # x86 (32-bit) — required for all 32-bit J2534 DLLs
+      # All VAG J2534 cables (MongoosePro VW, MongoosePro ISO2, Tactrix, VNCI)
+      # ship 32-bit DLLs only. A 32-bit Python process is required to load them.
       # This is the same requirement as VW_Flash and VCDS.
       - name: Set up Python 3.11 x86
         uses: actions/setup-python@v5
@@ -59,74 +59,36 @@ jobs:
           python-version: "3.11"
           architecture: "x86"
 
-      - name: Install dependencies x86
-        shell: cmd
-        run: |
-          pip install pyinstaller
-          pip install udsoncan pyserial numpy pycryptodome python-can websocket-client
-          pip install git+https://github.com/bri3d/sa2_seed_key.git
-          pip install bleak || echo "bleak optional on x86"
-
-      - name: Patch version x86
-        shell: python
-        run: |
-          import re, pathlib
-          p = pathlib.Path("ui/main_window.py")
-          src = p.read_text(encoding="utf-8")
-          src = re.sub(r'VERSION = "[^"]+"', 'VERSION = "${{ steps.ver.outputs.version }}-x86"', src)
-          p.write_text(src, encoding="utf-8")
-
-      - name: Build x86 EXE
-        shell: cmd
-        run: python build_exe.py --no-test --no-upx
-
-      - name: Verify x86 EXE
-        shell: cmd
-        run: |
-          if not exist dist\SimosSuite.exe (echo MISSING && exit /b 1)
-          dir dist\SimosSuite.exe
-
-      - name: Rename x86 EXE
-        shell: cmd
-        run: copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.ver.outputs.version }}-x86.exe"
-
-      # ── x64 (64-bit) — for BLE, WiFi, SocketCAN ──────────────────────────────
-      - name: Set up Python 3.11 x64
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          architecture: "x86"
-
-      - name: Install dependencies x64
+      - name: Install dependencies
         shell: cmd
         run: |
           pip install pyinstaller
           pip install udsoncan bleak pyserial numpy pycryptodome python-can websocket-client
-          python -c "import struct; print('Python arch:', struct.calcsize('P')*8, 'bit')"
           pip install git+https://github.com/bri3d/sa2_seed_key.git
+          python -c "import struct; print('Python arch:', struct.calcsize('P')*8, 'bit')"
 
-      - name: Patch version x64
+      - name: Patch version
         shell: python
         run: |
           import re, pathlib
           p = pathlib.Path("ui/main_window.py")
           src = p.read_text(encoding="utf-8")
-          src = re.sub(r'VERSION = "[^"]+"', 'VERSION = "${{ steps.ver.outputs.version }}-x64"', src)
+          src = re.sub(r'VERSION = "[^"]+"', 'VERSION = "${{ steps.ver.outputs.version }}"', src)
           p.write_text(src, encoding="utf-8")
 
-      - name: Build x64 EXE
+      - name: Build EXE
         shell: cmd
         run: python build_exe.py --no-test --no-upx
 
-      - name: Verify x64 EXE
+      - name: Verify EXE
         shell: cmd
         run: |
           if not exist dist\SimosSuite.exe (echo MISSING && exit /b 1)
           dir dist\SimosSuite.exe
 
-      - name: Rename x64 EXE
+      - name: Rename EXE
         shell: cmd
-        run: copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.ver.outputs.version }}-x64.exe"
+        run: copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.ver.outputs.version }}-x86.exe"
 
       - name: Update rolling dev release
         uses: softprops/action-gh-release@v2
@@ -134,16 +96,14 @@ jobs:
           tag_name: dev-latest
           name: "Dev Build — ${{ steps.ver.outputs.version }}"
           body: |
-            ## Download the right version
+            **x86 build — works with all J2534 cables (MongoosePro VW/ISO2, Tactrix, VNCI)**
 
-            | File | Use when |
-            |------|----------|
-            | **x86** | J2534 cable (Mongoose, Tactrix, VNCI) — **use this for the car** |
-            | **x64** | BLE dongle, WiFi, SocketCAN, Virtual ECU demo |
+            Two DLLs available in the Connect tab:
+            - **MongoosePro VW** — Convenience CAN (J255 climate, seat modules) + Drive Train CAN
+            - **MongoosePro ISO2** — Drive Train CAN only (ECU, TCU flash/tune)
 
             Commit: ${{ github.sha }}
           prerelease: true
           files: |
             dist/SimosSuite-${{ steps.ver.outputs.version }}-x86.exe
-            dist/SimosSuite-${{ steps.ver.outputs.version }}-x64.exe
           fail_on_unmatched_files: true
