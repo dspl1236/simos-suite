@@ -1385,18 +1385,25 @@ class LoggerTab(_Tab):
 # ─────────────────────────────────────────────────────────────────────────────
 
 # All C7 VAG modules that participate in Component Protection
+# Protocol source: ODIS session log odis-cp-session-wauggafc7dn120188.md
+# UDS modules: J255, J285, J234, J794 — reachable via ISO-TP on Diagnostic CAN
+# KWP2000 modules: J518, J519, J136, J521, J393 — KWP on Convenience/K-Line sub-bus
+#   Cannot scan KWP modules via UDS/ISO-TP — Mongoose will hang waiting for ISO-TP
+#   frame that never comes (KWP uses different framing).
+#   IKA key on KWP modules is written via TrainICA/TrainGVA KWP services in ODIS.
+#   For our tool: read IKA from UDS modules only; KWP modules noted as "KWP2000".
+# (display name,            addr,  tx_id, rx_id,  protocol)
 CP_MODULES = [
-    # (display name,            addr,  tx_id, rx_id)  — from ConnorHowell/vag-uds-ids
-    ("J533  Gateway",            "01",  0x710, 0x77A),
-    ("J255  Climatronic",        "08",  0x746, 0x7B0),
-    ("J285  Instruments",        "17",  0x714, 0x77E),
-    ("J234  Airbag",             "15",  0x715, 0x77F),
-    ("J794  MMI",                "5F",  0x773, 0x7DD),
-    ("J136  Mem.Seat Driver",    "36",  0x74C, 0x7B6),
-    ("J521  Mem.Seat Pass.",     "06",  0x74D, 0x7B7),
-    ("J518  KESSY",              "03",  0x732, 0x79C),
-    ("J519  Body Elect.",        "09",  0x70E, 0x778),
-    ("J393  Central Comfort",    "46",  0x70D, 0x777),
+    ("J533  Gateway",            "01",  0x710, 0x77A,  "UDS"),    # gateway — skip (constellation)
+    ("J255  Climatronic",        "08",  0x746, 0x7B0,  "UDS"),    # UDS — scan ✓
+    ("J285  Instruments",        "17",  0x714, 0x77E,  "UDS"),    # UDS — scan ✓
+    ("J234  Airbag",             "15",  0x715, 0x77F,  "UDS"),    # UDS — scan ✓
+    ("J794  MMI",                "5F",  0x773, 0x7DD,  "UDS"),    # UDS — scan ✓
+    ("J136  Mem.Seat Driver",    "36",  0x74C, 0x7B6,  "KWP"),    # KWP2000 — skip
+    ("J521  Mem.Seat Pass.",     "06",  0x74D, 0x7B7,  "KWP"),    # KWP2000 — skip
+    ("J518  KESSY",              "03",  0x732, 0x79C,  "KWP"),    # KWP2000 — skip
+    ("J519  Body Elect.",        "09",  0x70E, 0x778,  "KWP"),    # KWP2000 — skip
+    ("J393  Central Comfort",    "46",  0x70D, 0x777,  "KWP"),    # KWP2000 — skip
 ]
 
 # Known IKA key blob — Feb 2024 ODIS session, J136, VIN WAUGGA**********8
@@ -1698,13 +1705,18 @@ class CPToolsTab(_Tab):
         cp_count = 0
         import time as _mt
 
-        for mod_name, addr, tx, rx in CP_MODULES:
+        for mod_name, addr, tx, rx, proto in CP_MODULES:
             if tx == 0x710:
-                # Skip J533 — it's the gateway, not a CP slave module.
-                # Its constellation (0x04A3) is read separately at the end.
-                # Scanning J533's 0x00BE here causes BusyRepeatRequest because
-                # the bus scan topology query just used this channel.
-                log(f"\n  {mod_name}  TX=0x{tx:03X}  (gateway — skipped)\n", "dim")
+                log(f"\n  {mod_name}  (gateway — skipped, constellation read separately)\n", "dim")
+                continue
+            if proto == "KWP":
+                # KWP2000 module — cannot scan via UDS/ISO-TP.
+                # Opening ISO-TP J2534 connection to a KWP module makes the
+                # Mongoose hang waiting for ISO-TP frames that never arrive.
+                # IKA key on these modules is written via KWP TrainICA/TrainGVA
+                # (ODIS-only). We note them but skip UDS scan.
+                set_row(mod_name, "KWP2000", C["amber"], "KWP module — scan via ODIS", C["amber"])
+                log(f"\n  {mod_name}  TX=0x{tx:03X}  KWP2000 module — skip UDS scan\n", "warn")
                 continue
             log(f"\n  {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}  probing...\n", "dim")
             _mt.sleep(1.0)   # let previous J2534 channel fully close
