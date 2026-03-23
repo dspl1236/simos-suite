@@ -1626,6 +1626,13 @@ class CPToolsTab(_Tab):
                                 width=70)
             blob_lbl.grid(row=0, column=4, padx=2, sticky="w")
 
+            # KWP modules: dim the row, pre-fill status
+            if proto == "KWP":
+                name_lbl.config(fg=C["dim"])
+                addr_lbl.config(fg=C["dim"])
+                status_lbl.config(text="KWP2000", fg=C["amber"])
+                blob_lbl.config(text="write via ODIS only", fg=C["dim"])
+
             self._module_rows[mod_name] = {
                 "row": row, "cb": cb,
                 "status": status_lbl, "blob": blob_lbl
