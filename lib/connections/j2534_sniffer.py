@@ -183,6 +183,14 @@ class J2534CanSniffer:
         # Set up pass-all filter — mask = 0x00000000 passes everything
         self._setup_pass_filter()
 
+        # Capture DLL function pointers for raw CAN operations.
+        # J2534.__init__ sets these as module globals — store as instance
+        # attrs for reliable access from _setup_pass_filter / read_frame.
+        import importlib
+        _mod = importlib.import_module(self.__class__.__module__.rsplit(".", 1)[0] + ".j2534")
+        self._dll_start_filter = _mod.dllPassThruStartMsgFilter
+        self._dll_read_msgs = _mod.dllPassThruReadMsgs
+
         # Clear any stale data in the receive buffer
         self._j2534.PassThruIoctl(self._chanID, Ioctl_ID.CLEAR_RX_BUFFER)
 
@@ -192,8 +200,8 @@ class J2534CanSniffer:
 
     def _setup_pass_filter(self):
         """Configure a PASS_FILTER with mask=0 to receive all CAN IDs."""
-        from .j2534 import dllPassThruStartMsgFilter
-
+        # Access the DLL function pointer via the module — it's set as a
+        # module-level global by J2534.__init__ (which we already called).
         mask_msg = PASSTHRU_MSG()
         mask_msg.ProtocolID = Protocol_ID.CAN.value
         mask_msg.DataSize = 4
@@ -210,7 +218,7 @@ class J2534CanSniffer:
 
         msg_id = c_ulong(0)
 
-        result = dllPassThruStartMsgFilter(
+        result = self._dll_start_filter(
             self._chanID,
             c_ulong(Filter.PASS_FILTER.value),
             byref(mask_msg),
@@ -231,13 +239,11 @@ class J2534CanSniffer:
         if not self._opened:
             raise RuntimeError("Sniffer is not open")
 
-        from .j2534 import dllPassThruReadMsgs
-
         msg = PASSTHRU_MSG()
         msg.ProtocolID = Protocol_ID.CAN.value
         num_msgs = c_ulong(1)
 
-        result = dllPassThruReadMsgs(
+        result = self._dll_read_msgs(
             self._chanID, byref(msg), byref(num_msgs), c_ulong(timeout_ms)
         )
 
