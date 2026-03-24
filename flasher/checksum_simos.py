@@ -82,8 +82,12 @@ S8_CHECKSUM_HEADER_OFFSETS = {
     6: 0x340,  # CBOOT_TEMP
 }
 
-ECM3_CAL_CHECKSUM_OFFSET  = 0x400   # ECM3 checksum header in CAL
-ECM3_ASW1_ADDRESSES_OFFSET = 0x520  # ECM3 area addresses in ASW1
+ECM3_CAL_CHECKSUM_OFFSET       = 0x400   # ECM3 checksum header in CAL
+ECM3_ASW1_ADDRESSES_OFFSET_LATE  = 0x520  # ECM3 area addresses in ASW1 — late cars (2012+)
+ECM3_ASW1_ADDRESSES_OFFSET_EARLY = 0x540  # ECM3 area addresses in ASW1 — early cars (pre-2012)
+# Default to late variant (0x520) — confirmed correct for 2013 C7 A6/A7 3.0T TFSI (CGWB/CTUA)
+# Use detect_ecm3_asw1_offset() to auto-detect if you're unsure which variant your ASW1 is
+ECM3_ASW1_ADDRESSES_OFFSET = ECM3_ASW1_ADDRESSES_OFFSET_LATE
 
 
 def validate_crc32(data: bytes, block_num: int,
@@ -128,10 +132,59 @@ def fix_crc32(data: bytes, block_num: int,
     return bytes(out)
 
 
-def validate_ecm3(cal_data: bytes, asw1_data: bytes = None) -> tuple[bool, int, int]:
+def detect_ecm3_asw1_offset(asw1_data: bytes,
+                              cal_base: int = 0xA0040000,
+                              cal_size: int = 0x3C000) -> int:
+    """
+    Auto-detect whether this ASW1 is an early (0x540) or late (0x520) ECM3 variant.
+
+    Reads the first area start address from each candidate offset and checks
+    whether it falls within the CAL address range. Returns the offset that
+    produces valid addresses, defaulting to the late variant (0x520) if both
+    or neither are valid.
+
+    VW_Flash reference:
+        ecm3_cal_monitor_addresses       = 0x520  (late, most cars from ~2012)
+        ecm3_cal_monitor_addresses_early = 0x540  (early, pre-2012 builds)
+    """
+    cal_end = cal_base + cal_size
+
+    def _is_valid(offset):
+        if offset + 4 > len(asw1_data):
+            return False
+        addr = struct.unpack_from("<I", asw1_data, offset)[0]
+        return cal_base <= addr < cal_end
+
+    late_ok  = _is_valid(ECM3_ASW1_ADDRESSES_OFFSET_LATE)
+    early_ok = _is_valid(ECM3_ASW1_ADDRESSES_OFFSET_EARLY)
+
+    if late_ok and not early_ok:
+        log.info("ECM3 variant: LATE (0x%X)", ECM3_ASW1_ADDRESSES_OFFSET_LATE)
+        return ECM3_ASW1_ADDRESSES_OFFSET_LATE
+    elif early_ok and not late_ok:
+        log.info("ECM3 variant: EARLY (0x%X)", ECM3_ASW1_ADDRESSES_OFFSET_EARLY)
+        return ECM3_ASW1_ADDRESSES_OFFSET_EARLY
+    else:
+        # Both valid or neither — default to late (correct for 2013 C7 A6/A7 3.0T)
+        log.info(
+            "ECM3 variant: defaulting to LATE (0x%X) — both=%s neither=%s",
+            ECM3_ASW1_ADDRESSES_OFFSET_LATE, late_ok and early_ok, not late_ok and not early_ok
+        )
+        return ECM3_ASW1_ADDRESSES_OFFSET_LATE
+
+
+def validate_ecm3(cal_data: bytes, asw1_data: bytes = None,
+                  asw1_offset: int = None) -> tuple[bool, int, int]:
     """
     Validate the ECM3 64-bit summation checksum in CAL.
-    ECM3 area addresses are read from ASW1 at offset 0x520 (or from CAL at 0x440).
+
+    ECM3 area addresses are read from ASW1. Two ASW1 offset variants exist:
+      - Late  (0x520): 2012+ cars — default, correct for 2013 C7 A6/A7 3.0T TFSI
+      - Early (0x540): pre-2012 builds
+
+    Pass asw1_offset= explicitly to override auto-detection, or omit to
+    let detect_ecm3_asw1_offset() pick the right variant automatically.
+
     Returns (is_valid, stored_checksum, calculated_checksum).
     """
     hoff = ECM3_CAL_CHECKSUM_OFFSET
@@ -142,13 +195,16 @@ def validate_ecm3(cal_data: bytes, asw1_data: bytes = None) -> tuple[bool, int, 
     # Try to read addresses from CAL first (older ECUs)
     cal_addr = struct.unpack_from("<I", cal_data, hoff + 24)[0]
     if cal_addr > 0 and asw1_data is None:
-        # Addresses are embedded in CAL
+        # Addresses are embedded in CAL (very old ECUs)
         addr_data   = cal_data
         addr_offset = hoff + 24
     elif asw1_data is not None:
-        # Newer ECUs: addresses are in ASW1
-        addr_data   = asw1_data
-        addr_offset = ECM3_ASW1_ADDRESSES_OFFSET
+        # Determine which ASW1 variant to use
+        if asw1_offset is not None:
+            addr_offset = asw1_offset
+        else:
+            addr_offset = detect_ecm3_asw1_offset(asw1_data)
+        addr_data = asw1_data
     else:
         log.warning("ECM3: no ASW1 provided and CAL has no embedded addresses")
         return (False, 0, 0)
@@ -180,10 +236,16 @@ def validate_ecm3(cal_data: bytes, asw1_data: bytes = None) -> tuple[bool, int, 
     return (stored == checksum, stored, checksum)
 
 
-def fix_ecm3(cal_data: bytes, asw1_data: bytes = None) -> bytes:
-    """Fix the ECM3 64-bit checksum in CAL. Returns corrected CAL bytes."""
+def fix_ecm3(cal_data: bytes, asw1_data: bytes = None,
+             asw1_offset: int = None) -> bytes:
+    """
+    Fix the ECM3 64-bit checksum in CAL. Returns corrected CAL bytes.
+
+    asw1_offset: override ECM3 ASW1 variant (0x520=late, 0x540=early).
+    If omitted, auto-detected from asw1_data content.
+    """
     hoff = ECM3_CAL_CHECKSUM_OFFSET
-    valid, stored, calculated = validate_ecm3(cal_data, asw1_data)
+    valid, stored, calculated = validate_ecm3(cal_data, asw1_data, asw1_offset)
 
     if valid:
         log.info("ECM3: already valid (0x%016X)", stored)
