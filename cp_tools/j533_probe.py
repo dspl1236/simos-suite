@@ -626,6 +626,8 @@ class J533Probe:
             self._raw_log.append("--- Standard DIDs ---")
             for did, label in STD_DIDS.items():
                 raw, err = self._read_did(client, did)
+                status = raw.hex() if raw else f"ERR:{err}"
+                self._raw_log.append(f"  DID {did:#06x} ({label}): {status}")
                 std_results[did] = DIDResult(
                     did=did, label=label,
                     raw_hex=raw.hex() if raw else "",
@@ -636,6 +638,8 @@ class J533Probe:
             self._raw_log.append("--- Confirmed CP/constellation DIDs ---")
             for did, label in CONFIRMED_CP_DIDS.items():
                 raw, err = self._read_did(client, did)
+                status = raw.hex() if raw else f"ERR:{err}"
+                self._raw_log.append(f"  DID {did:#06x} ({label}): {status}")
                 cp_results[did] = DIDResult(
                     did=did, label=label,
                     raw_hex=raw.hex() if raw else "",
@@ -978,19 +982,88 @@ class J533Probe:
 
     # ── Public convenience API (used by CPToolsTab check button) ─────────────
 
+    def _wakeup(self) -> None:
+        """
+        Send tester-present on functional broadcast address 0x7DF to wake the
+        Lear J533 gateway from sleep before opening a diagnostic session.
+
+        The C7 Lear gateway (4H0907468x) requires this on first contact —
+        without it, the extended session request times out silently.
+        This mirrors what ODIS-E sends before any gateway diagnostic sequence.
+        """
+        try:
+            wake_conn = self._make_conn(0x7DF, 0x7DF)  # functional broadcast
+            wake_conn.open()
+            # 0x3E 0x80 = TesterPresent, suppressPositiveResponse bit set
+            wake_conn.specific_send(bytes([0x3E, 0x80]))
+            time.sleep(0.05)
+            wake_conn.specific_send(bytes([0x3E, 0x80]))
+            time.sleep(0.05)
+            wake_conn.close()
+            log.info("J533 wakeup sent on 0x7DF")
+        except Exception as e:
+            log.debug("J533 wakeup (non-fatal): %s", e)
+
     def connect(self) -> "J533Probe":
         """
         Open an extended diagnostic session on J533.
         Stores the client in self._client_j533 for subsequent calls.
         Returns self for chaining.
+
+        Procedure:
+          1. Send wakeup TesterPresent on functional address 0x7DF
+          2. Try extended session on physical address 0x710 (normal path)
+          3. If that fails, retry via functional address 0x7DF (some J533 variants
+             only respond to functional addressing for DiagnosticSessionControl)
+          4. Log the NRC/timeout so the caller can surface it clearly
         """
+        # Step 1: Wake the gateway
+        self._wakeup()
+        time.sleep(0.1)
+
+        # Step 2: Open session on physical address
         client = self._make_client(J533_TX, J533_RX)
         client.__enter__()
-        client.change_session(
-            services.DiagnosticSessionControl.Session.extendedDiagnosticSession)
-        self._client_j533 = client
-        log.info("J533 extended session open")
-        return self
+        try:
+            client.change_session(
+                services.DiagnosticSessionControl.Session.extendedDiagnosticSession)
+            self._client_j533 = client
+            log.info("J533 extended session open (physical 0x%03X)", J533_TX)
+            return self
+        except Exception as e:
+            log.warning("J533 physical session failed (%s) — trying functional 0x7DF", e)
+
+        # Step 3: Retry via functional broadcast address 0x7DF
+        # Some C7 Lear J533 variants only accept DiagSessionControl on 0x7DF
+        try:
+            client.__exit__(None, None, None)
+        except Exception:
+            pass
+
+        try:
+            # Open a second connection using functional TX address
+            client2 = self._make_client(0x7DF, J533_RX)
+            client2.__enter__()
+            client2.change_session(
+                services.DiagnosticSessionControl.Session.extendedDiagnosticSession)
+            # Switch back to physical client for subsequent DID reads
+            # (functional addressing is one-shot for session open only)
+            client2.__exit__(None, None, None)
+            time.sleep(0.05)
+            # Now open physical client — gateway should now be in extended session
+            client3 = self._make_client(J533_TX, J533_RX)
+            client3.__enter__()
+            self._client_j533 = client3
+            log.info("J533 extended session open (via functional 0x7DF fallback)")
+            return self
+        except Exception as e2:
+            log.error("J533 connect failed on both physical and functional: %s", e2)
+            try: client2.__exit__(None, None, None)
+            except Exception: pass
+            raise RuntimeError(
+                f"J533 did not respond to extended session request. "
+                f"Physical 0x{J533_TX:03X}: {e}  Functional 0x7DF: {e2}"
+            ) from e2
 
     def disconnect(self):
         """Close the J533 client session."""
