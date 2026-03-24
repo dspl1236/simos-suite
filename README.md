@@ -50,8 +50,8 @@ is not for you — though the license doesn't stop you. The copyleft does.
 | **Flash** | Full UDS CAL block flash: extended session → SA2 → erase (0xFF00) → RequestDownload → TransferData → exit → verify (0xFF01). Read CAL from ECU via ReadMemoryByAddress and auto-load into Tune tab. |
 | **Tune** | Simos8.5 calibration editor — all 14 tables with real RPM/load axis labels. Heat-map coloring. Editable cells, color updates live. 2D chart for 1×N tables (MAF, throttle, limits). Lean diagnosis. Fix checksums + save. |
 | **Logger** | Live DID poller using `logger.LogSession` — 16 channels, configurable interval, CSV export. |
-| **CP Tools** | J533 constellation probe — reads all CP/IKA/GKA DIDs. ODX parser. CP routine ID 0x0226 wired in (pending hardware confirmation). |
-| **Raw Sniff** | ESP32 BLE sniff mode — hex dump of every ISO-TP frame, CAN ID filter, save log. |
+| **CP Tools** | Full CP module scan — reads IKA key (DID 0x00BE) from all enrolled modules in one pass. J533 constellation probe, ODX parser. IKA key write + constellation update. CP routine ID 0x0226 wired in (pending hardware confirmation). |
+| **Raw Sniff** | Passive CAN bus listener via J2534 raw CAN channel. Use with OBD splitter alongside VCDS/ODIS to capture full UDS exchanges. ISO-TP reassembly, UDS service decode, PCAP export for Wireshark. |
 | **Trans** | ZF 8HP / DL501 / DQ250 / DQ381 live data — gear, selector, ATF temp, shaft speeds, torque, pressures. |
 
 ---
@@ -72,6 +72,9 @@ python -m tests.sim_runner --headless
 
 # Real hardware:
 python -m ui
+
+# Passive CAN sniffer (OBD splitter + J2534):
+# See Raw Sniff tab — captures VCDS/ODIS traffic without interfering
 ```
 
 ---
@@ -169,7 +172,7 @@ python -m cp_tools.mwb_extract --confirm 0x0226
 
 - [x] Phase 1 — Foundation (ECU defs, UDS flash, BLE transport, J533 probe, ODX parser)
 - [x] Phase 2 — Full 8-tab GUI, trans live data, sim harness
-- [x] Phase 3 — CP routine ID extracted (`0x0226`), logger wired, EXE build
+- [x] Phase 3 — CP routine ID extracted (`0x0226`), logger wired, EXE build, passive CAN sniffer
 - [ ] Phase 4 — CP hardware confirmation + full auth sequence
 - [ ] Phase 5 — Android APK (Kotlin BLE client)
 
