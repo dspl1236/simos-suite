@@ -29,11 +29,12 @@ C:\ProgramData\ODIS-S\diagdata\
 C:\ProgramData\ODIS-S\PostSetup\
 ```
 
-**2. Live UDS captures**
+**2. Live UDS captures (highest impact after .sd.db)**
 
-Packet captures from a real ODIS CP removal session, taken via the Raw Sniff
-tab alongside ODIS. Even a single confirmed capture would close the loop on
-the token format.
+Packet captures from a real ODIS CP removal session using the Raw Sniff tab
+with an OBD splitter — VCDS/ODIS on one leg, Mongoose on the other. The sniffer
+captures every CAN frame passively and exports to PCAP for Wireshark analysis.
+Even a single confirmed capture would close the loop on the GEKO token format.
 
 **3. Hardware testing**
 
@@ -80,11 +81,12 @@ python -m tests.sim_runner
 
 ### Areas needing work
 
-- `flasher/uds_flash.py` — CAL read-back (`_do_read_cal` is a stub)
-- `logger/` — LogSession is implemented; LoggerTab wiring needs live testing
-- `cp_tools/j533_probe.py` — CP auth routine once routine ID is confirmed
-- `tests/` — more coverage for edge cases (session timeouts, NRC handling)
-- EXE build — `simos_suite.spec` for PyInstaller
+- `cp_tools/j533_probe.py` — CP auth routine once routine ID `0x0226` is confirmed on live hardware
+- `lib/connections/can_sniffer.py` — ESP32 USB serial sniff mode (currently J2534 only)
+- `logger/` — LoggerTab live testing on hardware (backend is implemented)
+- `tests/` — more coverage for edge cases (session timeouts, NRC handling, J2534 channel lifecycle)
+- Live UDS capture of an ODIS CP removal session (using the Raw Sniff tab with an OBD splitter)
+- Android APK — Kotlin BLE client using the same ESP32 bridge
 
 ### Code style
 
