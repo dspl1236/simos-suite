@@ -37,10 +37,20 @@ def main():
     ok = run_headless(args.ecu, args.trans)
     all_pass = all_pass and ok
 
-    # 2. ECU backend tests
+    # 2. Checksum + FRF tests
+    print("\n[2/4] Checksum + FRF tests (test_checksums)")
+    try:
+        import tests.test_checksums as tc
+        ok = tc.run(args.verbose)
+        all_pass = all_pass and ok
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        all_pass = False
+
+    # 3. ECU backend tests
     # sim_ecu runs all @_test-decorated functions at import time and
     # exposes _results + _print_results().
-    print("\n[2/3] ECU backend tests (sim_ecu)")
+    print("\n[3/4] ECU backend tests (sim_ecu)")
     try:
         import tests.sim_ecu as sim_ecu
         ok = sim_ecu._print_results()   # returns True if all pass
@@ -50,7 +60,7 @@ def main():
         all_pass = False
 
     # 3. Transmission tests
-    print("\n[3/3] transmission tests (sim_trans)")
+    print("\n[4/4] transmission tests (sim_trans)")
     try:
         import tests.sim_trans as sim_trans
         ok = sim_trans._print_results()
