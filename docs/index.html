@@ -509,12 +509,13 @@ const BLE_HEADER_SZ = 8;
 
 // Module definitions: name, TX, RX
 const MODULES = [
+  // CAN TX/RX addresses confirmed from AU57X MWB dump + CP_MODULES
   { name: 'J533',  desc: 'Gateway',     tx: 0x710, rx: 0x77A },
-  { name: 'J255',  desc: 'Climatronic', tx: 0x746, rx: 0x7AE },
-  { name: 'J285',  desc: 'Instruments', tx: 0x720, rx: 0x728 },
-  { name: 'J234',  desc: 'Airbag',      tx: 0x736, rx: 0x73E },
-  { name: 'J794',  desc: 'MMI',         tx: 0x7C0, rx: 0x7C8 },
-  { name: 'J136',  desc: 'Mem. Seat',   tx: 0x714, rx: 0x77C },
+  { name: 'J255',  desc: 'Climatronic', tx: 0x746, rx: 0x7B0 },
+  { name: 'J285',  desc: 'Instruments', tx: 0x714, rx: 0x77E },
+  { name: 'J234',  desc: 'Airbag',      tx: 0x715, rx: 0x77F },
+  { name: 'J794',  desc: 'MMI',         tx: 0x773, rx: 0x7DD },
+  { name: 'J136',  desc: 'Mem. Seat',   tx: 0x74C, rx: 0x7B6 },  // KWP2000 — IKA read may NRC
 ];
 
 // Known IKA blob from Feb 2024 ODIS session
