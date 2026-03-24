@@ -307,7 +307,7 @@ SIMOS85 = ECUDef(
     blocks = {
         1: BlockDef(1, "CBOOT", 0x80020000, 0x13E00,  0x020000, 0x300, "FD_0"),
         2: BlockDef(2, "ASW1",  0x80080000, 0x17FE00, 0x080000, 0x300, "FD_1"),
-        3: BlockDef(3, "CAL",   0xA0040000, 0x3C000,  0x040000, 0x300, "FD_2",
+        3: BlockDef(3, "CAL",   0xA0040000, 0x3FE00,  0x040000, 0x300, "FD_2",
                     cal_block=True),
         6: BlockDef(6, "CBOOT_TEMP", 0xA0040000, 0x13E00, 0x040000, 0x340,
                     "FD_T", flashable=False),
@@ -331,7 +331,7 @@ SIMOS85 = ECUDef(
     },
     info_dids = STD_INFO_DIDS,
     notes = (
-        "XOR crypto CONFIRMED from FL_03F906070KA_4383.odx (ENCRYPT-COMPRESS=0x11). "
+        "XOR crypto CONFIRMED. ENCRYPT-COMPRESS=0x11 (XOR_COUNTER+LZSS). Block sizes confirmed from FL_4G0907551D__0006.frf ODX: PBL=0x13E00, ASW=0x17FE00, CAL=0x3FE00. "
         "SA2 script from VW_Flash S85 — CONFIRMED via VCDS: ASAM EV_ECM30TFS0214G0907551D 001007 AU57. "
         "Actual part number: 4G0 907 551 D (HW: 4G0 907 551 A) — CTUA/CGWB variant. "
         "4G0906014F in flashdaten is the C7 TDI diesel (EDC17), NOT this ECU. "
