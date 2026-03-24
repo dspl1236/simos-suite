@@ -51,7 +51,7 @@ try:
         ECU_REGISTRY, TCU_REGISTRY,
     )
     from flasher.uds_flash import (
-        flash_cal, read_ecu_info, FlashProgress, _make_connection,
+        flash_cal, flash_blocks, read_ecu_info, FlashProgress, _make_connection,
     )
     from tuner.cal_parser import CalParser
     from transport.interfaces import InterfaceRegistry
@@ -410,7 +410,14 @@ class FlashTab(_Tab):
     def __init__(self, parent, mw):
         super().__init__(parent, mw)
         self._cal_bytes: Optional[bytes] = None
-        self._cal_path = tk.StringVar(value="no file loaded")
+        self._cal_path  = tk.StringVar(value="no file loaded")
+
+        # Multi-block file slots  {block_num: (bytes|None, StringVar)}
+        self._block_files: dict = {
+            1: [None, tk.StringVar(value="not loaded")],  # CBOOT
+            2: [None, tk.StringVar(value="not loaded")],  # ASW1
+            3: [None, tk.StringVar(value="not loaded")],  # CAL
+        }
 
         _section(self, "CAL block")
 
@@ -462,6 +469,36 @@ class FlashTab(_Tab):
                        activeforeground=C["text"],
                        font=("Menlo", 10)).pack(anchor="w")
 
+        _section(self, "full flash (multi-block)")
+
+        mb_card = _card(self, padx=12, pady=10)
+        mb_card.pack(fill="x", padx=14, pady=4)
+
+        tk.Label(mb_card, text="Load individual blocks to flash. Leave unloaded to skip.",
+                 fg=C["muted"], bg=C["surface"], font=("Menlo", 9),
+                 anchor="w").pack(fill="x", pady=(0, 6))
+
+        BLOCK_LABELS = {1: "CBOOT (block 1)", 2: "ASW1  (block 2)", 3: "CAL   (block 3)"}
+        for bnum, blabel in BLOCK_LABELS.items():
+            row = _frame(mb_card, bg=C["surface"])
+            row.pack(fill="x", pady=2)
+            _btn(row, f"open {blabel.split()[0].lower()}",
+                 lambda n=bnum: self._open_block_file(n)).pack(side="left")
+            tk.Label(row, textvariable=self._block_files[bnum][1],
+                     fg=C["muted"], bg=C["surface"],
+                     font=("Menlo", 9)).pack(side="left", padx=8)
+
+        mb_btn_row = _frame(mb_card, bg=C["surface"])
+        mb_btn_row.pack(fill="x", pady=(8, 0))
+        self._flash_blocks_btn = _btn(
+            mb_btn_row, "flash loaded blocks",
+            self._do_flash_blocks, primary=True, state="disabled")
+        self._flash_blocks_btn.pack(side="left")
+        tip(self._flash_blocks_btn,
+            "Flash all loaded blocks in correct order (CBOOT→ASW1→CAL).\n"
+            "Blocks marked 'not loaded' are skipped.\n"
+            "Requires SA2 unlock. Do not interrupt once started.")
+
         _section(self, "progress")
 
         prog_card = _card(self, padx=12, pady=10)
@@ -492,6 +529,7 @@ class FlashTab(_Tab):
         if self._cal_bytes:
             self._write_btn.config(state="normal")
             self._verify_btn.config(state="normal")
+        self._refresh_flash_blocks_btn()
 
     def on_disconnect(self):
         for b in (self._read_btn, self._write_btn, self._verify_btn):
@@ -692,6 +730,68 @@ class FlashTab(_Tab):
         self._prog_label.config(text=f"error: {msg}", fg=C["red"])
         import logging; logging.getLogger("SimosSuite.GUI").error("Flash error: %s", msg)
 
+    def _open_block_file(self, block_num: int):
+        labels = {1: "CBOOT", 2: "ASW1", 3: "CAL"}
+        path = filedialog.askopenfilename(
+            title=f"Open {labels.get(block_num, 'block')} .bin",
+            filetypes=[("Binary files", "*.bin"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            fname = os.path.basename(path)
+            self._block_files[block_num][0] = data
+            self._block_files[block_num][1].set(f"{fname}  ({len(data):,} B)")
+            self._log_line(
+                f"block {block_num} ({labels.get(block_num)}): {fname} "
+                f"({len(data):,} bytes)\n", "ok")
+            # Enable flash button if at least one block is loaded and connected
+            self._refresh_flash_blocks_btn()
+        except Exception as e:
+            messagebox.showerror("File error", str(e))
+
+    def _refresh_flash_blocks_btn(self):
+        any_loaded = any(v[0] is not None for v in self._block_files.values())
+        state = "normal" if (any_loaded and self.mw.connected) else "disabled"
+        self._flash_blocks_btn.config(state=state)
+
+    def _do_flash_blocks(self):
+        loaded = {n: v[0] for n, v in self._block_files.items() if v[0] is not None}
+        if not loaded:
+            messagebox.showwarning("No files", "Load at least one block file first.")
+            return
+        names = {1: "CBOOT", 2: "ASW1", 3: "CAL"}
+        block_list = ", ".join(names.get(n, str(n)) for n in sorted(loaded))
+        if not messagebox.askyesno(
+                "Confirm flash",
+                f"Flash blocks: {block_list}\n\n"
+                f"Target: {self.mw.ecu.name if self.mw.ecu else 'ECU'}\n\n"
+                "This will erase and reprogram the selected blocks.\n"
+                "Ensure the vehicle is on a battery charger.\n\n"
+                "Continue?"):
+            return
+        self._set_buttons(False)
+        self._run(self._flash_blocks_task)
+
+    def _flash_blocks_task(self):
+        def cb(p: "FlashProgress"):
+            self._ui(self._update_progress, p)
+        try:
+            loaded = {n: v[0] for n, v in self._block_files.items() if v[0] is not None}
+            ok = flash_blocks(
+                ecu            = self.mw.ecu,
+                blocks         = loaded,
+                interface      = self.mw.interface,
+                interface_path = self.mw.iface_path,
+                callback       = cb,
+                dry_run        = self._dry_var.get(),
+            )
+            self._ui(self._flash_done, ok)
+        except Exception as e:
+            self._ui(self._flash_error, str(e))
+
     def _set_buttons(self, enabled: bool):
         s = "normal" if enabled else "disabled"
         if self.mw.connected:
@@ -699,6 +799,7 @@ class FlashTab(_Tab):
         if self._cal_bytes and self.mw.connected:
             self._write_btn.config(state=s)
             self._verify_btn.config(state=s)
+        self._refresh_flash_blocks_btn()
 
     def _log_line(self, text: str, tag: str = ""):
         self._append_log(self._log, text, tag)
