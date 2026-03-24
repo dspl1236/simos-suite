@@ -430,9 +430,15 @@ def flash_cal(
             max_block = 0xFFD
 
         # 8. TransferData
+        # Send tester_present every KEEPALIVE_EVERY chunks to prevent session
+        # timeout on slow adapters or large blocks (ASW1 ~1.5MB = ~375 chunks).
+        # VW_Flash relies on p2_server_max=30s being sufficient, but on the
+        # Mongoose and ESP32 adapters actual throughput can be much slower.
+        KEEPALIVE_EVERY = 50  # ~every 200KB at 0xFFB chunk size
         block_size = max_block - 2
         counter = 1
         offset = 0
+        chunk_count = 0
         while offset < total:
             chunk = encrypted[offset:offset + block_size]
             pct = 30 + int(60 * offset / total)
@@ -447,6 +453,14 @@ def flash_cal(
             offset += len(chunk)
             counter = (counter + 1) & 0xFF
             if counter == 0: counter = 1
+            chunk_count += 1
+            # Keepalive: reset session timer so slow adapters don't time out
+            if chunk_count % KEEPALIVE_EVERY == 0 and not dry_run:
+                try:
+                    client.tester_present()
+                    log.debug("TransferData keepalive at offset %#x (%d%%)", offset, pct)
+                except Exception as e:
+                    log.warning("tester_present keepalive failed at %#x: %s", offset, e)
 
         # 9. RequestTransferExit
         callback(FlashProgress("TRANSFER", "Transfer complete, exiting…", 92, "CAL"))
