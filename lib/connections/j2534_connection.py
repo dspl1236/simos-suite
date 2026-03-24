@@ -123,10 +123,17 @@ class J2534Connection(BaseConnection):
 
         if self.result == Error_ID.ERR_SUCCESS:
             self.logger.info("Set ISO15665_STMIN_TX to: " + str(stmin.Value))
+            self.stmin_tx_supported = True
         else:
-            self.logger.info("Failed to set ISO15765_STMIN_TX: " + str(self.result))
+            self.logger.warning(
+                "STMIN_TX IOCTL not supported by this J2534 adapter (result=%s). "
+                "Multi-frame flash transfers may fail or produce incomplete writes. "
+                "Recommended adapters: Tactrix OpenPort 2.0, or Switchleg ESP32 BridgeLEG firmware.",
+                self.result,
+            )
             message = self.interface.PassThruGetLastError()
-            self.logger.info("Failure message: " + str(message.value))
+            self.logger.warning("Adapter error detail: %s", message.value)
+            self.stmin_tx_supported = False
 
         self.rxqueue = queue.Queue()
         self.exit_requested = False
