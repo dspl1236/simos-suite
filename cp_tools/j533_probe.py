@@ -1041,14 +1041,30 @@ class J533Probe:
             conn = self._client_j533._connection
             request_bytes = bytes([0x31, 0x01, rid_hi, rid_lo]) + payload
             conn.specific_send(request_bytes)
-            resp = conn.specific_wait_frame(timeout=5.0)
+            # Loop to handle NRC 0x78 (requestCorrectlyReceived-ResponsePending)
+            # ECU may send one or more pending responses before the real answer.
+            # VW gateway modules are known to take up to 5s for CP routine responses.
+            resp = None
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                frame = conn.specific_wait_frame(timeout=5.0)
+                if frame is None:
+                    break
+                fb = bytes(frame)
+                # NRC 0x78 = pending — keep waiting
+                if len(fb) >= 3 and fb[0] == 0x7F and fb[2] == 0x78:
+                    log.debug("CP routine: NRC 0x78 pending — waiting...")
+                    continue
+                resp = fb
+                break
             log.info("CP routine response: %s", resp.hex() if resp else "None")
-            return bytes(resp) if resp else None
+            return resp if resp else None
         except Exception as e:
             log.warning("CP routine error: %s", e)
             # Fall back: use the client's native request mechanism
             try:
                 import udsoncan.services as _svc
+                self._client_j533.config["request_timeout"] = 10
                 resp = self._client_j533.routine_control(
                     request_type=_svc.RoutineControl.RequestType.startRoutine,
                     routine_id=routine_id,
@@ -1072,8 +1088,18 @@ class J533Probe:
         try:
             conn = self._client_j533._connection
             conn.specific_send(bytes([0x31, 0x03, rid_hi, rid_lo]))
-            resp = conn.specific_wait_frame(timeout=5.0)
-            return bytes(resp) if resp else None
+            # Handle NRC 0x78 pending responses
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                frame = conn.specific_wait_frame(timeout=5.0)
+                if frame is None:
+                    break
+                fb = bytes(frame)
+                if len(fb) >= 3 and fb[0] == 0x7F and fb[2] == 0x78:
+                    log.debug("CP routine result: NRC 0x78 pending — waiting...")
+                    continue
+                return fb
+            return None
         except Exception as e:
             log.warning("CP routine result error: %s", e)
             return None
