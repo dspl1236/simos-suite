@@ -2404,6 +2404,7 @@ class CPToolsTab(_Tab):
         self._run(self._probe_task)
 
     def _probe_task(self):
+        probe = None
         try:
             from cp_tools.j533_probe import J533Probe
             probe = J533Probe(
@@ -2420,6 +2421,14 @@ class CPToolsTab(_Tab):
             self._ui(self._append_log, self._log,
                      f"probe error: {e}\n", "err")
             self._ui(self._probe_btn.config, state="normal")
+        finally:
+            # Always release J2534 device handle — prevents channel leak
+            # if full_probe() raises partway through.
+            if probe is not None:
+                try:
+                    probe.disconnect()
+                except Exception:
+                    pass
 
     def _show_probe_report(self, report):
         self._append_log(self._log,
