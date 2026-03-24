@@ -427,6 +427,7 @@ class FlashTab(_Tab):
         fr = _frame(file_card, bg=C["surface"])
         fr.pack(fill="x")
         _btn(fr, "open .bin", self._open_file).pack(side="left")
+        _btn(fr, "open .frf", self._open_frf).pack(side="left", padx=(6, 0))
         tk.Label(fr, textvariable=self._cal_path,
                  fg=C["muted"], bg=C["surface"],
                  font=("Menlo", 10)).pack(side="left", padx=10)
@@ -557,6 +558,53 @@ class FlashTab(_Tab):
             self._log_line(f"loaded {fname}  ({sz:,} bytes)\n", "ok")
         except Exception as e:
             messagebox.showerror("File error", str(e))
+
+    def _open_frf(self):
+        """Load a CAL block from a decrypted Flashdaten FRF file."""
+        path = filedialog.askopenfilename(
+            title="Open Flashdaten FRF",
+            filetypes=[("FRF files", "*.frf"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            from frf.frf_loader import load_frf, describe_frf
+            key_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "frf.key")
+            info = load_frf(path, key_path=key_path if os.path.exists(key_path) else None)
+
+            # Pick the CAL block — last FD_ entry by number, or the smallest block
+            ecu = self.mw.ecu
+            if ecu and ecu.cal_block:
+                fd_name = ecu.cal_block.frf_name  # e.g. "FD_2"
+            else:
+                # Fallback: last numbered FD block
+                fd_name = sorted(k for k in info.blocks if k.startswith("FD_"))[-1]
+
+            if fd_name not in info.blocks:
+                messagebox.showerror("FRF error",
+                    f"Block {fd_name} not found in FRF.\nAvailable: {list(info.blocks)}")
+                return
+
+            self._cal_bytes = info.blocks[fd_name]
+            fname = os.path.basename(path)
+            self._cal_path.set(f"{fname} [{fd_name}]")
+            sz = len(self._cal_bytes)
+            self._file_info.config(
+                text=(f"{sz:,} bytes  SA2={info.sa2_script.hex()[:16]}..."
+                      if info.sa2_script else f"{sz:,} bytes"),
+                fg=C["green"])
+            if self.mw.connected:
+                self._write_btn.config(state="normal")
+                self._verify_btn.config(state="normal")
+            self._log_line(
+                f"loaded {fname} [{fd_name}]  ({sz:,} bytes)\n"
+                f"  flash_id={info.flash_id}  layer={info.layer_refs[0] if info.layer_refs else ''}\n",
+                "ok")
+        except FileNotFoundError as e:
+            messagebox.showerror("FRF key missing",
+                f"Cannot decrypt FRF: {e}\n\nPlace data/frf.key in the simos-suite directory.")
+        except Exception as e:
+            messagebox.showerror("FRF error", str(e))
 
     def _do_read_cal(self):
         """
