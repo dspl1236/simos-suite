@@ -279,16 +279,31 @@ def flash_cal(
 
     callback(FlashProgress("CONNECT", f"Connecting to {ecu.name}…", 0))
 
-    # Clear DTCs via OBD2 before flash (VW_Flash pattern)
+    # Clear DTCs via OBD2 before/after flash (VW_Flash pattern)
+    # Uses OBD functional address 0x700 → 0x7E8 directly, not the ECU connection.
+    # This matches VW_Flash's send_obd() — a separate short-lived connection
+    # that avoids touching the main ECU channel.
     def _obd_clear(iface, ipath):
         try:
-            import types
-            proxy = types.SimpleNamespace(can_tx=0x700, can_rx=0x7E8,
-                                          sa2_script=b"", crypto=None)
-            c = _make_connection(proxy, iface, ipath)
+            if iface.upper() == "J2534":
+                from lib.connections.j2534_connection import J2534Connection
+                import math
+                dll = ipath or (
+                    "C:/Program Files (x86)/OpenECU/OpenPort 2.0/drivers/openport 2.0/op20pt32.dll"
+                )
+                c = J2534Connection(windll=dll, rxid=0x7E8, txid=0x700)
+            elif iface.upper().startswith("SOCKETCAN"):
+                from udsoncan.connections import IsoTPSocketConnection
+                iface_name = ipath or iface.split("_", 1)[-1]
+                c = IsoTPSocketConnection(iface_name, rxid=0x7E8, txid=0x700,
+                                          params={"tx_padding": 0x55})
+            else:
+                return  # BLE/USB/mock — skip OBD clear
             c.open()
             c.specific_send(bytes([0x04]))
             try: c.specific_wait_frame(timeout=1.0)
+            except Exception: pass
+            try: c.specific_wait_frame(timeout=0.5)
             except Exception: pass
             c.close()
         except Exception as e:
@@ -296,6 +311,17 @@ def flash_cal(
     _obd_clear(interface, interface_path)
 
     conn = _make_connection(ecu, interface, interface_path)
+
+    # Check if adapter supports STMIN_TX — required for reliable multi-frame flash
+    if hasattr(conn, 'stmin_tx_supported') and not conn.stmin_tx_supported:
+        callback(FlashProgress(
+            "ERROR",
+            "This J2534 adapter does not support STMIN_TX timing control. "
+            "Flash transfers will likely fail mid-block. "
+            "Use a Tactrix OpenPort 2.0 or Switchleg ESP32 (BridgeLEG firmware) for flashing.",
+            0,
+        ))
+        return False
 
     cfg = dict(configs.default_client_config)
     cfg["security_algo"]        = _make_security_algo(ecu.sa2_script)
@@ -389,8 +415,8 @@ def flash_cal(
         if not dry_run:
             try:
                 dfi = udsoncan.DataFormatIdentifier(
-                    compression=0xA if ecu.crypto != CryptoType.XOR_COUNTER else 0x0,
-                    encryption=0xA  if ecu.crypto != CryptoType.XOR_COUNTER else 0x0,
+                    compression=0xA,  # Always 0xA for Simos — ECU expects LZSS+XOR regardless of variant
+                    encryption=0xA,   # Confirmed from VW_Flash simos_flash_utils.py PreparedBlockData
                 )
                 mem_loc = udsoncan.MemoryLocation(
                     address=cal_block.number, memorysize=total,
