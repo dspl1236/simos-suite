@@ -36,47 +36,53 @@ log = logging.getLogger("SimosSuite.CANSniffer")
 # TX = tester → ECU (requests), RX = ECU → tester (responses)
 
 VAG_DIAG_IDS: Dict[int, str] = {
+    # ── J533 gateway-routed addresses (C7 A6/A7/A8) ──
+    # These are the CAN IDs seen on the OBD diagnostic port.
+    # Confirmed from AU57X MWB dump and CP_MODULES.
     0x710: "J533 Gateway",
     0x77A: "J533 Gateway",
-    0x7E0: "OBD2 Func",
-    0x7E8: "OBD2 Func",
-    0x714: "J623 Engine",
-    0x77E: "J623 Engine",
     0x746: "J255 HVAC",
     0x7B0: "J255 HVAC",
+    0x714: "J285 Instruments",  # C7: J285 shares 0x714/0x77E with J623
+    0x77E: "J285 Instruments",
+    0x715: "J234 Airbag",
+    0x77F: "J234 Airbag",
+    0x773: "J794 MMI",
+    0x7DD: "J794 MMI",
+    0x74C: "J136 Seat DrvL",    # KWP2000 module
+    0x7B6: "J136 Seat DrvL",
+    0x74D: "J521 Seat Pass",    # KWP2000 module
+    0x7B7: "J521 Seat Pass",
+    0x732: "J518 KESSY",        # KWP2000 module
+    0x79C: "J518 KESSY",
+    0x70E: "J519 CentElect",    # KWP2000 module
+    0x778: "J519 CentElect",
+    0x70D: "J393 Comfort",      # KWP2000 module
+    0x777: "J393 Comfort",
     0x740: "J217 TCM",
     0x7A8: "J217 TCM",
+    # ── Generic VAG / OBD2 ──
+    0x7E0: "OBD2 Func",
+    0x7E8: "OBD2 Func",
+    # ── Additional known IDs (non-C7 platforms or direct-bus) ──
     0x712: "J104 ABS/ESP",
     0x77C: "J104 ABS/ESP",
     0x716: "J500 Steering",
     0x780: "J500 Steering",
-    0x726: "J285 Dash",
-    0x790: "J285 Dash",
-    0x760: "J794 InfoCtrl",
-    0x7CA: "J794 InfoCtrl",
-    0x744: "J234 Airbag",
-    0x7AE: "J234 Airbag",
-    0x76E: "J136 Seat DrvL",
-    0x7D8: "J136 Seat DrvL",
-    0x76F: "J137 Seat DrvR",
-    0x7D9: "J137 Seat DrvR",
     0x713: "J527 SteerAngle",
     0x77D: "J527 SteerAngle",
-    0x742: "J393 Comfort",
-    0x7AC: "J393 Comfort",
-    0x720: "J519 CentElect",
-    0x78A: "J519 CentElect",
+    0x742: "J393 Comfort (alt)",
+    0x7AC: "J393 Comfort (alt)",
     0x764: "J532 Headlamp",
     0x7CE: "J532 Headlamp",
-    0x772: "J345 Trailer",
-    0x7DC: "J345 Trailer",
 }
 
 # TX CAN IDs (tester → ECU, i.e. diagnostic requests)
+# Includes both C7 gateway-routed and generic VAG TX addresses
 _TX_IDS: Set[int] = {
-    0x710, 0x7E0, 0x714, 0x746, 0x740, 0x712, 0x716,
-    0x726, 0x760, 0x744, 0x76E, 0x76F, 0x713, 0x742,
-    0x720, 0x764, 0x772,
+    0x710, 0x7E0, 0x714, 0x715, 0x716, 0x732, 0x740, 0x742,
+    0x746, 0x74C, 0x74D, 0x70D, 0x70E, 0x712, 0x713, 0x764,
+    0x773,
 }
 
 
