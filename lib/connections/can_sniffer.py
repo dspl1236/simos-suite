@@ -1,20 +1,23 @@
 """
-lib/connections/can_sniffer.py — Passive CAN bus listener via J2534
+lib/connections/can_sniffer.py — Passive CAN bus sniffer via J2534
 
-Opens a raw CAN channel (Protocol_ID.CAN, not ISO15765) with a pass-all
-filter so every frame on the bus is captured without transmitting anything.
+Opens a raw CAN channel (Protocol_ID.CAN = 5) with a pass-all filter
+and reads every frame on the bus without transmitting anything.
 
-Designed for use with an OBD splitter: VCDS/ODIS talks to the car on one
-cable, this sniffer captures the full exchange on the other.
-
-Includes software ISO-TP reassembly and UDS service decode so the raw CAN
-frames are displayed as meaningful diagnostic messages.
+Designed for use with an OBD splitter: VCDS / ODIS on one port does
+the talking, while our Mongoose on the other port passively captures
+the full exchange.
 
 Usage:
-    sniffer = J2534CANSniffer(dll_path)
+    from lib.connections.can_sniffer import J2534CANSniffer, ISOTPReassembler
+
+    sniffer = J2534CANSniffer("C:/path/to/j2534.dll")
     sniffer.open()
+    reassembler = ISOTPReassembler()
     for frame in sniffer.read_frames():
-        print(frame)
+        msg = reassembler.feed(frame)
+        if msg:
+            print(msg.decode_uds())
     sniffer.close()
 """
 
@@ -22,266 +25,271 @@ from __future__ import annotations
 
 import ctypes
 import logging
-import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 log = logging.getLogger("SimosSuite.CANSniffer")
 
-# ── UDS service names for human-readable decode ──────────────────────────────
+# ── Known VAG diagnostic CAN IDs ─────────────────────────────────────────────
+# TX = tester → ECU (requests), RX = ECU → tester (responses)
+
+VAG_DIAG_IDS: Dict[int, str] = {
+    0x710: "J533 Gateway",
+    0x77A: "J533 Gateway",
+    0x7E0: "OBD2 Func",
+    0x7E8: "OBD2 Func",
+    0x714: "J623 Engine",
+    0x77E: "J623 Engine",
+    0x746: "J255 HVAC",
+    0x7B0: "J255 HVAC",
+    0x740: "J217 TCM",
+    0x7A8: "J217 TCM",
+    0x712: "J104 ABS/ESP",
+    0x77C: "J104 ABS/ESP",
+    0x716: "J500 Steering",
+    0x780: "J500 Steering",
+    0x726: "J285 Dash",
+    0x790: "J285 Dash",
+    0x760: "J794 InfoCtrl",
+    0x7CA: "J794 InfoCtrl",
+    0x744: "J234 Airbag",
+    0x7AE: "J234 Airbag",
+    0x76E: "J136 Seat DrvL",
+    0x7D8: "J136 Seat DrvL",
+    0x76F: "J137 Seat DrvR",
+    0x7D9: "J137 Seat DrvR",
+    0x713: "J527 SteerAngle",
+    0x77D: "J527 SteerAngle",
+    0x742: "J393 Comfort",
+    0x7AC: "J393 Comfort",
+    0x720: "J519 CentElect",
+    0x78A: "J519 CentElect",
+    0x764: "J532 Headlamp",
+    0x7CE: "J532 Headlamp",
+    0x772: "J345 Trailer",
+    0x7DC: "J345 Trailer",
+}
+
+# TX CAN IDs (tester → ECU, i.e. diagnostic requests)
+_TX_IDS: Set[int] = {
+    0x710, 0x7E0, 0x714, 0x746, 0x740, 0x712, 0x716,
+    0x726, 0x760, 0x744, 0x76E, 0x76F, 0x713, 0x742,
+    0x720, 0x764, 0x772,
+}
+
+
+# ── UDS service decoder ──────────────────────────────────────────────────────
 
 UDS_SERVICES = {
     0x10: "DiagSessionControl",
     0x11: "ECUReset",
-    0x14: "ClearDTC",
-    0x19: "ReadDTCInformation",
-    0x22: "ReadDataByIdentifier",
-    0x23: "ReadMemoryByAddress",
+    0x14: "ClearDTCs",
+    0x19: "ReadDTCInfo",
+    0x22: "ReadDID",
+    0x23: "ReadMemByAddr",
     0x27: "SecurityAccess",
-    0x28: "CommunicationControl",
-    0x2E: "WriteDataByIdentifier",
-    0x2F: "InputOutputControlByIdentifier",
+    0x28: "CommControl",
+    0x2E: "WriteDID",
+    0x2F: "IOControl",
     0x31: "RoutineControl",
     0x34: "RequestDownload",
     0x35: "RequestUpload",
     0x36: "TransferData",
-    0x37: "RequestTransferExit",
+    0x37: "TransferExit",
+    0x3D: "WriteMemByAddr",
     0x3E: "TesterPresent",
     0x85: "ControlDTCSetting",
+    0x7F: "NegativeResponse",
 }
 
-UDS_SESSIONS = {
-    0x01: "default",
-    0x02: "programming",
-    0x03: "extended",
-    0x60: "EOL",
-}
-
-UDS_NRC = {
+UDS_NRCS = {
     0x10: "generalReject",
     0x11: "serviceNotSupported",
     0x12: "subFunctionNotSupported",
-    0x13: "incorrectMessageLength",
+    0x13: "incorrectMsgLenOrFormat",
     0x14: "responseTooLong",
     0x22: "conditionsNotCorrect",
     0x24: "requestSequenceError",
-    0x25: "noResponseFromSubnet",
     0x31: "requestOutOfRange",
     0x33: "securityAccessDenied",
     0x35: "invalidKey",
     0x36: "exceededNumberOfAttempts",
     0x37: "requiredTimeDelayNotExpired",
     0x70: "uploadDownloadNotAccepted",
-    0x71: "transferDataSuspended",
     0x72: "generalProgrammingFailure",
     0x73: "wrongBlockSequenceCounter",
-    0x78: "requestCorrectlyReceived_responsePending",
-    0x7E: "subFunctionNotSupportedInActiveSession",
-    0x7F: "serviceNotSupportedInActiveSession",
+    0x78: "responsePending",
+    0x7E: "subFuncNotSupportedInSession",
+    0x7F: "serviceNotSupportedInSession",
 }
 
-# Known VAG CAN IDs for labelling
-VAG_CAN_LABELS = {
-    0x710: "J533 Gateway",
-    0x77A: "J533 Gateway",
-    0x746: "J255 Climatronic",
-    0x7B0: "J255 Climatronic",
-    0x7E0: "Engine (func)",
-    0x7E8: "Engine (func)",
-    0x714: "J217 TCU",
-    0x77E: "J217 TCU",
-    0x740: "J104 ESP/ABS",
-    0x7A4: "J104 ESP/ABS",
-    0x750: "J285 Cluster",
-    0x7B4: "J285 Cluster",
-    0x75A: "J234 Airbag",
-    0x7C4: "J234 Airbag",
-    0x773: "J794 ACC",
-    0x77D: "J794 ACC",
-    0x760: "J386 Door FL",
-    0x7C0: "J386 Door FL",
-    0x761: "J387 Door FR",
-    0x7C1: "J387 Door FR",
-    0x76E: "J393 Central Elect",
-    0x7D8: "J393 Central Elect",
-    0x7A6: "J527 Steering",
-    0x770: "J527 Steering",
-}
 
+def _decode_uds_payload(payload: bytes) -> str:
+    """Decode a UDS payload into a human-readable string."""
+    if not payload:
+        return ""
+
+    sid = payload[0]
+
+    # Negative response
+    if sid == 0x7F and len(payload) >= 3:
+        rejected_sid = payload[1]
+        nrc = payload[2]
+        svc = UDS_SERVICES.get(rejected_sid, f"0x{rejected_sid:02X}")
+        nrc_name = UDS_NRCS.get(nrc, f"0x{nrc:02X}")
+        return f"NegativeResponse {svc} → {nrc_name}"
+
+    is_resp = bool(sid & 0x40)
+    base_sid = sid & ~0x40 if is_resp else sid
+    svc_name = UDS_SERVICES.get(base_sid, f"SID_0x{base_sid:02X}")
+    prefix = "+" if is_resp else "→"
+
+    if base_sid == 0x10:
+        session = payload[1] if len(payload) > 1 else 0
+        sess_map = {1: "default", 2: "programming", 3: "extended"}
+        return f"{prefix} {svc_name} {sess_map.get(session, f'0x{session:02X}')}"
+
+    if base_sid == 0x22:
+        if len(payload) >= 3:
+            did = (payload[1] << 8) | payload[2]
+            extra = ""
+            if is_resp and len(payload) > 3:
+                data = payload[3:]
+                if did in (0xF190, 0xF18C, 0xF187, 0xF189, 0xF191, 0xF197):
+                    try:
+                        s = data.decode("ascii").strip("\x00 ")
+                        if s.isprintable():
+                            extra = f' "{s}"'
+                    except Exception:
+                        pass
+                if not extra:
+                    h = data[:16].hex().upper()
+                    extra = f" [{h}{'...' if len(data)>16 else ''}]"
+            return f"{prefix} {svc_name} 0x{did:04X}{extra}"
+
+    if base_sid == 0x2E:
+        if len(payload) >= 3:
+            did = (payload[1] << 8) | payload[2]
+            return f"{prefix} {svc_name} 0x{did:04X} ({len(payload)-3}B)"
+
+    if base_sid == 0x27:
+        if len(payload) >= 2:
+            sub = payload[1]
+            kind = "seed" if (sub % 2 == 1) else "key"
+            level = (sub + 1) // 2
+            return f"{prefix} {svc_name} L{level} {kind} ({len(payload)-2}B)"
+
+    if base_sid == 0x31:
+        if len(payload) >= 4:
+            sub = payload[1]
+            rid = (payload[2] << 8) | payload[3]
+            sub_map = {1: "start", 2: "stop", 3: "result"}
+            return f"{prefix} {svc_name} {sub_map.get(sub, f'sub{sub}')} 0x{rid:04X}"
+
+    if base_sid == 0x36:
+        blk = payload[1] if len(payload) > 1 else 0
+        return f"{prefix} {svc_name} block {blk} ({len(payload)-2}B)"
+
+    if base_sid == 0x3E:
+        return f"{prefix} TesterPresent"
+
+    if base_sid == 0x19:
+        sub = payload[1] if len(payload) > 1 else 0
+        return f"{prefix} ReadDTCInfo sub=0x{sub:02X}"
+
+    return f"{prefix} {svc_name}"
+
+
+# ── CAN frame ────────────────────────────────────────────────────────────────
 
 @dataclass
 class CANFrame:
-    """Single raw CAN frame from the bus."""
-    timestamp_us: int       # microseconds from J2534
-    can_id:       int       # 11-bit or 29-bit CAN ID
-    data:         bytes     # 0–8 bytes payload
-    is_extended:  bool = False  # 29-bit ID flag
+    timestamp_us: int
+    can_id:       int
+    data:         bytes
+    is_extended:  bool = False
+
+    @property
+    def id_hex(self) -> str:
+        return f"{self.can_id:08X}" if self.is_extended else f"{self.can_id:03X}"
+
+    @property
+    def data_hex(self) -> str:
+        return " ".join(f"{b:02X}" for b in self.data)
+
+    @property
+    def dlc(self) -> int:
+        return len(self.data)
 
     @property
     def direction(self) -> str:
-        """Guess TX/RX based on CAN ID parity (tester IDs are lower)."""
-        # VAG convention: tester TX is in 0x700–0x77F, ECU RX is 0x780–0x7FF
-        # (or offset +0x6A for some modules)
-        if 0x700 <= self.can_id <= 0x77F:
-            return "TX"
-        elif 0x780 <= self.can_id <= 0x7FF:
-            return "RX"
-        return "??"
+        """TX = tester → ECU (request), RX = ECU → tester (response)."""
+        return "TX" if self.can_id in _TX_IDS else "RX"
 
     @property
     def label(self) -> str:
-        return VAG_CAN_LABELS.get(self.can_id, "")
+        """Human-readable module name for this CAN ID."""
+        return VAG_DIAG_IDS.get(self.can_id, "")
 
-    @property
-    def hex_data(self) -> str:
-        return " ".join(f"{b:02X}" for b in self.data)
 
-    def format_line(self, t0_us: int = 0) -> str:
-        """Format as a single log line."""
-        rel_ms = (self.timestamp_us - t0_us) / 1000.0
-        lbl = f"  {self.label}" if self.label else ""
-        return (f"{rel_ms:10.1f}ms  {self.direction}  "
-                f"[{self.can_id:03X}]  {self.hex_data}{lbl}")
-
+# ── ISO-TP reassembled message ────────────────────────────────────────────────
 
 @dataclass
 class ISOTPMessage:
-    """Reassembled ISO-TP message from consecutive CAN frames."""
-    can_id:      int
-    payload:     bytes
+    can_id:       int
+    payload:      bytes
     timestamp_us: int
-    frame_count: int = 1
+    frame_count:  int = 1
+
+    @property
+    def service_id(self) -> int:
+        return self.payload[0] if self.payload else 0
+
+    @property
+    def is_response(self) -> bool:
+        return bool(self.service_id & 0x40)
 
     @property
     def direction(self) -> str:
-        if 0x700 <= self.can_id <= 0x77F:
-            return "TX"
-        elif 0x780 <= self.can_id <= 0x7FF:
-            return "RX"
-        return "??"
+        return "TX" if self.can_id in _TX_IDS else "RX"
 
     @property
     def label(self) -> str:
-        return VAG_CAN_LABELS.get(self.can_id, "")
+        return VAG_DIAG_IDS.get(self.can_id, "")
 
     def decode_uds(self) -> str:
-        """Attempt to decode as a UDS service message."""
-        if not self.payload:
-            return ""
-        sid = self.payload[0]
+        return _decode_uds_payload(self.payload)
 
-        # Negative response
-        if sid == 0x7F and len(self.payload) >= 3:
-            req_sid = self.payload[1]
-            nrc = self.payload[2]
-            svc = UDS_SERVICES.get(req_sid, f"0x{req_sid:02X}")
-            nrc_name = UDS_NRC.get(nrc, f"0x{nrc:02X}")
-            return f"NegativeResponse  {svc} → {nrc_name}"
 
-        # Positive response (SID + 0x40)
-        if sid >= 0x50:
-            req_sid = sid - 0x40
-            svc = UDS_SERVICES.get(req_sid, "")
-            if svc:
-                return self._decode_positive(req_sid, svc)
-
-        # Request
-        svc = UDS_SERVICES.get(sid, "")
-        if svc:
-            return self._decode_request(sid, svc)
-
-        return f"SID 0x{sid:02X}"
-
-    def _decode_request(self, sid: int, svc: str) -> str:
-        p = self.payload
-        if sid == 0x10 and len(p) >= 2:  # DiagSessionControl
-            sess = UDS_SESSIONS.get(p[1], f"0x{p[1]:02X}")
-            return f"{svc} {sess}"
-        if sid == 0x22 and len(p) >= 3:  # ReadDataByIdentifier
-            did = (p[1] << 8) | p[2]
-            return f"{svc} DID 0x{did:04X}"
-        if sid == 0x2E and len(p) >= 3:  # WriteDataByIdentifier
-            did = (p[1] << 8) | p[2]
-            data_len = len(p) - 3
-            return f"{svc} DID 0x{did:04X}  [{data_len} bytes]"
-        if sid == 0x27 and len(p) >= 2:  # SecurityAccess
-            sub = p[1]
-            kind = "requestSeed" if sub % 2 == 1 else "sendKey"
-            return f"{svc} level=0x{sub:02X} ({kind})"
-        if sid == 0x31 and len(p) >= 4:  # RoutineControl
-            sub = {1: "start", 2: "stop", 3: "requestResult"}.get(p[1], f"0x{p[1]:02X}")
-            rid = (p[2] << 8) | p[3]
-            return f"{svc} {sub} routine=0x{rid:04X}"
-        if sid == 0x36 and len(p) >= 2:  # TransferData
-            blk = p[1]
-            return f"{svc} block={blk}  [{len(p)-2} bytes]"
-        return svc
-
-    def _decode_positive(self, req_sid: int, svc: str) -> str:
-        p = self.payload
-        if req_sid == 0x10 and len(p) >= 2:
-            sess = UDS_SESSIONS.get(p[1], f"0x{p[1]:02X}")
-            return f"+{svc} {sess}"
-        if req_sid == 0x22 and len(p) >= 3:
-            did = (p[1] << 8) | p[2]
-            data_len = len(p) - 3
-            snippet = " ".join(f"{b:02X}" for b in p[3:3+min(8, data_len)])
-            if data_len > 8:
-                snippet += "..."
-            return f"+{svc} DID 0x{did:04X}  [{data_len}B] {snippet}"
-        if req_sid == 0x27 and len(p) >= 2:
-            sub = p[1]
-            kind = "seed" if sub % 2 == 1 else "keyAccepted"
-            return f"+{svc} ({kind})"
-        if req_sid == 0x31 and len(p) >= 4:
-            sub = {1: "started", 2: "stopped", 3: "result"}.get(p[1], f"0x{p[1]:02X}")
-            rid = (p[2] << 8) | p[3]
-            return f"+{svc} {sub} routine=0x{rid:04X}"
-        return f"+{svc}"
-
-    def format_line(self, t0_us: int = 0) -> str:
-        rel_ms = (self.timestamp_us - t0_us) / 1000.0
-        lbl = f"  {self.label}" if self.label else ""
-        uds = self.decode_uds()
-        hex_short = " ".join(f"{b:02X}" for b in self.payload[:16])
-        if len(self.payload) > 16:
-            hex_short += f"... ({len(self.payload)}B)"
-        return (f"{rel_ms:10.1f}ms  {self.direction}  "
-                f"[{self.can_id:03X}]{lbl}  {uds}\n"
-                f"{'':>14}{hex_short}")
-
+# ── ISO-TP reassembly ─────────────────────────────────────────────────────────
 
 class ISOTPReassembler:
     """
-    Software ISO-TP reassembly from raw CAN frames.
+    Lightweight ISO-TP (ISO 15765-2) reassembly for passive sniffing.
 
-    Tracks multi-frame transfers per CAN ID and emits complete
-    ISOTPMessage objects when a transfer finishes.
+    Handles SF, FF, CF. FC frames are ignored (we're passive).
+    Stale partial transfers are flushed after timeout_ms.
     """
 
-    def __init__(self, timeout_ms: float = 2000):
-        self._timeout_ms = timeout_ms
-        # Active transfers: can_id → {payload, expected_len, seq, ts}
-        self._active: Dict[int, dict] = {}
+    def __init__(self, timeout_ms: int = 3000):
+        self._sessions: Dict[int, dict] = {}
+        self._timeout_us = timeout_ms * 1000
 
     def feed(self, frame: CANFrame) -> Optional[ISOTPMessage]:
-        """
-        Feed a raw CAN frame. Returns an ISOTPMessage if a complete
-        message was reassembled, otherwise None.
-        """
         if len(frame.data) < 1:
             return None
 
         pci_type = (frame.data[0] >> 4) & 0x0F
 
-        # Single Frame (SF): PCI type 0
         if pci_type == 0:
-            sf_dl = frame.data[0] & 0x0F
-            if sf_dl == 0 or sf_dl > 7:
+            # Single Frame
+            sf_len = frame.data[0] & 0x0F
+            if sf_len == 0 or sf_len > 7:
                 return None
-            payload = frame.data[1:1+sf_dl]
+            payload = frame.data[1:1 + sf_len]
+            self._sessions.pop(frame.can_id, None)
             return ISOTPMessage(
                 can_id=frame.can_id,
                 payload=bytes(payload),
@@ -289,243 +297,218 @@ class ISOTPReassembler:
                 frame_count=1,
             )
 
-        # First Frame (FF): PCI type 1
-        if pci_type == 1 and len(frame.data) >= 2:
-            ff_dl = ((frame.data[0] & 0x0F) << 8) | frame.data[1]
-            payload = bytearray(frame.data[2:8])  # first 6 bytes
-            self._active[frame.can_id] = {
-                "payload": payload,
-                "expected": ff_dl,
+        elif pci_type == 1:
+            # First Frame
+            if len(frame.data) < 2:
+                return None
+            ff_len = ((frame.data[0] & 0x0F) << 8) | frame.data[1]
+            self._sessions[frame.can_id] = {
+                "expected_len": ff_len,
+                "buffer": bytearray(frame.data[2:8]),
                 "seq": 1,
-                "frames": 1,
                 "ts": frame.timestamp_us,
+                "last_ts": frame.timestamp_us,
+                "frames": 1,
             }
             return None
 
-        # Consecutive Frame (CF): PCI type 2
-        if pci_type == 2:
-            xfer = self._active.get(frame.can_id)
-            if xfer is None:
-                return None  # orphan CF, ignore
-            seq = frame.data[0] & 0x0F
-            if seq != (xfer["seq"] & 0x0F):
-                # Sequence mismatch — abort this transfer
-                del self._active[frame.can_id]
+        elif pci_type == 2:
+            # Consecutive Frame
+            session = self._sessions.get(frame.can_id)
+            if session is None:
                 return None
-            xfer["payload"].extend(frame.data[1:8])
-            xfer["seq"] += 1
-            xfer["frames"] += 1
+            session["buffer"].extend(frame.data[1:8])
+            session["seq"] += 1
+            session["frames"] += 1
+            session["last_ts"] = frame.timestamp_us
 
-            if len(xfer["payload"]) >= xfer["expected"]:
-                # Transfer complete
-                msg = ISOTPMessage(
+            if len(session["buffer"]) >= session["expected_len"]:
+                payload = bytes(session["buffer"][:session["expected_len"]])
+                frames = session["frames"]
+                ts = session["ts"]
+                del self._sessions[frame.can_id]
+                return ISOTPMessage(
                     can_id=frame.can_id,
-                    payload=bytes(xfer["payload"][:xfer["expected"]]),
-                    timestamp_us=xfer["ts"],
-                    frame_count=xfer["frames"],
+                    payload=payload,
+                    timestamp_us=ts,
+                    frame_count=frames,
                 )
-                del self._active[frame.can_id]
-                return msg
             return None
 
-        # Flow Control (FC): PCI type 3 — just note it, don't reassemble
-        if pci_type == 3:
-            return None  # FC frames are control, not data
+        elif pci_type == 3:
+            # Flow Control — passive, ignore
+            return None
 
         return None
 
     def flush_stale(self, now_us: int) -> List[ISOTPMessage]:
-        """Return partially reassembled messages that have timed out."""
+        """Return partial messages that have timed out."""
         stale = []
-        timeout_us = self._timeout_ms * 1000
-        for can_id in list(self._active):
-            xfer = self._active[can_id]
-            if (now_us - xfer["ts"]) > timeout_us:
+        to_delete = []
+        for can_id, session in self._sessions.items():
+            if now_us - session["last_ts"] > self._timeout_us:
+                # Yield what we have as a partial message
+                payload = bytes(session["buffer"][:session["expected_len"]])
                 stale.append(ISOTPMessage(
                     can_id=can_id,
-                    payload=bytes(xfer["payload"]),
-                    timestamp_us=xfer["ts"],
-                    frame_count=xfer["frames"],
+                    payload=payload,
+                    timestamp_us=session["ts"],
+                    frame_count=session["frames"],
                 ))
-                del self._active[can_id]
+                to_delete.append(can_id)
+        for cid in to_delete:
+            del self._sessions[cid]
         return stale
 
+    def reset(self):
+        self._sessions.clear()
+
+
+# ── J2534 raw CAN sniffer ────────────────────────────────────────────────────
 
 class J2534CANSniffer:
     """
-    Passive CAN bus listener using J2534 PassThru in raw CAN mode.
+    Passive CAN bus listener via J2534 raw CAN channel.
 
-    Opens Protocol_ID.CAN (not ISO15765) with a PASS_FILTER that accepts
-    all CAN IDs. Never transmits — purely listens.
+    Opens Protocol_ID.CAN (5) with a PASS_FILTER matching all CAN IDs.
+    Never transmits — purely receive-only. Safe to use on a splitter
+    alongside an active diagnostic tool (VCDS, ODIS).
 
-    With an OBD splitter, sees all traffic between VCDS/ODIS and the car.
+    The sniffer opens its own device handle — it does NOT share the
+    J2534 connection used by the rest of the app. Make sure no other
+    tab has an active J2534 session before starting the sniffer.
     """
 
-    # J2534 protocol/filter constants
-    PROTOCOL_CAN = 5
-    FILTER_PASS   = 0x00000001
-
-    def __init__(self, dll_path: str, baudrate: int = 500_000):
+    def __init__(self, dll_path: str):
         self.dll_path = dll_path
-        self.baudrate = baudrate
-        self._devID = None
-        self._chanID = None
-        self._hDLL = None
-        self._opened = False
+        self._dev_id = None
+        self._ch_id = None
+        self._j2534 = None
+        self._running = False
 
     def open(self):
         """Open J2534 device and start raw CAN channel with pass-all filter."""
-        import ctypes
-        from ctypes import c_ulong, c_long, byref, POINTER, WINFUNCTYPE, c_void_p
-        import os, pathlib
+        from lib.connections.j2534 import (
+            J2534, PASSTHRU_MSG, Protocol_ID, Filter,
+            Ioctl_ID, Error_ID,
+        )
 
-        # Load DLL
-        dll_dir = str(pathlib.Path(self.dll_path).parent)
-        if hasattr(os, 'add_dll_directory'):
-            os.add_dll_directory(dll_dir)
-        self._hDLL = ctypes.cdll.LoadLibrary(self.dll_path)
+        # J2534 class needs rxid/txid — use dummies, we only RX
+        self._j2534 = J2534(windll=self.dll_path, rxid=0x7FF, txid=0x000)
 
-        # Bind functions we need
-        self._fn_open = WINFUNCTYPE(c_long, c_void_p, POINTER(c_ulong))(
-            ("PassThruOpen", self._hDLL),
-            ((1, "pName", 0), (1, "pDeviceID", 0)))
+        result, self._dev_id = self._j2534.PassThruOpen()
+        if result != Error_ID.ERR_SUCCESS:
+            raise IOError(f"PassThruOpen failed: {result}")
 
-        self._fn_connect = WINFUNCTYPE(
-            c_long, c_ulong, c_ulong, c_ulong, c_ulong, POINTER(c_ulong))(
-            ("PassThruConnect", self._hDLL),
-            ((1,"DeviceID",0),(1,"ProtocolID",0),(1,"Flags",0),
-             (1,"BaudRate",500000),(1,"pChannelID",0)))
+        result, self._ch_id = self._j2534.PassThruConnect(
+            self._dev_id, Protocol_ID.CAN.value, 500000)
+        if result != Error_ID.ERR_SUCCESS:
+            raise IOError(f"PassThruConnect CAN failed: {result}")
 
-        self._fn_disconnect = WINFUNCTYPE(c_long, c_ulong)(
-            ("PassThruDisconnect", self._hDLL), ((1,"ChannelID",0),))
-
-        self._fn_close = WINFUNCTYPE(c_long, c_ulong)(
-            ("PassThruClose", self._hDLL), ((1,"DeviceID",0),))
-
-        from .j2534 import PASSTHRU_MSG
-        self._fn_read = WINFUNCTYPE(
-            c_long, c_ulong, POINTER(PASSTHRU_MSG), POINTER(c_ulong), c_ulong)(
-            ("PassThruReadMsgs", self._hDLL),
-            ((1,"ChannelID",0),(1,"pMsg",0),(1,"pNumMsgs",0),(1,"Timeout",0)))
-
-        self._fn_filter = WINFUNCTYPE(
-            c_long, c_ulong, c_ulong, POINTER(PASSTHRU_MSG),
-            POINTER(PASSTHRU_MSG), POINTER(PASSTHRU_MSG), POINTER(c_ulong))(
-            ("PassThruStartMsgFilter", self._hDLL),
-            ((1,"ChannelID",0),(1,"FilterType",0),(1,"pMaskMsg",0),
-             (1,"pPatternMsg",0),(1,"pFlowControlMsg",0),(1,"pMsgID",0)))
-
-        self._fn_ioctl = WINFUNCTYPE(c_long, c_ulong, c_ulong, c_void_p, c_void_p)(
-            ("PassThruIoctl", self._hDLL),
-            ((1,"Handle",0),(1,"IoctlID",0),(1,"pInput",0),(1,"pOutput",0)))
-
-        # Open device
-        devID = c_ulong()
-        result = self._fn_open(byref(ctypes.c_int()), byref(devID))
-        if result != 0:
-            raise RuntimeError(f"PassThruOpen failed: error {result}")
-        self._devID = devID
-
-        # Connect with raw CAN protocol
-        chanID = c_ulong()
-        result = self._fn_connect(
-            devID, self.PROTOCOL_CAN, 0, self.baudrate, byref(chanID))
-        if result != 0:
-            raise RuntimeError(f"PassThruConnect(CAN) failed: error {result}")
-        self._chanID = chanID
-
-        # Set pass-all filter: mask = 0x000, pattern = 0x000
-        mask = PASSTHRU_MSG()
-        mask.ProtocolID = self.PROTOCOL_CAN
-        mask.DataSize = 4
+        # Pass-all filter: mask = 0x00000000
+        mask_msg = PASSTHRU_MSG()
+        mask_msg.ProtocolID = Protocol_ID.CAN.value
+        mask_msg.DataSize = 4
         for i in range(4):
-            mask.Data[i] = 0x00  # mask all zeros = don't care
+            mask_msg.Data[i] = 0x00
 
-        pattern = PASSTHRU_MSG()
-        pattern.ProtocolID = self.PROTOCOL_CAN
-        pattern.DataSize = 4
+        pattern_msg = PASSTHRU_MSG()
+        pattern_msg.ProtocolID = Protocol_ID.CAN.value
+        pattern_msg.DataSize = 4
         for i in range(4):
-            pattern.Data[i] = 0x00
+            pattern_msg.Data[i] = 0x00
 
-        filterID = c_ulong()
-        result = self._fn_filter(
-            chanID, self.FILTER_PASS,
-            byref(mask), byref(pattern),
-            None,  # no flow control for PASS_FILTER
-            byref(filterID))
-        if result != 0:
-            raise RuntimeError(f"PassThruStartMsgFilter(PASS) failed: error {result}")
+        filter_id = ctypes.c_ulong(0)
 
-        # Clear RX buffer
-        CLEAR_RX_BUFFER = 0x08
-        self._fn_ioctl(chanID, CLEAR_RX_BUFFER, None, None)
+        from lib.connections.j2534 import dllPassThruStartMsgFilter
+        result = dllPassThruStartMsgFilter(
+            self._ch_id,
+            ctypes.c_ulong(Filter.PASS_FILTER.value),
+            ctypes.byref(mask_msg),
+            ctypes.byref(pattern_msg),
+            None,
+            ctypes.byref(filter_id),
+        )
+        if Error_ID(result) != Error_ID.ERR_SUCCESS:
+            raise IOError(f"PassThruStartMsgFilter failed: {Error_ID(result)}")
 
-        self._opened = True
-        log.info("CAN sniffer opened: device=%d channel=%d",
-                 devID.value, chanID.value)
+        self._j2534.PassThruIoctl(self._ch_id, Ioctl_ID.CLEAR_RX_BUFFER)
+        self._running = True
+        log.info("CAN sniffer opened (raw CAN, pass-all filter)")
 
     def read_frame(self, timeout_ms: int = 100) -> Optional[CANFrame]:
         """
-        Read a single raw CAN frame. Returns None on timeout/empty.
+        Read one raw CAN frame. Returns None on timeout/empty.
+
+        J2534 raw CAN frame layout:
+          Data[0:4] = CAN ID (big-endian)
+          Data[4:DataSize] = payload (0–8 bytes)
+          Timestamp = microseconds from adapter power-on
         """
-        if not self._opened:
+        if not self._running or self._ch_id is None:
             return None
 
-        from .j2534 import PASSTHRU_MSG
+        from lib.connections.j2534 import (
+            PASSTHRU_MSG, Protocol_ID, Error_ID,
+            dllPassThruReadMsgs,
+        )
+
         msg = PASSTHRU_MSG()
-        msg.ProtocolID = self.PROTOCOL_CAN
-        numMsgs = ctypes.c_ulong(1)
+        msg.ProtocolID = Protocol_ID.CAN.value
+        num_msgs = ctypes.c_ulong(1)
 
-        result = self._fn_read(
-            self._chanID, ctypes.byref(msg),
-            ctypes.byref(numMsgs), ctypes.c_ulong(timeout_ms))
+        result = dllPassThruReadMsgs(
+            self._ch_id,
+            ctypes.byref(msg),
+            ctypes.byref(num_msgs),
+            ctypes.c_ulong(timeout_ms),
+        )
 
-        ERR_BUFFER_EMPTY = 0x10
-        ERR_TIMEOUT = 0x09
-        if result in (ERR_BUFFER_EMPTY, ERR_TIMEOUT) or numMsgs.value == 0:
+        if Error_ID(result) == Error_ID.ERR_BUFFER_EMPTY or num_msgs.value == 0:
             return None
 
-        # Parse CAN frame: first 4 bytes = CAN ID (big-endian), rest = data
         if msg.DataSize < 4:
             return None
 
-        raw_id = bytes(msg.Data[0:4])
-        can_id = int.from_bytes(raw_id, "big")
-        is_extended = can_id > 0x7FF
-        data_len = msg.DataSize - 4
-        data = bytes(msg.Data[4:4+data_len])
+        can_id = int.from_bytes(bytes(msg.Data[0:4]), "big")
+        is_ext = bool(can_id & 0x80000000)
+        can_id = (can_id & 0x1FFFFFFF) if is_ext else (can_id & 0x7FF)
+
+        data = bytes(msg.Data[4:msg.DataSize])
 
         return CANFrame(
             timestamp_us=msg.Timestamp,
             can_id=can_id,
             data=data,
-            is_extended=is_extended,
+            is_extended=is_ext,
         )
 
+    def read_frames(self, timeout_ms: int = 100) -> Iterator[CANFrame]:
+        """Generator that yields CAN frames until stop() is called."""
+        while self._running:
+            frame = self.read_frame(timeout_ms)
+            if frame is not None:
+                yield frame
+
+    def stop(self):
+        self._running = False
+
     def close(self):
-        """Close the CAN channel and device."""
-        self._opened = False
-        if self._chanID is not None:
+        self._running = False
+        if self._j2534 and self._ch_id is not None:
             try:
-                self._fn_disconnect(self._chanID)
+                self._j2534.PassThruDisconnect(self._ch_id)
             except Exception:
                 pass
-            self._chanID = None
-        if self._devID is not None:
+        if self._j2534 and self._dev_id is not None:
             try:
-                self._fn_close(self._devID)
+                self._j2534.PassThruClose(self._dev_id)
             except Exception:
                 pass
-            self._devID = None
+        self._ch_id = None
+        self._dev_id = None
         log.info("CAN sniffer closed")
 
-    def __enter__(self):
-        self.open()
-        return self
-
-    def __exit__(self, *args):
-        self.close()
-
     @property
-    def is_open(self) -> bool:
-        return self._opened
+    def is_running(self) -> bool:
+        return self._running
