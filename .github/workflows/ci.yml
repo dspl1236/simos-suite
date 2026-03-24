@@ -46,7 +46,8 @@ jobs:
           count = subprocess.check_output(['git','rev-list','--count','HEAD']).decode().strip()
           sha   = subprocess.check_output(['git','rev-parse','--short','HEAD']).decode().strip()
           v = f"0.{count}.0-{sha}"
-          open(os.environ['GITHUB_OUTPUT'],'a').write(f"version={v}\n")
+          open(os.environ['GITHUB_OUTPUT'],'a').write(f"version={v}
+")
           print(f"Version: {v}")
 
       # x86 (32-bit) — required for all 32-bit J2534 DLLs
@@ -89,6 +90,41 @@ jobs:
       - name: Rename EXE
         shell: cmd
         run: copy dist\SimosSuite.exe "dist\SimosSuite-${{ steps.ver.outputs.version }}-x86.exe"
+
+      - name: Prune old dev-latest assets (keep 4 so new upload = 5 total)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="dev-latest"
+          KEEP=4
+
+          # Get the release id for dev-latest (may not exist yet on first run)
+          RELEASE_ID=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null || true)
+
+          if [ -z "$RELEASE_ID" ]; then
+            echo "No existing dev-latest release — nothing to prune."
+            exit 0
+          fi
+
+          # Fetch all assets sorted oldest-first, delete everything beyond KEEP
+          curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
+            | python3 -c "
+          import json, sys
+          assets = sorted(json.load(sys.stdin), key=lambda a: a['created_at'])
+          to_delete = assets[:-$KEEP] if len(assets) > $KEEP else []
+          for a in to_delete:
+              print(a['id'])
+          " | while read asset_id; do
+            echo "Deleting asset $asset_id..."
+            curl -s -o /dev/null -w "%{http_code}
+" -X DELETE \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/assets/$asset_id"
+          done
 
       - name: Update rolling dev release
         uses: softprops/action-gh-release@v2
