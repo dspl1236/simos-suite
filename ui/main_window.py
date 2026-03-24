@@ -576,62 +576,28 @@ class FlashTab(_Tab):
         self._run(self._read_task)
 
     def _read_task(self):
-        from flasher.uds_flash import _make_connection, FlashProgress
-        import udsoncan
+        from flasher.uds_flash import read_block, FlashProgress
 
         def cb(p):
             self._ui(self._update_progress, p)
 
-        ecu      = self.mw.ecu
-        blk      = ecu.cal_block
-        conn     = None
+        ecu = self.mw.ecu
+        blk = ecu.cal_block
 
         try:
-            conn = _make_connection(
-                ecu,
-                self.mw.interface,
+            # read_block() handles: extended session → programming session →
+            # SA2 unlock → RequestUpload → TransferData → XOR decrypt → LZSS decompress
+            cal_bytes = read_block(
+                ecu            = ecu,
+                block_num      = blk.number,
+                interface      = self.mw.interface,
                 interface_path = self.mw.iface_path,
-                ble_bridge     = self.mw.ble_bridge,
+                callback       = cb,
             )
-
-            cfg = dict(udsoncan.configs.default_client_config)
-            cfg["request_timeout"] = 30
-
-            with __import__("udsoncan").client.Client(conn, request_timeout=30, config=cfg) as client:
-                cb(FlashProgress("CONNECT", "Opening extended session...", 5))
-                client.change_session(
-                    udsoncan.services.DiagnosticSessionControl
-                    .Session.extendedDiagnosticSession)
-
-                cb(FlashProgress("CONNECT", f"Reading CAL block {blk.number} "
-                                            f"({blk.length:#x} bytes)...", 10))
-
-                # Read in chunks via ReadMemoryByAddress (0x23)
-                CHUNK   = 0x7F0
-                cal     = bytearray()
-                addr    = blk.base_addr
-                remain  = blk.length
-
-                while remain > 0:
-                    size   = min(CHUNK, remain)
-                    pct    = 10 + int(85 * (blk.length - remain) / blk.length)
-                    cb(FlashProgress("TRANSFER",
-                                     f"0x{addr:08X}  {blk.length-remain:#x}/{blk.length:#x}",
-                                     pct, "CAL"))
-
-                    resp = client.read_memory_by_address(
-                        udsoncan.MemoryLocation(addr, size, 32, 32))
-                    chunk_bytes = resp.service_data.memory_block
-                    cal.extend(chunk_bytes)
-                    addr   += len(chunk_bytes)
-                    remain -= len(chunk_bytes)
-
-                cal_bytes = bytes(cal)
-                cb(FlashProgress("DONE", f"Read {len(cal_bytes):,} bytes", 100, "CAL"))
-
-            # Hand off to Tune tab
+            if cal_bytes is None:
+                self._ui(self._flash_error, "read_block returned None — see log")
+                return
             self._ui(self._read_done, cal_bytes, ecu.name)
-
         except Exception as e:
             self._ui(self._flash_error, str(e))
 
@@ -721,8 +687,30 @@ class FlashTab(_Tab):
         self._set_buttons(True)
         if ok:
             self._prog_label.config(text="done", fg=C["green"])
+            # Auto-read DTCs after a successful flash to surface any codes set during programming
+            self._run(self._post_flash_dtc_task)
         else:
             self._prog_label.config(text="failed", fg=C["red"])
+
+    def _post_flash_dtc_task(self):
+        """Read DTCs after flash and log them. Non-fatal — errors are logged only."""
+        try:
+            from flasher.uds_flash import read_dtcs
+            dtcs = read_dtcs(
+                ecu            = self.mw.ecu,
+                interface      = self.mw.interface,
+                interface_path = self.mw.iface_path,
+            )
+            def _show(dtcs=dtcs):
+                if not dtcs or list(dtcs.keys()) == ["ERROR"]:
+                    self._log_line("post-flash DTC read: none or error\n", "dim")
+                else:
+                    self._log_line(f"post-flash DTCs ({len(dtcs)}): " +
+                                   ", ".join(dtcs.keys()) + "\n",
+                                   "err" if dtcs else "ok")
+            self._ui(_show)
+        except Exception as e:
+            self._ui(lambda: self._log_line(f"DTC read after flash: {e}\n", "dim"))
 
     def _flash_error(self, msg: str):
         self._set_buttons(True)
