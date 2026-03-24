@@ -656,3 +656,28 @@ code,pcode,name,symbol
 30794,P060C00,Internal Control Module Main Processor Performance,SV_ERR_SYM_STST_MON_1.30794
 31537,P060C00,Internal Control Module Main Processor Performance,SV_ERR_SYM_CRU_MON_1.31537
 31538,P138800,Ctrl. module faulty,SV_ERR_SYM_CONV_MON_1.31538
+31539,P030500,Cyl.5 Misfire Detected,SV_ERR_SYM_MIS_4.V6
+31540,P030600,Cyl.6 Misfire Detected,SV_ERR_SYM_MIS_5.V6
+31541,P023600,Cylinder 5 Above Knock Threshold,SV_ERR_SYM_KNK_RTD_LIM_4.V6
+31542,P023500,Cylinder 6 Above Knock Threshold,SV_ERR_SYM_KNK_RTD_LIM_5.V6
+31543,P033200,Knock Sensor 2 Circuit Low Input (Bank 2),SV_ERR_SYM_BAS_KNK_1.V6
+31544,P033300,Knock Sensor 2 Circuit High Input (Bank 2),SV_ERR_SYM_BAS_KNK_H_1.V6
+31545,P033100,Knock Sensor 2 Circuit Range/Performance (Bank 2),SV_ERR_SYM_REL_KNK_1.V6
+31546,P017100,System Too Lean (Bank 2),SV_ERR_SYM_LEAN_B2.V6
+31547,P017200,System Too Rich (Bank 2),SV_ERR_SYM_RICH_B2.V6
+31548,P017400,O2 Sensor Circuit No Activity Detected (Bank 2 S1),SV_ERR_SYM_O2_INACT_B2.V6
+31549,P013600,O2 Sensor Circuit Slow Response Bank 2 Sensor 1,SV_ERR_SYM_O2_SLOW_B2.V6
+31550,P022900,Supercharger Bypass Valve Control Circuit,SV_ERR_SYM_SC_BYP_CTRL.TFSI
+31551,P022A00,Supercharger Bypass Valve Stuck Open,SV_ERR_SYM_SC_BYP_OPEN.TFSI
+31552,P022B00,Supercharger Bypass Valve Stuck Closed,SV_ERR_SYM_SC_BYP_CLOSED.TFSI
+31553,P229700,Supercharger Outlet Pressure Sensor Range/Perf,SV_ERR_SYM_SC_PRES_RNG.TFSI
+31554,P229800,Supercharger Outlet Pressure Sensor High Input,SV_ERR_SYM_SC_PRES_H.TFSI
+31555,P229900,Supercharger Outlet Pressure Sensor Low Input,SV_ERR_SYM_SC_PRES_L.TFSI
+31556,P261600,Coolant Pump (Intercooler) Control Circuit Low,SV_ERR_SYM_ICP_SCG.TFSI
+31557,P261700,Coolant Pump (Intercooler) Control Circuit High,SV_ERR_SYM_ICP_SCP.TFSI
+31558,P026A00,Fuel Injector Bank 2 S1 Low,SV_ERR_SYM_INJ_B2_SCG.TFSI
+31559,P026B00,Fuel Injector Bank 2 S1 High,SV_ERR_SYM_INJ_B2_SCP.TFSI
+31560,P001100,Camshaft Position A Timing Over-Advanced/System Perf (Bank 2),SV_ERR_SYM_VCT_ADV_B2.V6
+31561,P001200,Camshaft Position A Timing Over-Retarded (Bank 2),SV_ERR_SYM_VCT_RTD_B2.V6
+31562,P001500,Camshaft Position B Timing Over-Advanced Bank 2,SV_ERR_SYM_VCTB_ADV_B2.V6
+31563,P001600,Camshaft Position B Timing Over-Retarded Bank 2,SV_ERR_SYM_VCTB_RTD_B2.V6
