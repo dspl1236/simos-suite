@@ -1462,7 +1462,7 @@ def read_ecu_info(
         if asam_id and not asam_id.startswith("<"):
             project = getattr(ecu, "project_code", "")
             # Known S85 ASAM prefixes from community-confirmed ODX containers
-            S85_ASAM_PREFIXES = ("S85", "EV_ECM8", "EV_ECM18TF", "EV_ECM3_S8")
+            S85_ASAM_PREFIXES = ("S85", "EV_ECM8", "EV_ECM18TF", "EV_ECM3_S8", "EV_ECM30TFS")
             matched = any(p in asam_id for p in S85_ASAM_PREFIXES)
             if not matched:
                 result["SA2 Script Warning"] = (
