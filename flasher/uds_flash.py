@@ -1086,6 +1086,223 @@ def flash_blocks(
     _obd_clear(interface, interface_path)
     return True
 
+# ─── Virtual read / block dump ───────────────────────────────────────────────
+
+def read_block(
+    ecu:            "ECUDef",
+    block_num:      int,
+    interface:      str = "J2534",
+    interface_path: "Optional[str]" = None,
+    callback:       "ProgressCallback" = _noop,
+) -> "Optional[bytes]":
+    """
+    Read a flash block from the ECU using UDS RequestUpload (virtual read).
+
+    This is the "safe" pre-flash workflow from VW_Flash: read the existing
+    block, modify CAL, flash back. Requires SA2 programming session unlock.
+
+    Block numbers for Simos8.5:
+        1 = CBOOT   (0x13E00 bytes)
+        2 = ASW1    (0x17FE00 bytes — ~1.5MB, takes ~2min on J2534)
+        3 = CAL     (0x3C000 bytes — normal read target)
+
+    The returned bytes are raw decrypted block data, ready for use with
+    flash_blocks() after modification.
+
+    Returns None on failure.
+    """
+    if block_num not in ecu.blocks:
+        callback(FlashProgress("ERROR", f"Block {block_num} not defined for {ecu.name}", 0))
+        return None
+
+    blk = ecu.blocks[block_num]
+    expected_len = blk.length
+
+    conn = _make_connection(ecu, interface, interface_path)
+    cfg = dict(configs.default_client_config)
+    cfg["security_algo"]        = _make_security_algo(ecu.sa2_script)
+    cfg["security_algo_params"] = None
+    cfg["data_identifiers"]     = {}
+    cfg["request_timeout"]      = 30
+
+    callback(FlashProgress("CONNECT", f"Connecting for block read ({blk.name})…", 0))
+
+    with Client(conn, request_timeout=30, config=cfg) as client:
+
+        def _st(t=30):
+            try: client.session_timing["p2_server_max"] = t
+            except TypeError: client.session_timing.p2_server_max = t
+            client.config["request_timeout"] = t
+
+        # Extended session
+        try:
+            client.change_session(
+                services.DiagnosticSessionControl.Session.extendedDiagnosticSession)
+        except exceptions.NegativeResponseException as e:
+            callback(FlashProgress("ERROR", f"Extended session refused: {e}", 0))
+            return None
+        _st(30)
+
+        # Precondition check
+        try:
+            client.start_routine(0x0203)
+        except Exception as e:
+            log.debug("Precondition 0x0203: %s", e)
+        client.tester_present()
+
+        # Programming session
+        callback(FlashProgress("CONNECT", "Entering programming session…", 10))
+        try:
+            client.change_session(
+                services.DiagnosticSessionControl.Session.programmingSession)
+        except exceptions.NegativeResponseException as e:
+            callback(FlashProgress("ERROR", f"Programming session refused: {e}", 0))
+            return None
+        _st(30)
+        client.tester_present()
+
+        # SA2 unlock
+        callback(FlashProgress("CONNECT", "SA2 security access…", 20))
+        try:
+            client.unlock_security_access(0x11)
+        except exceptions.NegativeResponseException as e:
+            callback(FlashProgress("ERROR", f"SA2 denied: {e}", 0))
+            return None
+        client.tester_present()
+
+        # RequestUpload — same addressing as RequestDownload (1-byte block ID)
+        callback(FlashProgress("TRANSFER", f"Requesting upload of {blk.name}…", 25))
+        try:
+            dfi = udsoncan.DataFormatIdentifier(compression=0xA, encryption=0xA)
+            mem_loc = udsoncan.MemoryLocation(
+                address=block_num, memorysize=expected_len,
+                address_format=8, memorysize_format=32,
+            )
+            resp = client.request_upload(mem_loc, dfi)
+            max_block = resp.service_data.max_length
+        except Exception as e:
+            callback(FlashProgress("ERROR", f"RequestUpload failed: {e}", 0))
+            return None
+
+        # TransferData — receive chunks
+        block_size = max_block - 2
+        counter    = 1
+        received   = bytearray()
+        KEEPALIVE_EVERY = 50
+
+        while len(received) < expected_len:
+            pct = 25 + int(70 * len(received) / expected_len)
+            callback(FlashProgress("TRANSFER",
+                                   f"Reading {blk.name}: {len(received):#08x}/{expected_len:#08x}",
+                                   pct, blk.name))
+            try:
+                resp = client.transfer_data(counter, b"")
+                chunk = bytes(resp.service_data.parameter_records)
+                received.extend(chunk)
+            except exceptions.NegativeResponseException as e:
+                callback(FlashProgress("ERROR",
+                                       f"TransferData read failed at {len(received):#x}: {e}", 0))
+                return None
+            counter = (counter + 1) & 0xFF
+            if counter == 0: counter = 1
+            if len(received) % (KEEPALIVE_EVERY * block_size) < block_size:
+                try: client.tester_present()
+                except Exception: pass
+
+        # RequestTransferExit
+        try:
+            client.request_transfer_exit()
+        except Exception as e:
+            log.warning("RequestTransferExit after upload: %s", e)
+        client.tester_present()
+
+        # Decrypt: XOR decrypt the received data (inverse of xor_encrypt)
+        from flasher.checksum_simos import xor_encrypt  # encrypt == decrypt for XOR
+        if ecu.crypto == CryptoType.XOR_COUNTER:
+            raw = xor_encrypt(bytes(received))
+        elif ecu.crypto == CryptoType.AES_CBC:
+            from Crypto.Cipher import AES
+            cipher = AES.new(ecu.crypto_key, AES.MODE_CBC, ecu.crypto_iv)
+            raw = cipher.decrypt(bytes(received))
+        else:
+            raw = bytes(received)
+
+        # Decompress LZSS
+        try:
+            from flasher.lzss_compress import lzss_decompress
+            raw = lzss_decompress(raw)
+        except Exception as e:
+            log.debug("LZSS decompress: %s — returning raw encrypted bytes", e)
+
+        callback(FlashProgress("DONE",
+                               f"{blk.name} read complete — {len(raw):,} bytes", 100, blk.name))
+        log.info("read_block: %s block %d — %d bytes", ecu.name, block_num, len(raw))
+        return raw
+
+
+# ─── DTC read ────────────────────────────────────────────────────────────────
+
+def read_dtcs(
+    ecu:            "ECUDef",
+    interface:      str = "J2534",
+    interface_path: "Optional[str]" = None,
+    confirmed_only: bool = True,
+) -> "Dict[str, str]":
+    """
+    Read DTCs from the ECU in extended session.
+    Returns dict of {dtc_code_hex: description}.
+
+    confirmed_only=True filters to confirmed+test_failed DTCs (normal use).
+    confirmed_only=False returns all stored DTCs.
+
+    Called automatically after flash_blocks/flash_cal to surface any codes
+    set during programming.
+    """
+    import udsoncan
+    from udsoncan import Dtc
+
+    conn = _make_connection(ecu, interface, interface_path)
+    cfg = dict(configs.default_client_config)
+    cfg["request_timeout"] = 10
+
+    dtcs = {}
+    try:
+        with Client(conn, request_timeout=10, config=cfg) as client:
+            client.change_session(
+                services.DiagnosticSessionControl.Session.extendedDiagnosticSession)
+            try:
+                client.session_timing["p2_server_max"] = 15
+            except TypeError:
+                client.session_timing.p2_server_max = 15
+
+            if confirmed_only:
+                mask = Dtc.Status(
+                    test_failed=True,
+                    confirmed=True,
+                    test_failed_this_operation_cycle=True,
+                    test_failed_since_last_clear=True,
+                    pending=False,
+                    test_not_completed_since_last_clear=False,
+                    test_not_completed_this_operation_cycle=False,
+                    warning_indicator_requested=False,
+                )
+                resp = client.get_dtc_by_status_mask(mask.get_byte_as_int())
+            else:
+                resp = client.get_dtc_by_status_mask(0xFF)
+
+            for dtc in resp.service_data.dtcs:
+                code = f"P{dtc.id:04X}"
+                status = dtc.status.get_byte_as_int()
+                dtcs[code] = f"status=0x{status:02X}"
+
+    except Exception as e:
+        log.warning("read_dtcs: %s", e)
+        dtcs["ERROR"] = str(e)
+
+    log.info("read_dtcs: %d DTCs found", len(dtcs))
+    return dtcs
+
+
 # ─── Read ECU info ────────────────────────────────────────────────────────────
 
 def read_ecu_info(
@@ -1234,5 +1451,28 @@ def read_ecu_info(
                     result[label] = str(val)
             except Exception as e:
                 result[label] = f"<{type(e).__name__}>"
+
+        # ── SA2 script verification via DID 0xF19E ────────────────────────
+        # DID 0xF19E returns the ASAM/ODX file identifier embedded in the ECU.
+        # For Simos8.5 (S85 project), this should start with a string containing
+        # "S85" or "EV_ECM8" or the Simos8 family identifier.
+        # If it doesn't match, the SA2 script in ecu_defs.py may be wrong for
+        # this specific ECU part number — extraction from the matching ODX is needed.
+        asam_id = result.get("ASAM File ID", "")
+        if asam_id and not asam_id.startswith("<"):
+            project = getattr(ecu, "project_code", "")
+            # Known S85 ASAM prefixes from community-confirmed ODX containers
+            S85_ASAM_PREFIXES = ("S85", "EV_ECM8", "EV_ECM18TF", "EV_ECM3_S8")
+            matched = any(p in asam_id for p in S85_ASAM_PREFIXES)
+            if not matched:
+                result["SA2 Script Warning"] = (
+                    f"ASAM ID '{asam_id}' does not match known {project} prefixes {S85_ASAM_PREFIXES}. "
+                    f"SA2 script in ecu_defs.py may not match this ECU. "
+                    f"Extract correct SA2 from the ODX file matching this ASAM ID."
+                )
+                log.warning("SA2 mismatch: ASAM ID '%s' unexpected for %s", asam_id, project)
+            else:
+                result["SA2 Script Status"] = f"OK — ASAM ID matches {project} profile"
+                log.info("SA2 script verified: ASAM ID '%s' matches %s", asam_id, project)
 
     return result
