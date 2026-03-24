@@ -285,10 +285,12 @@ J255_2ZONE = ECUDef(
 #   ENCRYPT-COMPRESS-METHOD: 0x11 = XOR counter + LZSS compression
 #   XOR algorithm confirmed at address 0x80017168 in 03F906070AK
 #
-# Block layout from VW_Flash (community confirmed for S85 project):
-#   Block 1 (CBOOT):  81,408 bytes  base 0x80020000
-#   Block 2 (ASW1):   1,702,400 bytes base 0x80080000
-#   Block 3 (CAL):    245,760 bytes   base 0xA0040000
+# Block layout CONFIRMED from FL_4G0907551D__0006.frf (decrypted, ODX extracted):
+#   Block 1 (CBOOT):  81,408 bytes  (0x13E00)  base 0x80020000  CRC32=0x89A21D6E
+#   Block 2 (ASW1):   1,572,352 bytes (0x17FE00) base 0x80080000  CRC32=0x3109382B
+#   Block 3 (CAL):    261,632 bytes  (0x3FE00)  base 0xA0040000  CRC32=0xE18B74FE
+#   ALFID: 014101  (used in RequestDownload)
+#   ECU ident string: "4G0907551D " (11 chars, trailing space required)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SIMOS85 = ECUDef(
