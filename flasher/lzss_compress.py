@@ -95,3 +95,47 @@ def lzss_compress(data: bytes) -> bytes:
     log.debug("LZSS: %d -> %d bytes (%.1f%%)", n, len(output),
               100 * len(output) / n if n else 0)
     return bytes(output)
+
+def lzss_decompress(data: bytes) -> bytes:
+    """
+    Decompress LZSS-compressed data produced by lzss_compress().
+    Matches the same parameters: WINDOW_SIZE=1023, flag byte MSB-first,
+    10-bit offset + 6-bit (length-3) token.
+
+    Used by read_block() to decompress ECU upload data before returning
+    raw calibration bytes to the caller.
+    """
+    output  = bytearray()
+    window  = bytearray(WINDOW_SIZE)
+    win_pos = 0
+    pos     = 0
+    n       = len(data)
+
+    while pos < n:
+        flag = data[pos]; pos += 1
+        for bit in range(7, -1, -1):
+            if pos >= n:
+                break
+            if flag & (1 << bit):
+                # Raw literal byte
+                b = data[pos]; pos += 1
+                output.append(b)
+                window[win_pos] = b
+                win_pos = (win_pos + 1) % WINDOW_SIZE
+            else:
+                # Encoded reference — 2 bytes: 10-bit offset + 6-bit length
+                if pos + 1 >= n:
+                    break
+                hi = data[pos]; pos += 1
+                lo = data[pos]; pos += 1
+                token  = (hi << 8) | lo
+                offset = (token >> 6) & 0x3FF
+                length = (token & 0x3F) + 3
+                for i in range(length):
+                    b = window[(offset + i) % WINDOW_SIZE]
+                    output.append(b)
+                    window[win_pos] = b
+                    win_pos = (win_pos + 1) % WINDOW_SIZE
+
+    log.debug("LZSS decompress: %d -> %d bytes", n, len(output))
+    return bytes(output)
