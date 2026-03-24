@@ -3384,488 +3384,393 @@ class DiagTab(_Tab):
             self._ui(self._clear_btn.config, state="normal")
 
 
-# TAB 7 — Raw Sniff (Passive CAN Bus Monitor)
+# TAB 7 — Raw Sniff (passive CAN bus listener)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RawSniffTab(_Tab):
     """
-    Passive CAN bus sniffer — listens to all traffic without transmitting.
+    Passive CAN bus sniffer using J2534 raw CAN mode.
 
-    Designed for use with an OBD-II splitter:
-      Port A → VCDS / Ross-Tech VAG-COM (drives diagnostic sessions)
-      Port B → Mongoose / Tactrix / VNCI (runs this sniffer, listen only)
-
-    Captures every CAN frame on the diagnostic bus and decodes UDS service
-    IDs in real time. Perfect for reverse-engineering CP removal sequences.
-
-    Interface modes:
-      J2534  — opens raw CAN channel (Protocol_ID.CAN) with pass-all filter
-      BLE    — uses ESP32 bridge raw sniff mode (0xCAFE frames)
-      Mock   — simulated frames for UI testing
+    Opens its own J2534 channel independently of the app's connected state.
+    With an OBD splitter, captures all traffic between VCDS/ODIS and the car.
+    Includes software ISO-TP reassembly and UDS service decode.
     """
 
     def __init__(self, parent, mw):
         super().__init__(parent, mw)
         self._sniffing = False
-        self._sniffer = None
-        self._paused = False
+        self._sniffer = None      # J2534CANSniffer instance
+        self._raw_frames = []     # all captured CANFrame objects
+        self._uds_messages = []   # reassembled ISOTPMessage objects
 
         info = _card(self, padx=12, pady=8)
         info.pack(fill="x", padx=14, pady=(12, 4))
         tk.Label(info, text=(
-            "Passive CAN bus monitor — listens without transmitting.\n"
-            "Use with an OBD splitter: VCDS on one port, Mongoose on the other.\n"
-            "Captures and decodes all UDS traffic for CP research."
+            "Passive CAN bus listener — opens raw CAN channel via J2534.\n"
+            "Use with OBD splitter: VCDS/ODIS talks on one cable, this listens on the other.\n"
+            "Captures full UDS exchange including CP removal sequences and GEKO tokens."
         ), fg=C["muted"], bg=C["surface"], font=("Menlo", 10),
-            justify="left", wraplength=580).pack(anchor="w")
+            justify="left", wraplength=620).pack(anchor="w")
 
-        # ── Control bar ──────────────────────────────────────────────────────
+        # ── Controls row ──────────────────────────────────────────────────────
         ctrl = _frame(self)
         ctrl.pack(fill="x", padx=14, pady=6)
-
-        self._sniff_btn = _btn(ctrl, "▶  start sniff",
+        self._sniff_btn = _btn(ctrl, "start sniff",
                                self._toggle_sniff, primary=True)
         self._sniff_btn.pack(side="left")
-        tip(self._sniff_btn,
-            "Opens J2534 in raw CAN mode (no ECU connection needed).\n"
-            "Safe to start while VCDS is already talking to the car.")
-
-        self._pause_btn = _btn(ctrl, "pause", self._toggle_pause,
-                               state="disabled")
-        self._pause_btn.pack(side="left", padx=4)
-
-        _btn(ctrl, "clear", lambda: self._do_clear()
-             ).pack(side="left", padx=4)
+        _btn(ctrl, "clear", self._clear_all).pack(side="left", padx=8)
         _btn(ctrl, "save log", self._save_log).pack(side="left")
+        _btn(ctrl, "save pcap", self._save_pcap).pack(side="left", padx=8)
+        tip(self._sniff_btn,
+            "Opens raw CAN channel on J2534 adapter.\n"
+            "Does NOT require app to be connected — uses its own channel.\n"
+            "Make sure no other tab has an active J2534 session.")
 
-        # ── Filters ──────────────────────────────────────────────────────────
-        filt_frame = _frame(self)
-        filt_frame.pack(fill="x", padx=14, pady=2)
+        # ── View mode toggle ──────────────────────────────────────────────────
+        tk.Label(ctrl, text="  view:",
+                 fg=C["muted"], bg=C["bg"],
+                 font=("Menlo", 10)).pack(side="left", padx=(16, 4))
+        self._view_mode = tk.StringVar(value="uds")
+        for val, label in [("uds", "UDS decoded"), ("raw", "raw CAN")]:
+            tk.Radiobutton(ctrl, text=label, variable=self._view_mode,
+                           value=val, fg=C["text"], bg=C["bg"],
+                           selectcolor=C["surface"],
+                           activebackground=C["bg"], activeforeground=C["blue"],
+                           font=("Menlo", 10),
+                           command=self._refresh_view).pack(side="left", padx=2)
 
-        tk.Label(filt_frame, text="filter CAN ID",
+        # ── Filter row ────────────────────────────────────────────────────────
+        filt_row = _frame(self)
+        filt_row.pack(fill="x", padx=14, pady=2)
+        tk.Label(filt_row, text="filter CAN ID",
                  fg=C["muted"], bg=C["bg"],
                  font=("Menlo", 10)).pack(side="left")
         self._filter_var = tk.StringVar(value="")
-        tk.Entry(filt_frame, textvariable=self._filter_var,
+        tk.Entry(filt_row, textvariable=self._filter_var,
                  bg=C["surface"], fg=C["text"],
                  insertbackground=C["text"],
                  font=("Menlo", 10), width=8, bd=0,
                  highlightbackground=C["border"],
                  highlightthickness=1).pack(side="left", padx=4)
-        tk.Label(filt_frame, text="(hex, comma-sep: 710,77A)",
+        tk.Label(filt_row, text="(hex, e.g. 710 or 710,77A for multiple)",
                  fg=C["dim"], bg=C["bg"],
-                 font=("Menlo", 9)).pack(side="left")
+                 font=("Menlo", 9)).pack(side="left", padx=4)
 
-        # UDS decode toggle
-        self._uds_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(filt_frame, text="UDS decode",
-                       variable=self._uds_var,
-                       fg=C["text"], bg=C["bg"],
-                       selectcolor=C["surface"],
-                       activebackground=C["bg"],
-                       activeforeground=C["text"],
-                       font=("Menlo", 10)).pack(side="left", padx=(16, 0))
+        # ── DLL path ──────────────────────────────────────────────────────────
+        dll_row = _frame(self)
+        dll_row.pack(fill="x", padx=14, pady=2)
+        tk.Label(dll_row, text="J2534 DLL",
+                 fg=C["muted"], bg=C["bg"],
+                 font=("Menlo", 10)).pack(side="left")
+        self._dll_var = tk.StringVar(value="")
+        tk.Entry(dll_row, textvariable=self._dll_var,
+                 bg=C["surface"], fg=C["text"],
+                 insertbackground=C["text"],
+                 font=("Menlo", 10), width=50, bd=0,
+                 highlightbackground=C["border"],
+                 highlightthickness=1).pack(side="left", padx=4, fill="x", expand=True)
+        _btn(dll_row, "browse", self._browse_dll).pack(side="left", padx=4)
+        tip(self._dll_var._root,
+            "Path to J2534 DLL. Auto-filled from Connect tab if available.")
 
-        # Auto-scroll toggle
-        self._autoscroll_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(filt_frame, text="auto-scroll",
-                       variable=self._autoscroll_var,
-                       fg=C["text"], bg=C["bg"],
-                       selectcolor=C["surface"],
-                       activebackground=C["bg"],
-                       activeforeground=C["text"],
-                       font=("Menlo", 10)).pack(side="left", padx=(8, 0))
-
-        # ── Frame log ────────────────────────────────────────────────────────
-        _section(self, "CAN bus frames")
+        # ── Log area ──────────────────────────────────────────────────────────
+        _section(self, "frame log")
         log_outer, self._hex_log = _scrolled_text(self, height=20)
         log_outer.pack(fill="both", expand=True, padx=14, pady=4)
-
-        # Monospace column header
-        hdr = "TIME          DIR  [CAN ID]  DATA                         UDS\n"
-        self._hex_log.insert("1.0", hdr)
-        self._hex_log.tag_add("hdr", "1.0", "1.end")
-
-        self._hex_log.tag_config("hdr",  foreground=C["dim"])
         self._hex_log.tag_config("tx",   foreground=C["blue"])
         self._hex_log.tag_config("rx",   foreground=C["green"])
-        self._hex_log.tag_config("fc",   foreground=C["dim"])       # flow control
+        self._hex_log.tag_config("fc",   foreground=C["dim"])
         self._hex_log.tag_config("uds",  foreground=C["amber"])
-        self._hex_log.tag_config("err",  foreground=C["red"])
+        self._hex_log.tag_config("nrc",  foreground=C["red"])
+        self._hex_log.tag_config("dim",  foreground=C["dim"])
+        self._hex_log.tag_config("hdr",  foreground=C["blue"])
 
-        # ── Status bar ───────────────────────────────────────────────────────
-        status_frame = _frame(self)
-        status_frame.pack(fill="x", padx=14, pady=(0, 4))
-
+        # Status bar
+        status = _frame(self)
+        status.pack(fill="x", padx=14, pady=(0, 4))
         self._frame_count = 0
-        self._count_lbl = tk.Label(status_frame, text="frames: 0",
+        self._msg_count = 0
+        self._count_lbl = tk.Label(status, text="frames: 0  |  messages: 0",
                                    fg=C["dim"], bg=C["bg"],
                                    font=("Menlo", 9))
         self._count_lbl.pack(side="left")
-
-        self._status_lbl = tk.Label(status_frame, text="idle",
+        self._status_lbl = tk.Label(status, text="",
                                     fg=C["dim"], bg=C["bg"],
                                     font=("Menlo", 9))
         self._status_lbl.pack(side="right")
 
     def on_connect(self):
-        # Sniff doesn't need the normal ECU connection — it opens its own
-        # J2534 channel in CAN mode. But we enable the button here anyway.
-        pass
+        # Auto-fill DLL path from interface panel if J2534
+        if self.mw.interface and self.mw.interface.upper() == "J2534":
+            if self.mw.iface_path and not self._dll_var.get():
+                self._dll_var.set(self.mw.iface_path)
 
     def on_disconnect(self):
+        # Auto-fill on disconnect too (DLL path is still valid)
         pass
 
-    def _do_clear(self):
-        self._clear_log(self._hex_log)
-        hdr = "TIME          DIR  [CAN ID]  DATA                         UDS\n"
-        self._hex_log.insert("1.0", hdr)
-        self._hex_log.tag_add("hdr", "1.0", "1.end")
-        self._frame_count = 0
-        self._count_lbl.config(text="frames: 0")
+    def _browse_dll(self):
+        path = filedialog.askopenfilename(
+            title="Select J2534 DLL",
+            filetypes=[("DLL files", "*.dll"), ("All files", "*.*")],
+        )
+        if path:
+            self._dll_var.set(path)
 
     def _parse_filter(self):
-        """Parse comma-separated hex CAN IDs from the filter field."""
+        """Parse filter entry into a set of CAN IDs, or None for pass-all."""
         filt_str = self._filter_var.get().strip()
         if not filt_str:
             return None
         ids = set()
-        for part in filt_str.replace(" ", "").split(","):
-            try:
-                ids.add(int(part, 16))
-            except ValueError:
-                pass
+        for part in filt_str.replace(" ", ",").split(","):
+            part = part.strip()
+            if part:
+                try:
+                    ids.add(int(part, 16))
+                except ValueError:
+                    pass
         return ids if ids else None
 
     def _toggle_sniff(self):
         if self._sniffing:
-            self._stop_sniff()
+            self._sniffing = False
+            self._sniff_btn.config(text="start sniff",
+                                   fg="#0d1117", bg=C["blue"])
+            self._status_lbl.config(text="stopped", fg=C["dim"])
         else:
-            self._start_sniff()
-
-    def _start_sniff(self):
-        # Determine interface — sniff works independently of ECU connection
-        iface = self.mw.interface or ""
-        iface_path = self.mw.iface_path or ""
-
-        if iface.upper() == "J2534":
-            self._sniffing = True
-            self._paused = False
-            self._frame_count = 0
-            self._sniff_btn.config(text="■  stop sniff",
-                                   fg=C["text"], bg=C["red"])
-            self._pause_btn.config(state="normal")
-            self._status_lbl.config(text="opening J2534 CAN channel...",
-                                    fg=C["amber"])
-            self._run(self._j2534_sniff_loop, iface_path)
-
-        elif iface.upper() in ("BLE", "USBISOTP"):
-            self._sniffing = True
-            self._paused = False
-            self._frame_count = 0
-            self._sniff_btn.config(text="■  stop sniff",
-                                   fg=C["text"], bg=C["red"])
-            self._pause_btn.config(state="normal")
-            self._status_lbl.config(text="ESP32 raw sniff mode...",
-                                    fg=C["amber"])
-            self._run(self._bridge_sniff_loop)
-
-        elif iface.upper() == "MOCK":
-            self._sniffing = True
-            self._paused = False
-            self._frame_count = 0
-            self._sniff_btn.config(text="■  stop sniff",
-                                   fg=C["text"], bg=C["red"])
-            self._pause_btn.config(state="normal")
-            self._status_lbl.config(text="simulated CAN traffic",
-                                    fg=C["amber"])
-            self._run(self._mock_sniff_loop)
-
-        else:
-            # Try to detect a J2534 DLL even if not "connected"
-            try:
-                from transport.interfaces import detect_j2534_dll
-                dll = detect_j2534_dll()
-                if dll:
-                    self._sniffing = True
-                    self._paused = False
-                    self._frame_count = 0
-                    self._sniff_btn.config(text="■  stop sniff",
-                                           fg=C["text"], bg=C["red"])
-                    self._pause_btn.config(state="normal")
-                    self._status_lbl.config(
-                        text=f"auto-detected: {os.path.basename(dll)}",
-                        fg=C["amber"])
-                    self._run(self._j2534_sniff_loop, dll)
+            dll = self._dll_var.get().strip()
+            if not dll:
+                # Try to get from interface panel
+                if (self.mw.interface and self.mw.interface.upper() == "J2534"
+                        and self.mw.iface_path):
+                    dll = self.mw.iface_path
+                    self._dll_var.set(dll)
+                else:
+                    messagebox.showwarning("No DLL",
+                        "Enter the J2534 DLL path or select an interface on the Connect tab.")
                     return
-            except Exception:
-                pass
-            messagebox.showwarning(
-                "No interface",
-                "Select a J2534 interface in the Connect tab first,\n"
-                "or connect an ESP32 bridge.\n\n"
-                "The sniffer opens its own CAN channel — no ECU\n"
-                "connection is needed, just the interface selection.")
+            self._sniffing = True
+            self._frame_count = 0
+            self._msg_count = 0
+            self._raw_frames.clear()
+            self._uds_messages.clear()
+            self._sniff_btn.config(text="stop sniff",
+                                   fg=C["text"], bg=C["btn"])
+            self._status_lbl.config(text="opening CAN channel...", fg=C["amber"])
+            self._run(self._sniff_loop)
 
-    def _stop_sniff(self):
-        self._sniffing = False
-        self._sniff_btn.config(text="▶  start sniff",
-                               fg="#0d1117", bg=C["blue"])
-        self._pause_btn.config(state="disabled", text="pause")
-        self._paused = False
-        self._status_lbl.config(text="stopped", fg=C["dim"])
-
-    def _toggle_pause(self):
-        if self._paused:
-            self._paused = False
-            self._pause_btn.config(text="pause")
-            self._status_lbl.config(text="listening...", fg=C["green"])
-        else:
-            self._paused = True
-            self._pause_btn.config(text="resume")
-            self._status_lbl.config(text="paused", fg=C["amber"])
-
-    # ── J2534 CAN sniff loop ─────────────────────────────────────────────────
-
-    def _j2534_sniff_loop(self, dll_path: str):
+    def _sniff_loop(self):
         """
-        Main sniff loop for J2534 raw CAN mode.
-        Opens its own device/channel — completely independent of any
-        ECU connection. Safe to run while VCDS is on the other splitter port.
+        Open raw CAN channel via J2534 and read all bus traffic.
+        Reassembles ISO-TP and decodes UDS services in real time.
         """
+        dll_path = self._dll_var.get().strip()
+
         try:
-            from lib.connections.j2534_sniffer import J2534CanSniffer
-        except ImportError as e:
-            self._ui(self._status_lbl.config,
-                     text=f"import error: {e}", fg=C["red"])
-            self._ui(self._stop_sniff)
+            from lib.connections.can_sniffer import (
+                J2534CANSniffer, ISOTPReassembler, CANFrame,
+            )
+        except ImportError:
+            self._ui(self._append_log, self._hex_log,
+                     "ERROR: lib/connections/can_sniffer.py not found\n", "nrc")
+            self._ui(self._sniff_btn.config, text="start sniff",
+                     fg="#0d1117", bg=C["blue"])
+            self._sniffing = False
             return
 
         sniffer = None
         try:
-            sniffer = J2534CanSniffer(dll_path)
+            sniffer = J2534CANSniffer(dll_path)
             sniffer.open()
             self._sniffer = sniffer
             self._ui(self._status_lbl.config,
-                     text="listening...", fg=C["green"])
+                     text="listening on CAN bus...", fg=C["green"])
+            self._ui(self._append_log, self._hex_log,
+                     "── CAN sniffer active — listening for traffic ──\n", "hdr")
 
-            filt_ids = self._parse_filter()
-            batch = []      # accumulate frames, flush to UI periodically
-            last_flush = time.time()
+            reassembler = ISOTPReassembler(timeout_ms=3000)
+            filt = self._parse_filter()
+            t0 = None
+            view_mode = self._view_mode.get()
 
             while self._sniffing:
-                if self._paused:
-                    time.sleep(0.05)
-                    continue
-
                 frame = sniffer.read_frame(timeout_ms=50)
                 if frame is None:
-                    # Flush any accumulated batch on idle
-                    if batch:
-                        self._flush_frames(batch)
-                        batch.clear()
-                        last_flush = time.time()
+                    # Check for stale partial transfers
+                    if t0 is not None:
+                        for msg in reassembler.flush_stale(
+                                int(time.time() * 1_000_000)):
+                            self._uds_messages.append(msg)
+                            self._msg_count += 1
+                            if view_mode == "uds":
+                                self._ui(self._show_uds_msg, msg, t0)
                     continue
 
-                # Re-check filter (user may change it live)
-                if filt_ids is None:
-                    filt_ids = self._parse_filter()
-                if filt_ids and frame.can_id not in filt_ids:
-                    # Also check on filter var change
-                    filt_ids = self._parse_filter()
-                    if filt_ids and frame.can_id not in filt_ids:
-                        continue
+                # First frame sets time reference
+                if t0 is None:
+                    t0 = frame.timestamp_us
 
-                batch.append(frame)
+                # Apply CAN ID filter
+                if filt is not None and frame.can_id not in filt:
+                    continue
+
+                self._raw_frames.append(frame)
                 self._frame_count += 1
 
-                # Flush batch every 50ms or 20 frames
-                now = time.time()
-                if len(batch) >= 20 or (now - last_flush) > 0.05:
-                    self._flush_frames(batch)
-                    batch.clear()
-                    last_flush = now
-                    # Refresh filter in case user changed it
-                    filt_ids = self._parse_filter()
+                # Show raw frame if in raw mode
+                cur_view = self._view_mode.get()
+                if cur_view != view_mode:
+                    view_mode = cur_view  # user toggled mid-capture
+
+                if view_mode == "raw":
+                    self._ui(self._show_raw_frame, frame, t0)
+
+                # Feed to ISO-TP reassembler
+                msg = reassembler.feed(frame)
+                if msg is not None:
+                    self._uds_messages.append(msg)
+                    self._msg_count += 1
+                    if view_mode == "uds":
+                        self._ui(self._show_uds_msg, msg, t0)
+
+                # Update counter every 10 frames
+                if self._frame_count % 10 == 0:
+                    self._ui(self._count_lbl.config,
+                             text=f"frames: {self._frame_count}"
+                                  f"  |  messages: {self._msg_count}")
 
         except Exception as e:
             self._ui(self._append_log, self._hex_log,
-                     f"\n[ERROR] {e}\n", "err")
-            self._ui(self._status_lbl.config,
-                     text=f"error: {str(e)[:40]}", fg=C["red"])
+                     f"sniffer error: {e}\n", "nrc")
         finally:
-            if sniffer is not None:
+            if sniffer:
                 try:
                     sniffer.close()
                 except Exception:
                     pass
             self._sniffer = None
-            self._ui(self._stop_sniff)
+            self._sniffing = False
+            self._ui(self._sniff_btn.config, text="start sniff",
+                     fg="#0d1117", bg=C["blue"])
+            self._ui(self._status_lbl.config, text="stopped", fg=C["dim"])
+            self._ui(self._count_lbl.config,
+                     text=f"frames: {self._frame_count}"
+                          f"  |  messages: {self._msg_count}")
 
-    def _flush_frames(self, frames):
-        """Format and append a batch of CAN frames to the log widget."""
-        show_uds = self._uds_var.get()
-        lines = []
-        for frame in frames:
-            ts = time.strftime("%H:%M:%S.") + f"{int(time.time()*1000)%1000:03d}"
-            hex_data = " ".join(f"{b:02X}" for b in frame.data)
+    def _show_raw_frame(self, frame, t0):
+        """Display a single raw CAN frame in the log."""
+        rel_ms = (frame.timestamp_us - t0) / 1000.0
+        tag = "tx" if frame.direction == "TX" else "rx"
+        lbl = f"  {frame.label}" if frame.label else ""
+        hex_data = " ".join(f"{b:02X}" for b in frame.data)
 
-            # Direction label
-            direction = frame.direction or "??"
+        # Annotate ISO-TP PCI type
+        pci = ""
+        if frame.data:
+            pci_type = (frame.data[0] >> 4) & 0x0F
+            pci = {0: "SF", 1: "FF", 2: "CF", 3: "FC"}.get(pci_type, "")
+            if pci:
+                pci = f" [{pci}]"
 
-            # UDS decode
-            uds_str = ""
-            if show_uds and frame.uds_label:
-                uds_str = frame.uds_label
+        line = f"{rel_ms:10.1f}  {frame.direction}  [{frame.can_id:03X}]{lbl}  {hex_data}{pci}\n"
+        self._append_log(self._hex_log, line, tag)
 
-            # Format: fixed-width columns
-            id_str = f"{frame.can_id:03X}" if frame.can_id <= 0x7FF else f"{frame.can_id:08X}"
-            line = f"{ts}  {direction:<3} [{id_str}]  {hex_data:<29}{uds_str}\n"
+    def _show_uds_msg(self, msg, t0):
+        """Display a reassembled UDS message in the log."""
+        rel_ms = (msg.timestamp_us - t0) / 1000.0
+        tag = "tx" if msg.direction == "TX" else "rx"
+        lbl = f"  {msg.label}" if msg.label else ""
+        uds = msg.decode_uds()
 
-            # Pick tag based on content
-            if frame.uds_label and frame.uds_label.startswith("FC"):
-                tag = "fc"
-            elif direction == "TX":
-                tag = "tx"
-            else:
-                tag = "rx"
+        # Color negative responses red
+        if uds.startswith("NegativeResponse"):
+            tag = "nrc"
 
-            lines.append((line, tag))
+        hex_short = " ".join(f"{b:02X}" for b in msg.payload[:20])
+        if len(msg.payload) > 20:
+            hex_short += f"... ({len(msg.payload)}B total)"
 
-        def _do_insert():
-            for line, tag in lines:
-                self._hex_log.insert("end", line, tag)
-            if self._autoscroll_var.get():
-                self._hex_log.see("end")
-            self._count_lbl.config(text=f"frames: {self._frame_count}")
+        frames_note = f"  [{msg.frame_count}F]" if msg.frame_count > 1 else ""
+        line = (f"{rel_ms:10.1f}  {msg.direction}  [{msg.can_id:03X}]{lbl}"
+                f"{frames_note}  {uds}\n"
+                f"{'':>14}{hex_short}\n")
+        self._append_log(self._hex_log, line, tag)
 
-        self._ui(_do_insert)
-
-    # ── ESP32 bridge sniff loop ──────────────────────────────────────────────
-
-    def _bridge_sniff_loop(self):
-        """
-        Sniff via ESP32 BLE/USB bridge raw mode.
-        The bridge firmware supports a 0xCAFE header frame that puts it into
-        promiscuous CAN mode. Each captured frame is forwarded as a BLE
-        notification or USB serial packet.
-        """
-        bridge = getattr(self.mw, "ble_bridge", None)
-        if bridge is None:
-            self._ui(self._append_log, self._hex_log,
-                     "\n[ERROR] No BLE/USB bridge connected\n", "err")
-            self._ui(self._stop_sniff)
+    def _refresh_view(self):
+        """Re-render the log when user toggles between raw/UDS view."""
+        if self._sniffing:
+            return  # live mode handles view switch in the loop
+        self._clear_log(self._hex_log)
+        if not self._raw_frames:
             return
+        t0 = self._raw_frames[0].timestamp_us
 
-        self._ui(self._status_lbl.config,
-                 text="ESP32 raw sniff — waiting for frames...", fg=C["amber"])
+        if self._view_mode.get() == "raw":
+            for frame in self._raw_frames:
+                self._show_raw_frame(frame, t0)
+        else:
+            for msg in self._uds_messages:
+                self._show_uds_msg(msg, t0)
 
-        # TODO: wire to bridge.start_raw_sniff() when firmware supports it
-        # For now, fall back to mock
-        self._ui(self._append_log, self._hex_log,
-                 "\n  ESP32 raw sniff mode not yet implemented in firmware.\n"
-                 "  Use J2534 (Mongoose) with OBD splitter for now.\n\n", "err")
-        self._ui(self._stop_sniff)
-
-    # ── Mock sniff loop (for UI testing) ─────────────────────────────────────
-
-    def _mock_sniff_loop(self):
-        """Simulated CAN traffic for UI development and testing."""
-        import random
-
-        # Simulate a realistic VCDS diagnostic session
-        scenarios = [
-            # VCDS opens extended session on J533
-            (0x710, bytes([0x02, 0x10, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00])),
-            (0x77A, bytes([0x06, 0x50, 0x03, 0x00, 0x19, 0x01, 0xF4, 0x00])),
-            # VCDS reads VIN from J533
-            (0x710, bytes([0x03, 0x22, 0xF1, 0x90, 0x00, 0x00, 0x00, 0x00])),
-            (0x77A, bytes([0x10, 0x14, 0x62, 0xF1, 0x90, 0x57, 0x41, 0x55])),
-            (0x710, bytes([0x30, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00])),
-            (0x77A, bytes([0x21, 0x5A, 0x5A, 0x5A, 0x30, 0x30, 0x30, 0x30])),
-            (0x77A, bytes([0x22, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30])),
-            # VCDS reads IKA key from J255
-            (0x746, bytes([0x02, 0x10, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00])),
-            (0x7B0, bytes([0x06, 0x50, 0x03, 0x00, 0x19, 0x01, 0xF4, 0x00])),
-            (0x746, bytes([0x03, 0x22, 0x00, 0xBE, 0x00, 0x00, 0x00, 0x00])),
-            (0x7B0, bytes([0x10, 0x25, 0x62, 0x00, 0xBE, 0x00, 0x00, 0x00])),
-            (0x746, bytes([0x30, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00])),
-            # Tester present keepalive
-            (0x710, bytes([0x02, 0x3E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])),
-            (0x77A, bytes([0x02, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])),
-        ]
-
-        filt_ids = self._parse_filter()
-        self._ui(self._status_lbl.config,
-                 text="mock traffic (simulated VCDS session)", fg=C["amber"])
-        idx = 0
-
-        while self._sniffing:
-            if self._paused:
-                time.sleep(0.05)
-                continue
-
-            can_id, data = scenarios[idx % len(scenarios)]
-            idx += 1
-
-            if filt_ids and can_id not in filt_ids:
-                time.sleep(0.01)
-                continue
-
-            # Import here to avoid issues if sniffer module not available
-            try:
-                from lib.connections.j2534_sniffer import CANFrame, _uds_label, KNOWN_TESTER_IDS
-            except ImportError:
-                # Fallback — inline the essentials
-                class CANFrame:
-                    def __init__(self, **kw):
-                        for k, v in kw.items():
-                            setattr(self, k, v)
-                KNOWN_TESTER_IDS = {0x710, 0x746, 0x7E0, 0x7DF}
-                def _uds_label(d): return ""
-
-            direction = "TX" if can_id in KNOWN_TESTER_IDS else "RX"
-            frame = CANFrame(
-                timestamp_us=int(time.time() * 1_000_000),
-                can_id=can_id,
-                is_extended=False,
-                data=data,
-                is_tx_echo=False,
-                direction=direction,
-                uds_label=_uds_label(data),
-            )
-
-            self._frame_count += 1
-            self._flush_frames([frame])
-
-            # Vary timing to simulate realistic bus
-            delay = random.uniform(0.02, 0.15)
-            if data[1] == 0x3E:   # tester present — longer gap
-                delay = random.uniform(0.5, 1.5)
-            time.sleep(delay)
-
-    # ── Save ─────────────────────────────────────────────────────────────────
+    def _clear_all(self):
+        self._clear_log(self._hex_log)
+        self._raw_frames.clear()
+        self._uds_messages.clear()
+        self._frame_count = 0
+        self._msg_count = 0
+        self._count_lbl.config(text="frames: 0  |  messages: 0")
 
     def _save_log(self):
         content = self._hex_log.get("1.0", "end")
         if not content.strip():
             messagebox.showinfo("Empty", "Nothing to save.")
             return
-        ts = time.strftime("%Y%m%d_%H%M%S")
         path = filedialog.asksaveasfilename(
-            title="Save CAN sniff log",
-            initialfile=f"can_sniff_{ts}.txt",
+            title="Save sniff log",
             defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"),
-                       ("CSV files", "*.csv"),
-                       ("All files", "*.*")],
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
         )
         if path:
             with open(path, "w") as f:
                 f.write(content)
             messagebox.showinfo("Saved", os.path.basename(path))
 
-            messagebox.showinfo("Saved", os.path.basename(path))
+    def _save_pcap(self):
+        """Save raw frames as a minimal PCAP file for Wireshark analysis."""
+        if not self._raw_frames:
+            messagebox.showinfo("Empty", "No frames captured.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save PCAP",
+            defaultextension=".pcap",
+            filetypes=[("PCAP files", "*.pcap"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            import struct as _s
+            with open(path, "wb") as f:
+                # PCAP global header (link type 227 = SocketCAN)
+                f.write(_s.pack("<IHHiIII",
+                    0xA1B2C3D4, 2, 4, 0, 0, 128, 227))
+                t0 = self._raw_frames[0].timestamp_us
+                for frame in self._raw_frames:
+                    ts_sec = (frame.timestamp_us - t0) // 1_000_000
+                    ts_usec = (frame.timestamp_us - t0) % 1_000_000
+                    # SocketCAN frame: 4-byte ID (big-endian) + 1-byte DLC + 3 pad + 8 data
+                    can_id_be = frame.can_id
+                    if frame.is_extended:
+                        can_id_be |= 0x80000000
+                    dlc = len(frame.data)
+                    can_frame = _s.pack(">I", can_id_be) + bytes([dlc, 0, 0, 0])
+                    can_frame += frame.data.ljust(8, b"\x00")
+                    f.write(_s.pack("<IIII", ts_sec, ts_usec, len(can_frame), len(can_frame)))
+                    f.write(can_frame)
+            messagebox.showinfo("Saved", f"{os.path.basename(path)}\n"
+                                f"{len(self._raw_frames)} frames")
+        except Exception as e:
+            messagebox.showerror("Save error", str(e))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
