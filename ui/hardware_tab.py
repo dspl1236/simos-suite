@@ -71,6 +71,7 @@ class HardwareTab(ttk.Frame):
         self.selected:  Optional[InterfaceInfo] = None
         self.connected: Optional[InterfaceInfo] = None
         self._manual_open = False
+        self._stmin_us   = None  # set in _build_ui; tk.IntVar for STMIN_TX
 
         self.configure(style="BG0.TFrame")
         self._build_styles()
@@ -99,6 +100,7 @@ class HardwareTab(ttk.Frame):
     # ── Layout ──────────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        self._stmin_us = tk.IntVar(value=350_000)
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
@@ -446,6 +448,32 @@ class HardwareTab(ttk.Frame):
             tk.Label(card, text=value, bg=PAL["bg2"], fg=fg,
                      font=("Courier New", 9), wraplength=140, anchor="w").pack(anchor="w", pady=(4,0))
 
+        # ── STMIN_TX control — J2534 only ─────────────────────────────────
+        if iface.interface == "J2534":
+            stmin_row = tk.Frame(self.detail_frame, bg=PAL["bg0"])
+            stmin_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(10, 2))
+            tk.Label(stmin_row, text="STMIN_TX (µs)", bg=PAL["bg0"],
+                     fg=PAL["text_dim"], font=("Courier New", 8, "bold")).pack(side="left")
+            tk.Label(stmin_row,
+                     text="  inter-frame gap for flash. 350000=default  900000=DSG/slow",
+                     bg=PAL["bg0"], fg="#555", font=("Courier New", 7)).pack(side="left")
+
+            ctrl_row = tk.Frame(self.detail_frame, bg=PAL["bg0"])
+            ctrl_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
+            tk.Spinbox(
+                ctrl_row, from_=0, to=900_000, increment=50_000,
+                textvariable=self._stmin_us,
+                width=10, bg=PAL["bg2"], fg=PAL["text"],
+                font=("Courier New", 10),
+                insertbackground=PAL["text"], relief="flat", bd=0,
+            ).pack(side="left", padx=(0, 10))
+            for lbl, val in [("0", 0), ("350k", 350_000), ("500k", 500_000), ("900k", 900_000)]:
+                tk.Button(
+                    ctrl_row, text=lbl, bg=PAL["bg3"], fg=PAL["text_sec"],
+                    font=("Courier New", 8), relief="flat", bd=0, padx=6, pady=2,
+                    command=lambda v=val: self._stmin_us.set(v),
+                ).pack(side="left", padx=(0, 4))
+
     # ── Scan ────────────────────────────────────────────────────────────────
 
     def _run_scan(self):
@@ -514,6 +542,8 @@ class HardwareTab(ttk.Frame):
                 elif t == "J2534":
                     self._bridge = None
                     self._bridge_type = "J2534"
+                    # Capture stmin value so flash/probe callers can read self.stmin_us
+                    self._stmin_val = self._stmin_us.get()
 
                 self.after(0, lambda: self._connect_ok(iface))
             except Exception as exc:
