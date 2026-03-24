@@ -681,3 +681,13 @@ code,pcode,name,symbol
 31561,P001200,Camshaft Position A Timing Over-Retarded (Bank 2),SV_ERR_SYM_VCT_RTD_B2.V6
 31562,P001500,Camshaft Position B Timing Over-Advanced Bank 2,SV_ERR_SYM_VCTB_ADV_B2.V6
 31563,P001600,Camshaft Position B Timing Over-Retarded Bank 2,SV_ERR_SYM_VCTB_RTD_B2.V6
+31564,P219D00,Fuel/Air Mixture Cylinder 1 Unbalanced,SV_ERR_SYM_MIX_UNBAL_0.TFSI30
+31565,P219D00,Fuel/Air Mixture Cylinder 2 Unbalanced,SV_ERR_SYM_MIX_UNBAL_1.TFSI30
+31566,P219D00,Fuel/Air Mixture Cylinder 3 Unbalanced,SV_ERR_SYM_MIX_UNBAL_2.TFSI30
+31567,P219D00,Fuel/Air Mixture Cylinder 4 Unbalanced,SV_ERR_SYM_MIX_UNBAL_3.TFSI30
+31568,P219D00,Fuel/Air Mixture Cylinder 5 Unbalanced,SV_ERR_SYM_MIX_UNBAL_4.TFSI30
+31569,P219D00,Fuel/Air Mixture Cylinder 6 Unbalanced,SV_ERR_SYM_MIX_UNBAL_5.TFSI30
+31570,P017300,O2 Sensor Circuit No Activity Detected Bank 1 Sensor 1,SV_ERR_SYM_O2_INACT_B1.TFSI30
+31571,P017500,O2 Sensor Circuit No Activity Detected Bank 1 Sensor 2,SV_ERR_SYM_O2_INACT_B1S2.TFSI30
+31572,P044000,Evaporative Emission System Malfunction,SV_ERR_SYM_EVAP_LEAK.TFSI30
+31573,P044100,Evaporative Emission System Incorrect Purge Flow,SV_ERR_SYM_EVAP_FLOW.TFSI30
