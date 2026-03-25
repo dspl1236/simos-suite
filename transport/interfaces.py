@@ -317,11 +317,20 @@ def probe_j2534_dll(dll_path: str, timeout_ms: int = 3000) -> dict:
 
 # ── USB-serial port detection ─────────────────────────────────────────────────
 
-def detect_usb_isotp_ports() -> List[tuple[str, str]]:
+def detect_usb_isotp_ports() -> List[tuple[str, str, bool]]:
     """
     Find serial ports that look like an ESP32 ISO-TP bridge.
-    Returns list of (description, port_path).
-    The ESP32 on the A0/bridge presents as a CP210x or CH340 USB-UART.
+    Returns list of (description, port_path, is_dual_can).
+
+    The dual-CAN bridge (AITRIP ESP32 + MCP2515) uses CP2102 VID 0x10C4
+    PID 0xEA60 — same as the single-CAN bridge. Both are detected here.
+    The firmware advertises dual-CAN capability; Simos-Suite routes
+    Convenience CAN frames by setting flag 0x10 on the BLE command byte.
+
+    Supported USB-UART chips:
+      CP2102 (Silicon Labs 0x10C4) — AITRIP ESP32-WROOM-32 devkit
+      CH340/CH341 (QinHeng 0x1A86) — cheaper ESP32 clones
+      ESP32-S3 native USB CDC (Espressif 0x303A) — future boards
     """
     found = []
     try:
@@ -329,21 +338,23 @@ def detect_usb_isotp_ports() -> List[tuple[str, str]]:
         for port in serial.tools.list_ports.comports():
             desc = (port.description or "").lower()
             vid_pid = f"{port.vid:04X}:{port.pid:04X}" if port.vid else ""
-            # CP2102 (Silicon Labs) — most ESP32 devkits
-            # CH340/CH341 — cheaper clones
-            # FTDI — some custom boards
+            # Match known ESP32 USB-UART bridges
             is_esp32 = (
                 "cp210" in desc
                 or "ch340" in desc
                 or "ch341" in desc
-                or port.vid == 0x10C4   # Silicon Labs
-                or port.vid == 0x1A86   # QinHeng (CH340)
+                or port.vid == 0x10C4   # Silicon Labs (CP2102)
+                or port.vid == 0x1A86   # QinHeng (CH340/CH341)
+                or port.vid == 0x303A   # Espressif (ESP32-S3 native USB)
             )
             if is_esp32:
                 label = f"{port.device}  {port.description or ''}"
                 if vid_pid:
                     label += f"  [{vid_pid}]"
-                found.append((label.strip(), port.device))
+                # CP2102 with PID 0xEA60 is the AITRIP dual-CAN board
+                # (also the single-CAN bridge — firmware determines capability)
+                is_dual = (port.vid == 0x10C4 and port.pid == 0xEA60)
+                found.append((label.strip(), port.device, is_dual))
     except ImportError:
         pass  # pyserial not installed
     except Exception:
@@ -399,19 +410,34 @@ class InterfaceRegistry:
             interface = "BLE",
             path      = "",
             available = ble_available,
-            notes     = "Wireless. Requires bleak. Scan for device first.",
+            bus_type  = "BOTH",   # Dual-CAN firmware: flag 0x10 routes to MCP2515
+            notes     = ("Wireless. Requires bleak. Scan for device first.\n"
+                         "Dual-CAN: commands with flag 0x10 route to "
+                         "Convenience CAN (MCP2515 100k)."),
         ))
 
         # USB ISO-TP (ESP32 over USB serial)
         usb_ports = detect_usb_isotp_ports()
         if usb_ports:
-            for label, port in usb_ports:
+            for label, port, is_dual in usb_ports:
+                if is_dual:
+                    display = f"ESP32 Dual-CAN Bridge ({port})"
+                    bus = "BOTH"
+                    notes = (f"{label}\n"
+                             "Dual-CAN: Drive Train (TWAI 500k) + "
+                             "Convenience (MCP2515 100k)")
+                else:
+                    display = f"ESP32 USB Bridge ({port})"
+                    bus = "DRIVE"
+                    notes = label
                 self._interfaces.append(InterfaceInfo(
-                    name      = f"ESP32 USB Bridge ({port})",
-                    interface = "USBISOTP",
-                    path      = port,
-                    available = True,
-                    notes     = label,
+                    name         = display,
+                    interface    = "USBISOTP",
+                    path         = port,
+                    available    = True,
+                    hw_connected = True,   # USB enumerated = cable present
+                    bus_type     = bus,
+                    notes        = notes,
                 ))
         else:
             self._interfaces.append(InterfaceInfo(

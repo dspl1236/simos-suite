@@ -75,6 +75,14 @@ BADGE_COLORS = {
     "USBISOTP": {"bg": "#0c2a1a", "fg": "#56d364"},
     "J2534":    {"bg": "#2a1a0c", "fg": "#e3b341"},
     "SOCKETCAN":{"bg": "#1a0c2a", "fg": "#bc8cff"},
+    "WIFI":     {"bg": "#1a1a0c", "fg": "#b0b040"},
+}
+
+# Bus type labels for the interface list
+BUS_LABELS = {
+    "DRIVE": "DT",       # Drive Train CAN (500k, pins 6+14)
+    "CONV":  "CONV",     # Convenience CAN (100k, pins 3+11)
+    "BOTH":  "DUAL",     # Dual-CAN (both buses)
 }
 
 STATUS_DOT = {
@@ -378,6 +386,15 @@ class InterfacePanel(tk.Frame):
                          fg=badge_colors["fg"], bg=badge_colors["bg"],
                          font=("Menlo", 8, "bold"), padx=6, pady=2)
         badge.pack(side="right", padx=(6, 0))
+
+        # Bus type badge (DUAL / DT / CONV)
+        bus = getattr(iface, 'bus_type', '')
+        if bus and bus in BUS_LABELS:
+            bus_color = "#3fb950" if bus == "BOTH" else "#d29922"
+            bus_badge = tk.Label(row, text=BUS_LABELS[bus],
+                                fg=bus_color, bg="#1a1a1a",
+                                font=("Menlo", 7, "bold"), padx=4, pady=2)
+            bus_badge.pack(side="right", padx=(4, 0))
 
         entry = {"frame": row, "iface": iface}
         self._iface_rows.append(entry)
