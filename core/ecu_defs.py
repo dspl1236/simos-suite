@@ -626,8 +626,11 @@ ZF8HP = TCUDef(
     platform   = Platform.PQ46,
     can_tx     = 0x7E1,
     can_rx     = 0x7E9,
-    # SA2 confirmed from community ZF8HP UDS research
-    sa2_script = bytes.fromhex("6806824A05871A2B3C4D5E6F7A8B494C"),
+    # SA2 CONFIRMED from Flashdaten ODX: FL_0BH300011N and FL_0BH300012B
+    # (both produce identical SA2 bytecode — same script across all ZF 8HP variants)
+    # Previous community script (6806824A05871A2B...) was WRONG (16 bytes, incorrect)
+    sa2_script = bytes.fromhex(
+        "6805824A10680284100819734A05872506200382499318111973824A058712082001824A0181494C"),
     gear_count = 8,
     live_dids  = {k: v for k, v in TCU_LIVE_DIDS.items() if k not in (0x01B0, 0x01B1)},
     notes = (
