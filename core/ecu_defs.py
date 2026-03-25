@@ -168,12 +168,11 @@ J533_LEAR = ECUDef(
     crypto       = CryptoType.NONE,   # Flash ODX uses encrypt-method 0x00
     crypto_key   = None,
     crypto_iv    = None,
-    # CONFIRMED from FL_4H0907468E__0204.odx and FL_4H0907468AC_0037_S.odx
-    # SA2 script CONFIRMED from FL_4G0907551D__0006.frf
-    # Decrypted via VW_Flash recursive-XOR + extracted from Flash ODX
-    # ECU: 4G0907551D  SW: 0006  Engine: CTUA  3.0T TFSI
-    # Test: seed 0xDEADBEEF → key 0x55612515
-    sa2_script   = bytes.fromhex("6805824A10680493300419624A05871510197082499324041966824A058702031970824A0181494C"),
+    # SA2 CONFIRMED from Flashdaten: FL_4H0907468E__0204.frf, FL_4H0907468AC_0037_S.frf
+    # and 5 more J533 FRF files — all 7 produce identical 12-byte SA2.
+    # CRITICAL FIX: Previously had the Simos8.5 40-byte SA2 here by mistake.
+    # The J533 Lear gateway uses a DIFFERENT, shorter SA2 script.
+    sa2_script   = bytes.fromhex("6805814A05870A22128A494C"),
     blocks = {
         1: BlockDef(1, "FIRMWARE", 0x00000000, 0x76000,  0x000000, 0x300, "FD_1"),
         3: BlockDef(3, "CONFIG",   0x00000000, 0x000800, 0x000000, 0x000, "FD_3"),
@@ -234,7 +233,8 @@ J255_4ZONE = ECUDef(
     },
     binfile_size = 741376,
     compatible_hw = ["4G0820043", "4G0820043A", "4G0820043E", "4G0820043F",
-                     "4G0820043G", "4G0820043H", "4G0820043M", "4G0820043N"],
+                     "4G0820043G", "4G0820043H", "4G0820043M", "4G0820043N",
+                     "4G0820043R"],  # R variant: larger firmware (0xF5000), same SA2
     info_dids = STD_INFO_DIDS,
     notes = (
         "SA2 confirmed. This is the donor 4-zone unit that was installed "
