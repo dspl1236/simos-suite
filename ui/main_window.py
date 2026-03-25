@@ -1250,15 +1250,80 @@ class CPToolsTab(_Tab):
                  font=("Courier New", 8), wraplength=560,
                  justify="left").pack(anchor="w", pady=(4, 0))
 
+        # ── Constellation Map ─────────────────────────────────────────────────
+        _section(self, "constellation map")
+        const_map_card = _card(self, padx=10, pady=6)
+        const_map_card.pack(fill="x", padx=14, pady=(2, 2))
+
+        const_map_hdr = _frame(const_map_card, bg=C["surface"])
+        const_map_hdr.pack(fill="x", pady=(0, 4))
+        for col, width, text in [
+            (0, 4,  "SLOT"),
+            (1, 28, "MODULE"),
+            (2, 7,  "CODED"),
+            (3, 7,  "ONLINE"),
+            (4, 8,  "CAN ID"),
+            (5, 8,  "IKA"),
+        ]:
+            tk.Label(const_map_hdr, text=text, bg=C["surface"], fg=C["muted"],
+                     font=("Courier New", 8), width=width,
+                     anchor="w").grid(row=0, column=col, sticky="w", padx=2)
+
+        self._const_map_frame = _frame(const_map_card, bg=C["surface"])
+        self._const_map_frame.pack(fill="x")
+        self._const_map_rows: list = []
+
+        const_map_note = tk.Label(const_map_card,
+                     text="Run scan to populate. Shows J533 constellation bitmap "
+                          "vs actual bus presence.",
+                     bg=C["surface"], fg=C["dim"],
+                     font=("Courier New", 8))
+        const_map_note.pack(anchor="w", pady=(4, 0))
+
+        # ── Constellation Fix Actions ────────────────────────────────────────
+        fix_card = _card(self, padx=10, pady=6)
+        fix_card.pack(fill="x", padx=14, pady=(2, 2))
+
+        fix_row = _frame(fix_card, bg=C["surface"])
+        fix_row.pack(fill="x")
+
+        self._deep_diag_btn = _btn(fix_row, "⊙  Deep Diagnostic",
+                                    self._do_deep_diagnostic, state="disabled")
+        self._deep_diag_btn.pack(side="left")
+        tip(self._deep_diag_btn,
+            'Read ALL constellation DIDs from J533:\n'
+            '0x04A3 (coded), 0x2A2A (allocation), 0x2A26 (present),\n'
+            '0x2A2C (CAN IDs). Decodes full slot map.\n'
+            'Then reads IKA key from each UDS module.\n'
+            'Produces a complete CP state snapshot.')
+
+        self._fix_const_btn = _btn(fix_row,
+            "⚡  Fix Constellation (match bus to bitmap)",
+            self._do_fix_constellation, state="disabled")
+        self._fix_const_btn.pack(side="left", padx=(8, 0))
+        tip(self._fix_const_btn,
+            'Reads which modules are ONLINE on the bus,\n'
+            'rebuilds the constellation bitmap to match,\n'
+            'and writes it to J533 DID 0x04A3.\n'
+            'This re-enrolls your actual hardware.')
+
+        tk.Label(fix_card,
+                 text="Deep Diagnostic reads everything first. "
+                      "Fix Constellation writes a rebuilt bitmap that "
+                      "matches the modules actually on the bus.",
+                 bg=C["surface"], fg=C["dim"],
+                 font=("Courier New", 8), wraplength=560,
+                 justify="left").pack(anchor="w", pady=(4, 0))
+
         # ── Log ───────────────────────────────────────────────────────────────
         _section(self, "log")
         self._log = _log_widget(self)
         self._log.pack(fill="both", expand=True, padx=14, pady=(0, 8))
 
-        # ── Legacy buttons (keep for compat) ──────────────────────────────────
+        # ── Probe / Save / ODX ────────────────────────────────────────────────
         leg = _frame(self)
         leg.pack(fill="x", padx=14, pady=(0, 8))
-        self._probe_btn = _btn(leg, "⊙  J533 probe",
+        self._probe_btn = _btn(leg, "⊙  J533 probe (full report)",
                                self._do_probe, state="disabled")
         self._probe_btn.pack(side="left")
         self._save_btn  = _btn(leg, "↓  save report",
@@ -1326,6 +1391,7 @@ class CPToolsTab(_Tab):
         self._scan_btn.config(state="normal")
         self._probe_btn.config(state="normal")
         self._restore_const_btn.config(state="normal")
+        self._deep_diag_btn.config(state="normal")
         self._status_var.set("ready — click Scan to check all modules")
         self._status_lbl_color(C["green"])
 
@@ -1335,6 +1401,8 @@ class CPToolsTab(_Tab):
         self._const_btn.config(state="disabled")
         self._sel_all_btn.config(state="disabled")
         self._restore_const_btn.config(state="disabled")
+        self._deep_diag_btn.config(state="disabled")
+        self._fix_const_btn.config(state="disabled")
         self._status_var.set("connect to vehicle first")
         self._status_lbl_color(C["muted"])
         self._reset_module_rows()
@@ -1948,6 +2016,405 @@ class CPToolsTab(_Tab):
             log(f"  Restore error: {e}\n", "err")
 
         self._ui(self._restore_const_btn.config, state="normal")
+
+    # ── Deep Diagnostic ─────────────────────────────────────────────────────
+
+    def _do_deep_diagnostic(self):
+        self._deep_diag_btn.config(state="disabled")
+        self._fix_const_btn.config(state="disabled")
+        self._clear_log(self._log)
+        self._append_log(self._log,
+            "── Deep CP Diagnostic ────────────────────────────────────\n",
+            "hdr")
+        self._status_var.set("running deep diagnostic...")
+        self._run(self._deep_diagnostic_task)
+
+    def _deep_diagnostic_task(self):
+        """
+        Read ALL constellation DIDs from J533, decode the full slot map,
+        then read IKA key from each accessible module. Produces a complete
+        picture of what J533 expects vs what's actually on the bus.
+        """
+        import udsoncan
+        from udsoncan.client import Client
+        from udsoncan import configs
+
+        def log(msg, tag=""):
+            self._ui(self._append_log, self._log, msg, tag)
+
+        class _BytesCodec(udsoncan.DidCodec):
+            def encode(self, v): return bytes(v)
+            def decode(self, p): return p
+            def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
+
+        DIAG_DIDS = {
+            CONST_DID: "Constellation (coded bitmap)",
+            0x2A2A: "Allocation table (slot→module)",
+            0x2A26: "Present bitmap (online/offline)",
+            0x2A2C: "TP-Identifier (CAN IDs per slot)",
+            0x00BE: "IKA Key (J533)",
+            0x0438: "Stored theft protection keys",
+            0x043D: "Successful key downloads",
+            0x043E: "Showroom mode",
+        }
+
+        raw_data = {}  # DID → bytes
+
+        # ── Read all DIDs from J533 ──────────────────────────────────────────
+        log("  Reading J533 constellation DIDs...\n", "dim")
+        try:
+            from cp_tools.j533_probe import J533Probe
+            probe = J533Probe(
+                interface      = self.mw.interface,
+                interface_path = self.mw.iface_path,
+                ble_bridge     = getattr(self.mw, "ble_bridge", None),
+            )
+            cfg = dict(configs.default_client_config)
+            for did in DIAG_DIDS:
+                cfg["data_identifiers"] = {did: _BytesCodec}
+            cfg["request_timeout"] = 8
+            cfg["use_server_timing"] = False
+            conn = probe._make_conn(0x710, 0x77A)
+
+            with Client(conn, request_timeout=8, config=cfg) as c:
+                c.change_session(
+                    udsoncan.services.DiagnosticSessionControl
+                    .Session.extendedDiagnosticSession)
+
+                for did, label in DIAG_DIDS.items():
+                    try:
+                        r = c.read_data_by_identifier([did])
+                        val = bytes(r.service_data.values[did])
+                        raw_data[did] = val
+                        short = val.hex().upper()
+                        if len(short) > 40:
+                            short = short[:40] + "..."
+                        log(f"    0x{did:04X}  {label}\n"
+                            f"           {short}\n", "ok")
+                    except udsoncan.exceptions.NegativeResponseException as e:
+                        nrc = getattr(getattr(e, "response", None), "code", 0)
+                        log(f"    0x{did:04X}  {label}  NRC 0x{nrc:02X}\n", "warn")
+                    except Exception as e:
+                        log(f"    0x{did:04X}  {label}  error: {str(e)[:50]}\n", "warn")
+
+                # Return to default session
+                try:
+                    c.change_session(
+                        udsoncan.services.DiagnosticSessionControl
+                        .Session.defaultSession)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            log(f"  J533 connection error: {e}\n", "err")
+            self._ui(self._deep_diag_btn.config, state="normal")
+            return
+
+        # ── Decode constellation ─────────────────────────────────────────────
+        log("\n── Constellation Decode ───────────────────────────────────\n",
+            "hdr")
+
+        coded_raw   = raw_data.get(CONST_DID)
+        alloc_raw   = raw_data.get(0x2A2A)
+        present_raw = raw_data.get(0x2A26)
+        tp_id_raw   = raw_data.get(0x2A2C)
+
+        if not coded_raw:
+            log("  Cannot decode — DID 0x04A3 not read\n", "err")
+            self._ui(self._deep_diag_btn.config, state="normal")
+            return
+
+        from cp_tools.j533_probe import J533Probe as _P
+        constellation = _P.decode_constellation(
+            coded_raw, alloc_raw, present_raw, tp_id_raw)
+
+        # Store for Fix Constellation to use
+        self._diag_constellation = constellation
+        self._diag_raw = raw_data
+
+        log(f"  {'Slot':>4}  {'Module':<28}  {'Coded':>6}  "
+            f"{'Online':>6}  {'CAN ID':>8}  Status\n", "dim")
+        log(f"  {'─'*4}  {'─'*28}  {'─'*6}  {'─'*6}  {'─'*8}  {'─'*12}\n", "dim")
+
+        mismatch_count = 0
+        for entry in constellation:
+            slot  = entry["slot"]
+            name  = entry["ecu_name_label"][:27]
+            coded = "YES" if entry["coded"] else "-"
+            pres  = "YES" if entry["present"] else "-"
+            can   = f"0x{entry['can_id']:04X}" if entry.get("can_id") else "-"
+
+            # Identify mismatches
+            is_coded  = entry["coded"]
+            is_online = entry["present"]
+            if is_coded and not is_online:
+                status = "ENROLLED BUT OFFLINE"
+                tag = "err"
+                mismatch_count += 1
+            elif not is_coded and is_online:
+                status = "ONLINE BUT NOT ENROLLED"
+                tag = "warn"
+                mismatch_count += 1
+            elif is_coded and is_online:
+                status = "OK"
+                tag = "ok"
+            else:
+                status = ""
+                tag = "dim"
+
+            flag = ""
+            if entry.get("ecu_name") == 8:
+                flag = " ◄ J255"
+            elif entry.get("ecu_name") == 54:
+                flag = " ◄ J136"
+
+            log(f"  {slot:>4}  {name:<28}  {coded:>6}  {pres:>6}  "
+                f"{can:>8}  {status}{flag}\n", tag)
+
+        # Update the constellation map display
+        self._ui(self._update_const_map, constellation)
+
+        log(f"\n  Mismatches: {mismatch_count}\n",
+            "ok" if mismatch_count == 0 else "err")
+
+        # ── IKA key analysis ─────────────────────────────────────────────────
+        ika_j533 = raw_data.get(0x00BE)
+        if ika_j533:
+            all_zero = all(b == 0 for b in ika_j533)
+            log(f"\n  J533 IKA key: {'ALL ZEROS — no key installed' if all_zero else ika_j533.hex().upper()[:32] + '...'}\n",
+                "err" if all_zero else "ok")
+
+        key_dl = raw_data.get(0x043D)
+        if key_dl:
+            log(f"  Key downloads: {int.from_bytes(key_dl, 'big')}\n", "dim")
+
+        showroom = raw_data.get(0x043E)
+        if showroom:
+            mode = "ACTIVE" if any(b != 0 for b in showroom) else "not active"
+            log(f"  Showroom mode: {mode}\n", "dim")
+
+        # ── Verdict ──────────────────────────────────────────────────────────
+        if mismatch_count > 0:
+            log(f"\n  ⚠  {mismatch_count} constellation mismatch(es) found.\n"
+                f"  The constellation bitmap does not match the modules on the bus.\n"
+                f"  Click 'Fix Constellation' to rebuild and write a corrected bitmap.\n",
+                "warn")
+            self._ui(self._fix_const_btn.config, state="normal")
+            self._ui(self._verdict_var.set,
+                     f"⚠  {mismatch_count} CONSTELLATION MISMATCH(ES)")
+            self._ui(self._verdict_lbl.config, fg=C["amber"])
+        else:
+            log("\n  ✓  Constellation matches bus state — no enrollment issues.\n"
+                "  If CP is still active, the issue is IKA key mismatch, not enrollment.\n",
+                "ok")
+            self._ui(self._verdict_var.set, "✓  CONSTELLATION OK")
+            self._ui(self._verdict_lbl.config, fg=C["green"])
+
+        # Save report
+        self._diag_report_json = {
+            "raw_dids": {f"0x{k:04X}": v.hex().upper() for k, v in raw_data.items()},
+            "constellation": constellation,
+            "mismatches": mismatch_count,
+        }
+        self._ui(self._save_btn.config, state="normal")
+        self._ui(self._deep_diag_btn.config, state="normal")
+
+    def _update_const_map(self, constellation: list):
+        """Update the constellation map grid in the UI."""
+        # Clear existing rows
+        for w in self._const_map_frame.winfo_children():
+            w.destroy()
+        self._const_map_rows.clear()
+
+        for entry in constellation:
+            if not entry["coded"] and not entry["present"]:
+                continue  # skip empty slots
+
+            row = _frame(self._const_map_frame, bg=C["surface"])
+            row.pack(fill="x", pady=1)
+
+            slot  = entry["slot"]
+            name  = entry["ecu_name_label"][:27]
+            coded = "YES" if entry["coded"] else "-"
+            pres  = "YES" if entry["present"] else "-"
+            can   = f"0x{entry['can_id']:04X}" if entry.get("can_id") else "-"
+
+            # Mismatch coloring
+            is_coded  = entry["coded"]
+            is_online = entry["present"]
+            if is_coded and not is_online:
+                color = C["red"]
+                ika = "MISSING"
+            elif not is_coded and is_online:
+                color = C["amber"]
+                ika = "NOT ENROLLED"
+            elif is_coded and is_online:
+                color = C["green"]
+                ika = "OK"
+            else:
+                color = C["dim"]
+                ika = "-"
+
+            for col, width, text, fg in [
+                (0, 4,  str(slot), C["muted"]),
+                (1, 28, name, color),
+                (2, 7,  coded, color),
+                (3, 7,  pres, color),
+                (4, 8,  can, C["muted"]),
+                (5, 8,  ika, color),
+            ]:
+                tk.Label(row, text=text, bg=C["surface"], fg=fg,
+                         font=("Courier New", 9), width=width,
+                         anchor="w").grid(row=0, column=col, sticky="w", padx=2)
+
+            self._const_map_rows.append(entry)
+
+    # ── Fix Constellation ─────────────────────────────────────────────────
+
+    def _do_fix_constellation(self):
+        """
+        Rebuild constellation bitmap from the PRESENT bitmap (what's actually
+        on the bus) and write it to J533 DID 0x04A3.
+        """
+        if not hasattr(self, '_diag_raw') or not self._diag_raw:
+            self._append_log(self._log,
+                "Run Deep Diagnostic first.\n", "warn")
+            return
+
+        present_raw = self._diag_raw.get(0x2A26)
+        coded_raw   = self._diag_raw.get(CONST_DID)
+
+        if not present_raw or not coded_raw:
+            self._append_log(self._log,
+                "Missing constellation data — run Deep Diagnostic first.\n",
+                "warn")
+            return
+
+        # The fix: set coded bitmap = present bitmap
+        # This enrolls every module that's currently online and unenrolls
+        # any that are offline (e.g., the 4-zone J255 that's no longer installed)
+        new_const = bytearray(len(coded_raw))
+        # Copy present bits into coded, preserving the coded length
+        for i in range(min(len(present_raw), len(new_const))):
+            new_const[i] = present_raw[i]
+
+        import tkinter.messagebox as mb
+        current_hex = " ".join(f"{b:02X}" for b in coded_raw)
+        new_hex     = " ".join(f"{b:02X}" for b in new_const)
+
+        if not mb.askyesno(
+            "Fix Constellation",
+            f"This will rewrite the J533 constellation to match\n"
+            f"the modules currently on the bus.\n\n"
+            f"Current: {current_hex}\n"
+            f"New:     {new_hex}\n\n"
+            f"This enrolls your actual hardware and unenrolls\n"
+            f"any modules that are no longer installed.\n\n"
+            f"Continue?",
+            icon="warning"
+        ):
+            return
+
+        self._fix_const_btn.config(state="disabled")
+        self._append_log(self._log,
+            f"\n── Fix Constellation ──────────────────────────────────────\n"
+            f"  Current: {current_hex}\n"
+            f"  Writing: {new_hex}\n",
+            "hdr")
+        self._run(self._fix_constellation_task, bytes(new_const), coded_raw)
+
+    def _fix_constellation_task(self, new_const: bytes, old_const: bytes):
+        import udsoncan
+        from udsoncan.client import Client
+        from udsoncan import configs
+
+        def log(msg, tag=""):
+            self._ui(self._append_log, self._log, msg, tag)
+
+        class _BytesCodec(udsoncan.DidCodec):
+            def encode(self, v): return bytes(v)
+            def decode(self, p): return p
+            def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
+
+        try:
+            from cp_tools.j533_probe import J533Probe
+            probe = J533Probe(
+                interface      = self.mw.interface,
+                interface_path = self.mw.iface_path,
+                ble_bridge     = getattr(self.mw, "ble_bridge", None),
+            )
+            cfg = dict(configs.default_client_config)
+            cfg["data_identifiers"] = {CONST_DID: _BytesCodec}
+            cfg["request_timeout"]  = 10
+            conn = probe._make_conn(0x710, 0x77A)
+
+            with Client(conn, request_timeout=10, config=cfg) as c:
+                c.change_session(
+                    udsoncan.services.DiagnosticSessionControl
+                    .Session.extendedDiagnosticSession)
+
+                # SA2 unlock on J533 — use confirmed script from ecu_defs
+                try:
+                    from sa2_seed_key.sa2_script import Sa2Script
+                    seed_resp = c.request_seed(0x03)
+                    seed = bytes(seed_resp.service_data.seed)
+                    key = Sa2Script(J533_LEAR.sa2_script).execute(
+                        int.from_bytes(seed, "big"))
+                    c.send_key(0x04, key.to_bytes(4, "big"))
+                    log("  SA2 unlocked on J533 ✓\n", "ok")
+                except ImportError:
+                    log("  SA2 module not installed — "
+                        "pip install sa2_seed_key\n", "warn")
+                except Exception as e:
+                    log(f"  SA2 error: {e}\n", "err")
+                    self._ui(self._fix_const_btn.config, state="normal")
+                    return
+
+                # Write new constellation
+                c.write_data_by_identifier(CONST_DID, new_const)
+                log("  Write accepted ✓\n", "ok")
+
+                # Verify
+                r = c.read_data_by_identifier([CONST_DID])
+                readback = bytes(r.service_data.values[CONST_DID])
+
+                if readback == new_const:
+                    log(f"  Verified ✓  readback matches\n", "ok")
+                    rb_hex = " ".join(f"{b:02X}" for b in readback)
+                    self._ui(self._const_var.set, rb_hex)
+                    log(f"\n  ✓  Constellation fixed — matches current bus hardware.\n"
+                        f"  Cycle ignition (key OFF 12s, key ON 10s) then rescan.\n",
+                        "ok")
+                    self._ui(self._verdict_var.set,
+                             "✓  CONSTELLATION FIXED — CYCLE IGNITION")
+                    self._ui(self._verdict_lbl.config, fg=C["green"])
+                    self._ui(self._ign_btn.config, state="normal")
+                else:
+                    rb_hex = " ".join(f"{b:02X}" for b in readback)
+                    log(f"  Readback differs: {rb_hex}\n", "warn")
+                    log("  J533 may have modified the value. This could mean\n"
+                        "  the gateway validates constellation structure.\n", "warn")
+
+        except udsoncan.exceptions.NegativeResponseException as nre:
+            nrc = getattr(getattr(nre, "response", None), "code", 0)
+            log(f"  J533 rejected write — NRC 0x{nrc:02X}\n", "err")
+            if nrc == 0x22:
+                log("  conditionsNotCorrect — J533 may require GEKO server\n"
+                    "  authorization to accept constellation changes.\n"
+                    "  Next step: try routine 0x0226 before the write.\n", "warn")
+            elif nrc == 0x31:
+                log("  requestOutOfRange — value rejected.\n", "warn")
+            elif nrc == 0x33:
+                log("  securityAccessDenied — SA2 unlock may have failed.\n", "warn")
+            # Log the rollback value for manual recovery
+            old_hex = " ".join(f"{b:02X}" for b in old_const)
+            log(f"\n  Original value preserved: {old_hex}\n"
+                f"  Use 'Restore Known-Good' if needed.\n", "dim")
+        except Exception as e:
+            log(f"  Error: {e}\n", "err")
+
+        self._ui(self._fix_const_btn.config, state="normal")
+        self._ui(self._deep_diag_btn.config, state="normal")
 
     # ── Guided ignition cycle ────────────────────────────────────────────────
 
