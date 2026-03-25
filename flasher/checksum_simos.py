@@ -223,7 +223,7 @@ def validate_ecm3(cal_data: bytes, asw1_data: bytes = None,
     checksum = 0
     for i in range(0, len(addresses), 2):
         start, end = int(addresses[i]), int(addresses[i+1])
-        for j in range(start, end, 4):
+        for j in range(start, end + 1, 4):
             checksum += struct.unpack_from("<I", cal_data, j)[0]
 
     checksum &= 0xFFFFFFFFFFFFFFFF  # keep 64-bit

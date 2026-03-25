@@ -567,7 +567,8 @@ def _flash_one_block(
         except exceptions.NegativeResponseException as e:
             callback(FlashProgress("ERROR", f"TransferExit failed ({label}): {e}", 0, label))
             return False
-    client.tester_present()
+    if not dry_run:
+        client.tester_present()
 
     # ── Checksum routine 0x0202 ────────────────────────────────────────────
     if not dry_run:
@@ -1052,7 +1053,8 @@ def flash_blocks(
                     callback(FlashProgress("ERROR",
                                            f"TransferExit {blk.name} failed: {e}", 0))
                     return False
-            client.tester_present()
+            if not dry_run:
+                client.tester_present()
 
             # Per-block checksum 0x0202
             if not dry_run:

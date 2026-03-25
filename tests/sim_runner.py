@@ -14,7 +14,6 @@ What gets simulated:
     ECU Info tab    — all 18 standard VW DIDs populated with realistic values
     Flash tab       — full flash sequence (connect→erase→transfer→verify→done)
                       runs at 10× speed with real progress callbacks
-    Tune tab        — pre-loads a synthetic CAL binary with known table values
     Logger tab      — live engine DID values that drift/animate over time
     Trans tab       — live TCU values: gear shifts, ATF warm-up, speed sweep
     CP Tools tab    — J533 probe returns realistic constellation data
@@ -296,14 +295,6 @@ def auto_connect_after_launch(mw, delay: float = 1.5):
                         log.info("[SIM] FlashTab: synthetic CAL loaded")
                     except Exception as e:
                         log.warning("[SIM] FlashTab: %s", e)
-
-                # Tune tab — load and display tables
-                elif cls == "TuneTab":
-                    try:
-                        tab.load_bytes(cal, "4G0906259E_CGWB_demo.bin")
-                        log.info("[SIM] TuneTab: tables loaded")
-                    except Exception as e:
-                        log.warning("[SIM] TuneTab: %s", e)
 
                 # CP Tools tab — auto-run scan after short delay
                 elif cls == "CPToolsTab":

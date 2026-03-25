@@ -172,7 +172,7 @@ def _make_synthetic_cal(area_start_off: int = 0x1000,
     for s_abs, e_abs in ecm3_pairs:
         s_off = s_abs - CAL_BASE
         e_off = e_abs - CAL_BASE
-        for j in range(s_off, e_off, 4):
+        for j in range(s_off, e_off + 1, 4):
             ecm3 += struct.unpack_from('<I', cal, j)[0]
     ecm3 &= 0xFFFFFFFFFFFFFFFF
 

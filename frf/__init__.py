@@ -1,4 +1,4 @@
-"""frf -- FRF decryption and ODX extraction utilities."""
-from .frf_loader import load_frf, describe_frf, FRFInfo, validate_block_crc
+"""frf -- FRF decryption and ODX extraction utilities.
 
-__all__ = ["load_frf", "describe_frf", "FRFInfo", "validate_block_crc"]
+High-level FRF loading is handled by flasher.frf_loader.FrfLoader.
+"""
