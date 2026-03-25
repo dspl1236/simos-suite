@@ -417,6 +417,22 @@ class FlashTab(_Tab):
             3: [None, tk.StringVar(value="not loaded")],  # CAL
         }
 
+        # ── Flash disabled banner ─────────────────────────────────────────
+        flash_warn = tk.Frame(self, bg="#3d2800", padx=12, pady=8,
+                              highlightbackground="#d29922",
+                              highlightthickness=1)
+        flash_warn.pack(fill="x", padx=14, pady=(8, 2))
+        tk.Label(flash_warn,
+                 text="FLASH WRITES DISABLED",
+                 fg="#d29922", bg="#3d2800",
+                 font=("Courier New", 11, "bold")).pack(anchor="w")
+        tk.Label(flash_warn,
+                 text="ECU flash writes are disabled until connection validation\n"
+                      "is confirmed on real hardware. Read and verify are safe\n"
+                      "and remain enabled.",
+                 fg="#b08520", bg="#3d2800",
+                 font=("Courier New", 9), justify="left").pack(anchor="w")
+
         _section(self, "CAL block")
 
         # File row
@@ -451,8 +467,7 @@ class FlashTab(_Tab):
                                self._do_write_cal, primary=True,
                                state="disabled")
         self._write_btn.pack(side="left", padx=(0, 8))
-        tip(self._write_btn, 'Write modified calibration back to ECU.\nRequires extended session + SA2 unlock.\nDo not interrupt once started.')
-        tip(self._write_btn, 'SA2 unlock + WriteDataByIdentifier(0x00BE).\nWrites IKA key to checked modules.\nVerifies readback after each write.')
+        tip(self._write_btn, 'DISABLED — Flash writes are disabled until\nconnection validation is confirmed on hardware.\nRead operations are safe and enabled.')
 
         self._verify_btn = _btn(op_row, "verify checksum",
                                 self._do_verify, state="disabled")
@@ -526,7 +541,8 @@ class FlashTab(_Tab):
     def on_connect(self):
         self._read_btn.config(state="normal")
         if self._cal_bytes:
-            self._write_btn.config(state="normal")
+            # Write is DISABLED until connection validation is hardware-confirmed
+            # self._write_btn.config(state="normal")
             self._verify_btn.config(state="normal")
         self._refresh_flash_blocks_btn()
 
@@ -551,7 +567,7 @@ class FlashTab(_Tab):
                 text=f"{sz:,} bytes  ({sz/1024:.1f} KB)",
                 fg=C["green"])
             if self.mw.connected:
-                self._write_btn.config(state="normal")
+                # Write disabled — pending hardware validation
                 self._verify_btn.config(state="normal")
             self._log_line(f"loaded {fname}  ({sz:,} bytes)\n", "ok")
         except Exception as e:
@@ -590,7 +606,7 @@ class FlashTab(_Tab):
             sz = len(self._cal_bytes)
             self._file_info.config(text=f"{sz:,} bytes", fg=C["green"])
             if self.mw.connected:
-                self._write_btn.config(state="normal")
+                # Write disabled — pending hardware validation
                 self._verify_btn.config(state="normal")
             self._log_line(
                 f"loaded {fname} [block {block_num}]  ({sz:,} bytes)\n",
@@ -653,7 +669,7 @@ class FlashTab(_Tab):
             text=f"read from {ecu_name}  ({sz/1024:.1f} KB)",
             fg=C["green"])
         if self.mw.connected:
-            self._write_btn.config(state="normal")
+            # Write disabled — pending hardware validation
             self._verify_btn.config(state="normal")
         self._log_line(f"read OK — {sz:,} bytes\n", "ok")
     def _do_write_cal(self):
@@ -1151,6 +1167,14 @@ class CPToolsTab(_Tab):
         tk.Label(row2, text="EXPERIMENTAL:",
                  bg=C["surface"], fg=C["amber"],
                  font=("Courier New", 9)).pack(side="left")
+        self._restore_const_btn = _btn(
+            row2,
+            "↺  Restore Known-Good Constellation",
+            self._do_restore_constellation,
+            state="disabled")
+        self._restore_const_btn.pack(side="left", padx=(8, 0))
+        tip(self._restore_const_btn, 'Writes known-good constellation (FDA1E80C...)\nback to J533 DID 0x04A3.\nUse to undo zero-constellation or recover.')
+
         self._zero_const_btn = _btn(
             row2,
             "⊘  Try Zero Constellation (disable CP check)",
@@ -1317,6 +1341,7 @@ class CPToolsTab(_Tab):
         self._scan_btn.config(state="normal")
         self._probe_btn.config(state="normal")
         self._zero_const_btn.config(state="normal")
+        self._restore_const_btn.config(state="normal")
         self._status_var.set("ready — click Scan to check all modules")
         self._status_lbl_color(C["green"])
 
@@ -1326,6 +1351,7 @@ class CPToolsTab(_Tab):
         self._const_btn.config(state="disabled")
         self._sel_all_btn.config(state="disabled")
         self._zero_const_btn.config(state="disabled")
+        self._restore_const_btn.config(state="disabled")
         self._status_var.set("connect to vehicle first")
         self._status_lbl_color(C["muted"])
         self._reset_module_rows()
@@ -1644,7 +1670,7 @@ class CPToolsTab(_Tab):
         for mod_name in selected:
             if mod_name not in mod_map:
                 continue
-            _, addr, tx, rx = mod_map[mod_name]
+            _, addr, tx, rx, proto = mod_map[mod_name]
             log(f"\n  Writing to {mod_name}  TX=0x{tx:03X} RX=0x{rx:03X}\n",
                 "hdr")
             try:
@@ -1665,17 +1691,38 @@ class CPToolsTab(_Tab):
                         .Session.extendedDiagnosticSession)
                     log("    extended session opened\n", "dim")
 
-                    # SA2 seed/key
+                    # SA2 seed/key — use per-module script from ecu_defs
                     try:
-                        from sa2_seed_key.sa2_script import Sa2Algorithm
-                        seed_resp = c.request_seed(0x03)
-                        seed      = bytes(seed_resp.service_data.seed)
-                        key       = Sa2Algorithm().compute_key(seed)
-                        c.send_key(0x04, key)
-                        log("    SA2 unlocked ✓\n", "ok")
+                        from sa2_seed_key.sa2_script import Sa2Script
+                        # Map CAN TX ID to the correct ECU def SA2 script
+                        _sa2_scripts = {
+                            0x710: J533_LEAR.sa2_script,   # J533 Gateway
+                            0x746: J255_4ZONE.sa2_script,  # J255 Climatronic
+                        }
+                        sa2_bytecode = _sa2_scripts.get(tx)
+                        if sa2_bytecode is None:
+                            log(f"    No SA2 script for TX=0x{tx:03X} — "
+                                f"trying without security access\n", "warn")
+                        else:
+                            seed_resp = c.request_seed(0x03)
+                            seed = bytes(seed_resp.service_data.seed)
+                            key = Sa2Script(sa2_bytecode).execute(
+                                int.from_bytes(seed, "big"))
+                            c.send_key(0x04, key.to_bytes(4, "big"))
+                            log(f"    SA2 unlocked ✓ (script for 0x{tx:03X})\n",
+                                "ok")
                     except ImportError:
-                        log("    SA2 module not available — write may fail\n",
-                            "warn")
+                        # Fallback to generic Sa2Algorithm if Sa2Script unavailable
+                        try:
+                            from sa2_seed_key.sa2_script import Sa2Algorithm
+                            seed_resp = c.request_seed(0x03)
+                            seed = bytes(seed_resp.service_data.seed)
+                            key = Sa2Algorithm().compute_key(seed)
+                            c.send_key(0x04, key)
+                            log("    SA2 unlocked ✓ (generic)\n", "ok")
+                        except ImportError:
+                            log("    SA2 module not installed — "
+                                "pip install sa2_seed_key\n", "warn")
                     except Exception as sa2_e:
                         log(f"    SA2 error: {sa2_e}\n", "err")
                         continue
@@ -1771,16 +1818,18 @@ class CPToolsTab(_Tab):
                 log(f"  Modules to enroll: {', '.join(written_names)}\n",
                     "hdr")
 
-                # SA2 unlock on J533
+                # SA2 unlock on J533 — use confirmed script from ecu_defs
                 try:
-                    from sa2_seed_key.sa2_script import Sa2Algorithm
+                    from sa2_seed_key.sa2_script import Sa2Script
                     seed_resp = c.request_seed(0x03)
                     seed = bytes(seed_resp.service_data.seed)
-                    key  = Sa2Algorithm().compute_key(seed)
-                    c.send_key(0x04, key)
+                    key = Sa2Script(J533_LEAR.sa2_script).execute(
+                        int.from_bytes(seed, "big"))
+                    c.send_key(0x04, key.to_bytes(4, "big"))
                     log("  SA2 unlocked on J533 ✓\n", "ok")
                 except ImportError:
-                    log("  SA2 module not available\n", "warn")
+                    log("  SA2 module not installed — "
+                        "pip install sa2_seed_key\n", "warn")
                 except Exception as e:
                     log(f"  SA2 error: {e}\n", "err")
                     self._ui(self._const_btn.config, state="normal")
@@ -1815,6 +1864,107 @@ class CPToolsTab(_Tab):
             log(f"  Constellation error: {e}\n", "err")
 
         self._ui(self._const_btn.config, state="normal")
+
+    # ── Restore known-good constellation ─────────────────────────────────────
+
+    def _do_restore_constellation(self):
+        """Write the known-good constellation back to J533 DID 0x04A3."""
+        import tkinter.messagebox as mb
+        if not mb.askyesno(
+            "Restore Known-Good Constellation",
+            "This will write the Feb 2024 known-good constellation\n"
+            "(FD A1 E8 0C FE 62 60 0D 00 00) to J533 DID 0x04A3.\n\n"
+            "Use this to undo a zero-constellation experiment or\n"
+            "restore CP after replacing a module.\n\n"
+            "Continue?",
+            icon="question"
+        ):
+            return
+        self._restore_const_btn.config(state="disabled")
+        self._append_log(self._log,
+            "\n── Restoring Known-Good Constellation ──────────────────\n",
+            "hdr")
+        self._run(self._restore_constellation_task)
+
+    def _restore_constellation_task(self):
+        import udsoncan
+        from udsoncan.client import Client
+        from udsoncan import configs
+
+        def log(msg, tag=""):
+            self._ui(self._append_log, self._log, msg, tag)
+
+        class _BytesCodec(udsoncan.DidCodec):
+            def encode(self, v): return bytes(v)
+            def decode(self, p): return p
+            def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
+
+        KNOWN_GOOD = bytes.fromhex("FDA1E80CFE62600D0000")
+
+        try:
+            from cp_tools.j533_probe import J533Probe
+            probe = J533Probe(
+                interface      = self.mw.interface,
+                interface_path = self.mw.iface_path,
+                ble_bridge     = getattr(self.mw, "ble_bridge", None),
+            )
+            cfg = dict(configs.default_client_config)
+            cfg["data_identifiers"] = {CONST_DID: _BytesCodec}
+            cfg["request_timeout"]  = 10
+            conn = probe._make_conn(0x710, 0x77A)
+
+            with Client(conn, request_timeout=10, config=cfg) as c:
+                c.change_session(
+                    udsoncan.services.DiagnosticSessionControl
+                    .Session.extendedDiagnosticSession)
+
+                # Read current
+                r = c.read_data_by_identifier([CONST_DID])
+                current = bytes(r.service_data.values[CONST_DID])
+                log(f"  Current:    {' '.join(f'{b:02X}' for b in current)}\n",
+                    "dim")
+                log(f"  Restoring:  {' '.join(f'{b:02X}' for b in KNOWN_GOOD)}\n",
+                    "hdr")
+
+                if current == KNOWN_GOOD:
+                    log("  Already at known-good value — no write needed ✓\n", "ok")
+                    self._ui(self._restore_const_btn.config, state="normal")
+                    return
+
+                # SA2 unlock on J533 — use confirmed script from ecu_defs
+                try:
+                    from sa2_seed_key.sa2_script import Sa2Script
+                    seed_resp = c.request_seed(0x03)
+                    seed = bytes(seed_resp.service_data.seed)
+                    key = Sa2Script(J533_LEAR.sa2_script).execute(
+                        int.from_bytes(seed, "big"))
+                    c.send_key(0x04, key.to_bytes(4, "big"))
+                    log("  SA2 unlocked on J533 ✓\n", "ok")
+                except ImportError:
+                    log("  SA2 module not installed — "
+                        "pip install sa2_seed_key\n", "warn")
+                except Exception as e:
+                    log(f"  SA2 error: {e}\n", "err")
+                    self._ui(self._restore_const_btn.config, state="normal")
+                    return
+
+                c.write_data_by_identifier(CONST_DID, KNOWN_GOOD)
+
+                # Verify
+                r2 = c.read_data_by_identifier([CONST_DID])
+                readback = bytes(r2.service_data.values[CONST_DID])
+                if readback == KNOWN_GOOD:
+                    log("  Restored ✓  readback matches known-good\n", "ok")
+                    self._ui(self._const_var.set,
+                             " ".join(f"{b:02X}" for b in readback))
+                else:
+                    log(f"  Verify FAILED — readback: "
+                        f"{' '.join(f'{b:02X}' for b in readback)}\n", "err")
+
+        except Exception as e:
+            log(f"  Restore error: {e}\n", "err")
+
+        self._ui(self._restore_const_btn.config, state="normal")
 
     # ── Option 1: Try zero constellation ─────────────────────────────────────
     # Tests whether J533 has a CP-disabled / virgin state by writing all zeros
