@@ -38,6 +38,18 @@ from typing import Callable, Optional, Tuple
 
 from transport.interfaces import InterfaceRegistry, InterfaceInfo
 
+# CAN addresses that live on Convenience CAN (pins 3+11, 100kbps)
+# MongoosePro VW DLL required for direct access; ISO2 routes via J533 gateway
+# which deadlocks on multi-frame ISO-TP reads (34-byte DID 0x00BE)
+CONVENIENCE_CAN_TX_IDS = {
+    0x746,   # J255 Climatronic
+    0x74C,   # J136 Memory Seat Driver
+    0x74D,   # J521 Memory Seat Passenger
+    0x732,   # J518 KESSY
+    0x70E,   # J519 Body Electronics
+    0x70D,   # J393 Central Comfort
+}
+
 # ── Color palette (dark theme matching the rest of the suite) ─────────────────
 
 COLORS = {
@@ -68,6 +80,13 @@ BADGE_COLORS = {
 STATUS_DOT = {
     True:  {"color": "#3fb950", "label": "●"},   # available
     False: {"color": "#484f58", "label": "●"},   # unavailable
+}
+
+# 3-state connection indicator
+CONN_STATE = {
+    "none":    {"color": "#f85149", "label": "NO HARDWARE"},
+    "cable":   {"color": "#d29922", "label": "CABLE OK — CHECK IGNITION"},
+    "ecu":     {"color": "#3fb950", "label": "ECU RESPONDING"},
 }
 
 
@@ -330,7 +349,13 @@ class InterfacePanel(tk.Frame):
                        cursor="hand2" if iface.available else "arrow")
         row.pack(fill="x", pady=2)
 
-        dot_color = COLORS["green"] if iface.available else COLORS["text_dim"]
+        # 3-state dot: green = cable confirmed, amber = DLL only, gray = not found
+        if getattr(iface, 'hw_connected', False):
+            dot_color = COLORS["green"]
+        elif iface.available:
+            dot_color = COLORS["amber"]
+        else:
+            dot_color = COLORS["text_dim"]
         tk.Label(row, text="●", fg=dot_color, bg=row["bg"],
                  font=("Menlo", 9)).pack(side="left", padx=(0, 8))
 
@@ -479,18 +504,46 @@ class InterfacePanel(tk.Frame):
         self._selected_iface = None
         self._sel_info_var.set("")
         self._populate_list()
-        n = len(self._registry.available())
+
+        available = self._registry.available()
+        n = len(available)
+        hw_count = sum(1 for i in available if getattr(i, 'hw_connected', False))
+
         self._refresh_btn.config(text="⟳  refresh", fg=COLORS["blue"])
         if n == 0:
             self._set_status(COLORS["text_dim"],
                              "no hardware detected — check connections")
+        elif hw_count > 0:
+            hw_names = ", ".join(
+                i.name.split("(")[0].strip()
+                for i in available if getattr(i, 'hw_connected', False))
+            self._set_status(COLORS["green"],
+                             f"{hw_count} cable{'s' if hw_count!=1 else ''} "
+                             f"confirmed: {hw_names}")
         else:
-            names = ", ".join(i.interface.split("_")[0]
-                              for i in self._registry.available())
-            self._set_status(COLORS["green"] if n else COLORS["text_dim"],
-                             f"{n} interface{'s' if n!=1 else ''} found: {names}")
+            names = ", ".join(i.interface.split("_")[0] for i in available)
+            self._set_status(COLORS["amber"],
+                             f"{n} interface{'s' if n!=1 else ''} found "
+                             f"(no cables confirmed): {names}")
+
         self._connect_btn.config(state="disabled")
         self._hide_boxes()
+
+    def suggest_dll_for_cp(self) -> Optional[str]:
+        """
+        If the user is about to work with Convenience CAN modules (J255, J136, etc.),
+        check if a MongoosePro VW DLL is available and suggest it.
+        Returns the suggested DLL path or None.
+        """
+        conv_dlls = [
+            i for i in self._registry.available()
+            if i.interface == "J2534" and getattr(i, 'bus_type', '') == "CONV"
+        ]
+        if conv_dlls:
+            best = next((d for d in conv_dlls if getattr(d, 'hw_connected', False)),
+                        conv_dlls[0])
+            return best.path
+        return None
 
     # ── Connect / Disconnect ──────────────────────────────────────────────────
 
@@ -511,28 +564,124 @@ class InterfacePanel(tk.Frame):
 
         def _connect_task():
             import time
+
+            # ── MOCK mode — bypass hardware checks ────────────────────
             if interface == "MOCK":
                 try:
                     from tests.sim_runner import _install_mock_patch
                     _install_mock_patch("S85", "ZF8HP")
                 except Exception:
                     pass
-            time.sleep(0.3)
-            self.after(0, lambda: self._on_connected(interface, path))
+                self.after(0, lambda: self._on_connected(interface, path))
+                return
+
+            # ── BLE — device scan deferred to connect time ────────────
+            if interface == "BLE":
+                self.after(0, lambda: self._set_status(
+                    COLORS["amber"], "BLE scanning for bridge..."))
+                # BLE connection is established by the BLE bridge layer
+                # at first use. We trust it here.
+                time.sleep(0.5)
+                self.after(0, lambda: self._on_connected(interface, path))
+                return
+
+            # ── J2534 — probe cable + ping ECU ────────────────────────
+            if interface == "J2534":
+                from transport.interfaces import probe_j2534_dll
+                self.after(0, lambda: self._set_status(
+                    COLORS["amber"], "probing J2534 cable..."))
+                probe = probe_j2534_dll(path)
+                if not probe["connected"]:
+                    reason = probe["error"] or "Cable not responding"
+                    self.after(0, lambda r=reason: self._on_connect_failed(
+                        f"J2534 cable not detected.\n{r}\n\n"
+                        "Check: cable plugged in, drivers installed, "
+                        "no other software using the port."))
+                    return
+
+                fw = probe.get("firmware", "")
+                cable_msg = f"Cable OK — {fw}" if fw else "Cable connected"
+                self.after(0, lambda m=cable_msg: self._set_status(
+                    COLORS["amber"], f"{m} — pinging ECU..."))
+
+                # Try TesterPresent on the selected ECU
+                ecu_ok, ecu_msg = self._ping_ecu(interface, path)
+                if ecu_ok:
+                    self.after(0, lambda m=ecu_msg: self._on_connected(
+                        interface, path, detail=m))
+                else:
+                    # Cable works but ECU didn't respond — still allow connect
+                    # (user may want to scan modules that respond on different CAN IDs)
+                    self.after(0, lambda m=ecu_msg: self._on_connected(
+                        interface, path, detail=m, partial=True))
+                return
+
+            # ── USB ISO-TP / SocketCAN / WiFi — basic connect ─────────
+            # Try TesterPresent if we have an ECU selected
+            ecu_ok, ecu_msg = self._ping_ecu(interface, path)
+            if ecu_ok:
+                self.after(0, lambda m=ecu_msg: self._on_connected(
+                    interface, path, detail=m))
+            else:
+                # Still allow connect for non-ECU work (CP scan etc.)
+                self.after(0, lambda m=ecu_msg: self._on_connected(
+                    interface, path, detail=m, partial=True))
 
         threading.Thread(target=_connect_task, daemon=True).start()
 
-    def _on_connected(self, interface: str, path: str):
+    def _ping_ecu(self, interface: str, path: str) -> tuple:
+        """
+        Send TesterPresent (0x3E 0x00) to the selected ECU.
+        Returns (success: bool, message: str).
+        """
+        ecu = self._ecu
+        if ecu is None:
+            return (False, "No ECU selected — skipping ping")
+
+        try:
+            from flasher.uds_flash import _make_connection
+            import udsoncan
+            from udsoncan.client import Client
+            from udsoncan import configs
+
+            cfg = dict(configs.default_client_config)
+            cfg["request_timeout"] = 4
+            cfg["p2_timeout"]      = 0.5
+            cfg["use_server_timing"] = False
+
+            conn = _make_connection(
+                ecu, interface, interface_path=path,
+                ble_bridge=getattr(self, "_ble_bridge", None))
+            with Client(conn, request_timeout=4, config=cfg) as client:
+                client.tester_present()
+                return (True, f"{ecu.name} responding ✓")
+        except Exception as e:
+            err = str(e)[:80]
+            if "timeout" in err.lower():
+                return (False, f"ECU not responding (timeout) — check ignition is ON")
+            return (False, f"ECU ping failed: {err}")
+
+    def _on_connected(self, interface: str, path: str,
+                       detail: str = "", partial: bool = False):
         self._connected = True
         self._connect_btn.config(state="normal", text="disconnect",
                                  fg=COLORS["red"], bg="#3d0f0f",
                                  activeforeground=COLORS["red"],
                                  activebackground="#5a1f1f")
         label = f"{interface}:{path}" if path else interface
-        self._set_status(COLORS["green"], f"connected — {label}")
-        self._show_note(
-            "UDS transport active. Extended session ready.\n"
-            "Use _make_connection(ecu, interface, path) to create udsoncan Client.")
+
+        if partial:
+            # Cable works but ECU didn't respond
+            self._set_status(COLORS["amber"], f"connected (partial) — {label}")
+            self._show_warn(
+                f"{detail}\n\n"
+                "Cable is working but selected ECU did not respond.\n"
+                "Module scanning and CP tools may still work on other addresses.\n"
+                "Check: ignition ON, correct ECU selected, OBD port connected.")
+        else:
+            self._set_status(COLORS["green"], f"connected — {label}")
+            self._show_note(detail or "UDS transport active.")
+
         if self._on_connect:
             self._on_connect(interface, path)
 

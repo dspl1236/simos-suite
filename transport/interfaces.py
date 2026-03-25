@@ -67,12 +67,17 @@ Usage:
 
 from __future__ import annotations
 
+import ctypes
+import logging
 import os
 import platform
 import sys
+from ctypes import c_long, c_ulong, c_void_p, c_char, byref, POINTER, WINFUNCTYPE
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+log = logging.getLogger("SimosSuite.Interfaces")
 
 # ── Known J2534 DLL locations (Windows, 32-bit) ───────────────────────────────
 
@@ -227,6 +232,89 @@ def detect_j2534_dll() -> Optional[str]:
     return dlls[0][1] if dlls else None
 
 
+# ── J2534 hardware probe ─────────────────────────────────────────────────────
+
+def probe_j2534_dll(dll_path: str, timeout_ms: int = 3000) -> dict:
+    """
+    Probe a J2534 DLL to check if the cable is physically connected.
+
+    Returns a dict:
+        connected: bool    — True if PassThruOpen succeeded (cable is plugged in)
+        firmware:  str     — Firmware version string (or "")
+        dll_ver:   str     — DLL version string (or "")
+        api_ver:   str     — API version string (or "")
+        error:     str     — Error message if failed (or "")
+    """
+    result = {"connected": False, "firmware": "", "dll_ver": "",
+              "api_ver": "", "error": ""}
+
+    if platform.system() != "Windows":
+        result["error"] = "J2534 only supported on Windows"
+        return result
+
+    try:
+        import pathlib
+        dll_dir = str(pathlib.Path(dll_path).parent)
+        if hasattr(os, 'add_dll_directory'):
+            os.add_dll_directory(dll_dir)
+        hDLL = ctypes.cdll.LoadLibrary(dll_path)
+    except OSError as e:
+        result["error"] = f"Cannot load DLL: {e}"
+        return result
+
+    try:
+        # PassThruOpen(pName, pDeviceID) → long
+        _OpenProto = WINFUNCTYPE(c_long, c_void_p, POINTER(c_ulong))
+        _Open = _OpenProto(("PassThruOpen", hDLL),
+                           ((1, "pName", 0), (1, "pDeviceID", 0)))
+
+        # PassThruClose(DeviceID) → long
+        _CloseProto = WINFUNCTYPE(c_long, c_ulong)
+        _Close = _CloseProto(("PassThruClose", hDLL), ((1, "DeviceID", 0),))
+
+        # PassThruReadVersion(DeviceID, pFirmwareVersion, pDllVersion, pApiVersion)
+        _VersionProto = WINFUNCTYPE(c_long, c_ulong,
+                                     ctypes.c_char_p, ctypes.c_char_p,
+                                     ctypes.c_char_p)
+        _ReadVersion = _VersionProto(
+            ("PassThruReadVersion", hDLL),
+            ((1, "DeviceID", 0), (1, "pFW", 0),
+             (1, "pDLL", 0), (1, "pAPI", 0)))
+
+    except AttributeError as e:
+        result["error"] = f"DLL missing J2534 exports: {e}"
+        return result
+
+    deviceID = c_ulong(0)
+    ret = _Open(None, byref(deviceID))
+    if ret != 0:
+        result["error"] = f"PassThruOpen failed (code {ret}) — cable not connected"
+        return result
+
+    result["connected"] = True
+
+    # Read version strings
+    fw_buf  = ctypes.create_string_buffer(80)
+    dll_buf = ctypes.create_string_buffer(80)
+    api_buf = ctypes.create_string_buffer(80)
+    try:
+        vret = _ReadVersion(deviceID, fw_buf, dll_buf, api_buf)
+        if vret == 0:
+            result["firmware"] = fw_buf.value.decode("ascii", errors="replace").strip()
+            result["dll_ver"]  = dll_buf.value.decode("ascii", errors="replace").strip()
+            result["api_ver"]  = api_buf.value.decode("ascii", errors="replace").strip()
+    except Exception:
+        pass  # version read is best-effort
+
+    # Close immediately — don't hold the port
+    try:
+        _Close(deviceID)
+    except Exception:
+        pass
+
+    return result
+
+
 # ── USB-serial port detection ─────────────────────────────────────────────────
 
 def detect_usb_isotp_ports() -> List[tuple[str, str]]:
@@ -272,9 +360,17 @@ class InterfaceInfo:
     path:        str          # DLL path or serial port
     available:   bool         # Is the hardware present/detected?
     notes:       str = ""
+    hw_connected: bool = False   # True if physical hardware confirmed (probe passed)
+    firmware:    str = ""        # Firmware version (J2534 only)
+    bus_type:    str = ""        # "DRIVE" for high-speed CAN, "CONV" for convenience CAN
 
     def __str__(self):
-        status = "✓" if self.available else "✗"
+        if self.hw_connected:
+            status = "✓ connected"
+        elif self.available:
+            status = "○ DLL found"
+        else:
+            status = "✗ not found"
         return f"[{status}] {self.name}  ({self.interface}:{self.path})"
 
 
@@ -327,7 +423,7 @@ class InterfaceRegistry:
             ))
 
         # J2534 DLLs — show all installed adapters, deduplicated by path
-        # Cable/hardware detection happens at connect time via PassThruOpen
+        # Probe each DLL with PassThruOpen to detect physical cable
         j2534_dlls = detect_j2534_dlls()
         seen_paths = set()
         for name, dll_path in j2534_dlls:
@@ -335,12 +431,35 @@ class InterfaceRegistry:
             if norm in seen_paths:
                 continue
             seen_paths.add(norm)
+
+            # Determine bus type from DLL name
+            is_conv = ("mongoosepro vw" in name.lower()
+                       or "convenience" in name.lower())
+            bus_type = "CONV" if is_conv else "DRIVE"
+
+            # Probe hardware — does PassThruOpen succeed?
+            probe = probe_j2534_dll(dll_path)
+            hw_ok = probe["connected"]
+
+            if hw_ok and probe["firmware"]:
+                display_name = f"{name} (fw {probe['firmware']})"
+                notes = f"Cable connected — firmware {probe['firmware']}"
+            elif hw_ok:
+                display_name = f"{name} — connected"
+                notes = "Cable connected via PassThruOpen"
+            else:
+                display_name = f"{name} — cable not detected"
+                notes = probe["error"] or "DLL installed but cable not responding"
+
             self._interfaces.append(InterfaceInfo(
-                name      = name,
-                interface = "J2534",
-                path      = dll_path,
-                available = True,
-                notes     = "J2534 PassThru — plug in cable then connect",
+                name         = display_name,
+                interface    = "J2534",
+                path         = dll_path,
+                available    = True,           # DLL exists on disk
+                hw_connected = hw_ok,          # Cable physically confirmed
+                firmware     = probe.get("firmware", ""),
+                bus_type     = bus_type,
+                notes        = notes,
             ))
 
         # FunkBridge WiFi (AP or Station mode)
