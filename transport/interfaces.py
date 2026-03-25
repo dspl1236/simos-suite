@@ -463,19 +463,36 @@ class InterfaceRegistry:
                        or "convenience" in name.lower())
             bus_type = "CONV" if is_conv else "DRIVE"
 
-            # Probe hardware — does PassThruOpen succeed?
-            probe = probe_j2534_dll(dll_path)
-            hw_ok = probe["connected"]
+            # VNCI 6154A uses a network adapter, not USB — probe differently
+            is_vnci = any(tag in name.lower() for tag in [
+                "vnci", "6154", "vcdc", "stic"])
 
-            if hw_ok and probe["firmware"]:
-                display_name = f"{name} (fw {probe['firmware']})"
-                notes = f"Cable connected — firmware {probe['firmware']}"
-            elif hw_ok:
-                display_name = f"{name} — connected"
-                notes = "Cable connected via PassThruOpen"
+            if is_vnci:
+                vnci_adapter = self._detect_vnci_network()
+                hw_ok = vnci_adapter is not None
+                if hw_ok:
+                    display_name = f"{name} — connected ({vnci_adapter})"
+                    notes = (f"Network adapter '{vnci_adapter}' detected.\n"
+                             "VNCI communicates via virtual network interface.")
+                else:
+                    display_name = f"{name} — adapter not detected"
+                    notes = ("DLL installed but VNCI network adapter not found.\n"
+                             "Plug in VNCI 6154A and check Device Manager → "
+                             "Network adapters.")
             else:
-                display_name = f"{name} — cable not detected"
-                notes = probe["error"] or "DLL installed but cable not responding"
+                # Standard J2534 — probe via PassThruOpen
+                probe = probe_j2534_dll(dll_path)
+                hw_ok = probe["connected"]
+
+                if hw_ok and probe["firmware"]:
+                    display_name = f"{name} (fw {probe['firmware']})"
+                    notes = f"Cable connected — firmware {probe['firmware']}"
+                elif hw_ok:
+                    display_name = f"{name} — connected"
+                    notes = "Cable connected via PassThruOpen"
+                else:
+                    display_name = f"{name} — cable not detected"
+                    notes = probe["error"] or "DLL installed but cable not responding"
 
             self._interfaces.append(InterfaceInfo(
                 name         = display_name,
@@ -533,6 +550,40 @@ class InterfaceRegistry:
                     available = True,
                     notes     = "Linux SocketCAN + iso-tp kernel module required",
                 ))
+
+    def _detect_vnci_network(self) -> Optional[str]:
+        """
+        Detect VNCI 6154A by scanning Windows network adapters.
+        The VNCI presents as a virtual network adapter (not a COM port).
+        The J2534 DLL (vcdc.dll) communicates over this adapter internally.
+
+        Returns the adapter name if found, or None.
+        """
+        if platform.system() != "Windows":
+            return None
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["ipconfig", "/all"],
+                capture_output=True, text=True, timeout=5)
+            # Look for VNCI/VAS6154 adapter in ipconfig output
+            lines = result.stdout.split("\n")
+            for i, line in enumerate(lines):
+                low = line.lower()
+                if any(tag in low for tag in [
+                    "vnci", "vas6154", "vas 6154",
+                    "6154a", "stic",
+                ]):
+                    # Found it — extract the adapter name from the header line
+                    # ipconfig shows "Ethernet adapter <NAME>:" before Description
+                    for j in range(max(0, i - 5), i):
+                        if "adapter" in lines[j].lower() and ":" in lines[j]:
+                            name = lines[j].split("adapter")[-1].strip().rstrip(":")
+                            return name
+                    return "VNCI 6154A"
+        except Exception:
+            pass
+        return None
 
     def _scan_socketcan(self) -> List[str]:
         """Return names of available SocketCAN interfaces."""
