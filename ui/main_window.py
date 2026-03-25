@@ -1161,31 +1161,16 @@ class CPToolsTab(_Tab):
         self._sel_all_btn.pack(side="right")
         tip(self._sel_all_btn, "Tick all modules currently showing CP ACTIVE.\nUncheck any you don't want to fix.")
 
-        # Row 2 — experimental options
+        # Row 2 — recovery options
         row2 = _frame(act)
         row2.pack(fill="x", pady=(6, 0))
-        tk.Label(row2, text="EXPERIMENTAL:",
-                 bg=C["surface"], fg=C["amber"],
-                 font=("Courier New", 9)).pack(side="left")
         self._restore_const_btn = _btn(
             row2,
             "↺  Restore Known-Good Constellation",
             self._do_restore_constellation,
             state="disabled")
-        self._restore_const_btn.pack(side="left", padx=(8, 0))
-        tip(self._restore_const_btn, 'Writes known-good constellation (FDA1E80C...)\nback to J533 DID 0x04A3.\nUse to undo zero-constellation or recover.')
-
-        self._zero_const_btn = _btn(
-            row2,
-            "⊘  Try Zero Constellation (disable CP check)",
-            self._do_zero_constellation,
-            state="disabled")
-        self._zero_const_btn.pack(side="left", padx=(8, 0))
-        tip(self._zero_const_btn, 'EXPERIMENTAL: writes 00x10 to DID 0x04A3.\nTests if J533 has a CP-disabled state.\nKnown-good value can always be restored.')
-        tk.Label(row2,
-                 text="writes 00×10 to DID 0x04A3 — tests if J533 has a CP-disabled state",
-                 bg=C["surface"], fg=C["dim"],
-                 font=("Courier New", 8)).pack(side="left", padx=(8, 0))
+        self._restore_const_btn.pack(side="left")
+        tip(self._restore_const_btn, 'Writes known-good constellation (FDA1E80C...)\nback to J533 DID 0x04A3.\nUse after module replacement or to recover.')
 
         # Status line
         self._status_var = tk.StringVar(value="connect to vehicle first")
@@ -1340,7 +1325,6 @@ class CPToolsTab(_Tab):
     def on_connect(self):
         self._scan_btn.config(state="normal")
         self._probe_btn.config(state="normal")
-        self._zero_const_btn.config(state="normal")
         self._restore_const_btn.config(state="normal")
         self._status_var.set("ready — click Scan to check all modules")
         self._status_lbl_color(C["green"])
@@ -1350,7 +1334,6 @@ class CPToolsTab(_Tab):
         self._write_btn.config(state="disabled")
         self._const_btn.config(state="disabled")
         self._sel_all_btn.config(state="disabled")
-        self._zero_const_btn.config(state="disabled")
         self._restore_const_btn.config(state="disabled")
         self._status_var.set("connect to vehicle first")
         self._status_lbl_color(C["muted"])
@@ -1965,136 +1948,6 @@ class CPToolsTab(_Tab):
             log(f"  Restore error: {e}\n", "err")
 
         self._ui(self._restore_const_btn.config, state="normal")
-
-    # ── Option 1: Try zero constellation ─────────────────────────────────────
-    # Tests whether J533 has a CP-disabled / virgin state by writing all zeros
-    # to DID 0x04A3. If J533 enters a "don't check" mode, CP stops being
-    # enforced without needing to know any IKA keys.
-    # Safe to try — if it fails or causes issues, write the known-good
-    # constellation back (FD A1 E8 0C FE 62 60 0D 00 00).
-
-    def _do_zero_constellation(self):
-        import tkinter.messagebox as mb
-        if not mb.askyesno(
-            "Try Zero Constellation",
-            "This will write 10 zero bytes to J533 DID 0x04A3.\n\n"
-            "If J533 has a CP-disabled state, this disables the\n"
-            "constellation check permanently without needing IKA keys.\n\n"
-            "If it causes issues, the known-good constellation can be\n"
-            "restored with \u229e Update Constellation.\n\n"
-            "Continue?",
-            icon="warning"
-        ):
-            return
-        self._zero_const_btn.config(state="disabled")
-        self._scan_btn.config(state="disabled")
-        self._append_log(self._log,
-            "\n── Option 1: Zero Constellation ─────────────────────────\n",
-            "hdr")
-        self._append_log(self._log,
-            "  Writing 00 00 00 00 00 00 00 00 00 00 to J533 DID 0x04A3\n",
-            "warn")
-        self._run(self._zero_constellation_task)
-
-    def _zero_constellation_task(self):
-        import udsoncan
-        from udsoncan.client import Client  # noqa: F401
-        from udsoncan import configs
-
-        def log(msg, tag=""):
-            self._ui(self._append_log, self._log, msg, tag)
-
-        class _BytesCodec(udsoncan.DidCodec):
-            def encode(self, v): return bytes(v)
-            def decode(self, p): return p
-            def __len__(self): raise udsoncan.DidCodec.ReadAllRemainingData
-
-        ZERO_CONST    = bytes(10)          # 10 × 0x00
-        KNOWN_GOOD    = bytes.fromhex("FDA1E80CFE62600D0000")
-
-        try:
-            from cp_tools.j533_probe import J533Probe
-            probe = J533Probe(
-                interface      = self.mw.interface,
-                interface_path = self.mw.iface_path,
-                ble_bridge     = getattr(self.mw, "ble_bridge", None),
-            )
-            cfg = dict(configs.default_client_config)
-            cfg["data_identifiers"] = {CONST_DID: _BytesCodec}
-            cfg["request_timeout"]  = 10
-            conn = probe._make_conn(0x710, 0x77A)
-
-            with Client(conn, request_timeout=10, config=cfg) as c:
-                c.change_session(
-                    udsoncan.services.DiagnosticSessionControl
-                    .Session.extendedDiagnosticSession)
-
-                # Read current constellation first
-                r = c.read_data_by_identifier([CONST_DID])
-                current = bytes(r.service_data.values[CONST_DID])
-                log(f"  Current: {' '.join(f'{b:02X}' for b in current)}\n",
-                    "dim")
-                log(f"  Writing: 00 00 00 00 00 00 00 00 00 00\n", "warn")
-
-                # SA2 unlock
-                try:
-                    from sa2_seed_key.sa2_script import Sa2Algorithm
-                    seed_resp = c.request_seed(0x03)
-                    seed = bytes(seed_resp.service_data.seed)
-                    key  = Sa2Algorithm().compute_key(seed)
-                    c.send_key(0x04, key)
-                    log("  SA2 unlocked ✓\n", "ok")
-                except Exception as sa2_e:
-                    log(f"  SA2 error: {sa2_e}\n", "err")
-                    self._ui(self._zero_const_btn.config, state="normal")
-                    self._ui(self._scan_btn.config, state="normal")
-                    return
-
-                # Write zero constellation
-                c.write_data_by_identifier(CONST_DID, ZERO_CONST)
-
-                # Read back
-                r2 = c.read_data_by_identifier([CONST_DID])
-                readback = bytes(r2.service_data.values[CONST_DID])
-                log(f"  Readback: {' '.join(f'{b:02X}' for b in readback)}\n",
-                    "ok")
-
-                if readback == ZERO_CONST:
-                    log("  Zero constellation accepted by J533 ✓\n", "ok")
-                    log("\n  NOW: cycle ignition and run Scan All Modules.\n",
-                        "hdr")
-                    log("  If all modules show CP clear → zero constellation\n"
-                        "  disables the CP check. \U0001f389\n", "ok")
-                    log("  If modules still show CP active → zero constellation\n"
-                        "  does not disable the check on this platform.\n",
-                        "warn")
-                    log("  In either case the known-good constellation can be\n"
-                        "  restored with \u229e Update Constellation.\n", "dim")
-                    self._ui(self._const_var.set, "00 00 00 00 00 00 00 00 00 00")
-                    self._ui(self._verdict_var.set,
-                             "\u26a0  Zero constellation written — cycle ignition and rescan")
-                    self._ui(self._verdict_lbl.config, fg=C["amber"])
-                    self._ui(self._ign_btn.config, state="normal")
-                else:
-                    log(f"  Unexpected readback — J533 may have modified the value\n",
-                        "warn")
-
-        except udsoncan.exceptions.NegativeResponseException as nre:
-            nrc = nre.response.code if hasattr(nre, "response") else 0
-            log(f"  J533 rejected zero write — NRC 0x{nrc:02X}\n", "err")
-            if nrc == 0x22:
-                log("  conditionsNotCorrect — J533 may require GEKO token\n"
-                    "  to accept this constellation value.\n", "warn")
-            elif nrc == 0x31:
-                log("  requestOutOfRange — zero constellation not a valid\n"
-                    "  value on this platform.\n", "warn")
-            log("  This is expected if J533 validates the constellation\n"
-                "  structure before writing.\n", "dim")
-        except Exception as e:
-            log(f"  Error: {e}\n", "err")
-
-        self._ui(self._zero_const_btn.config, state="normal")
-        self._ui(self._scan_btn.config, state="normal")
 
     # ── Guided ignition cycle ────────────────────────────────────────────────
 
