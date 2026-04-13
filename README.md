@@ -123,6 +123,8 @@ it to GitHub Releases automatically.
 | SC1 | Simos12 | 2.0T EA888 Gen1/2 | PQ46 |
 | SC2 | Simos12.2 | 2.0T EA888 Gen3 | PQ46 |
 | SC8 | Simos18.1/6 | 2.0T EA888 Gen3b | MQB |
+| SC8_TTRS | Simos18.1 | **2.5T EA855 TTRS/TT** | MQB — **NEW** |
+| SCG | Simos18.10 | 2.0T EA888 Gen3b Evo | MQB Evo — **NEW** |
 
 | Key | TCU | Gearbox |
 |-----|-----|---------|

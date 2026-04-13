@@ -419,7 +419,90 @@ SIMOS18 = ECUDef(
 
 # ── SIMOS18 aliases ──────────────────────────────────────────────────────────
 SIMOS181  = SIMOS18   # alias used by main_window.py and other callers
-SIMOS1810 = SIMOS18   # Simos18.10 placeholder — same SA2 family, TODO: ODX confirm
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Simos18.1 TTRS / TT — 2.5T EA855 DAZA / DNWA (8S0906259)
+# Confirmed: uses same AES key/IV as standard Simos18.1 (SC8)
+# Block layout matches bri3d/VW_Flash simos18.py
+#
+# Verified by decrypting 8 TTRS FRF files:
+#   FL_8S0906259B  (3 revisions)
+#   FL_8S0906259C, J, N, R, _
+#   All 5 blocks decrypt + LZSS decompress to correct sizes.
+#
+# CAL block at PFLASH 0xA0800000 (binfile offset 0x200000), 654,336 bytes
+# NOTE: EA855 calibration uses different map structures/scaling than EA888.
+# Scanner signatures from TriCoreTool (EA888-tuned) do NOT match EA855.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SIMOS18_TTRS = ECUDef(
+    name="Simos18.1 — 2.5T TFSI EA855 TTRS/TT (8S0906259)",
+    project_code="SC8_TTRS",
+    platform=Platform.MQB, can_tx=0x7E0, can_rx=0x7E8,
+    crypto=CryptoType.AES_CBC,
+    crypto_key=bytes.fromhex("98D31202E48E3854F2CA561545BA6F2F"),
+    crypto_iv =bytes.fromhex("E7861278C508532798BCA4FE451D20D1"),
+    sa2_script=bytes.fromhex(
+        "6802814A10680493080820094A05872212195482499307122011824A058703112010824A0181494C"),
+    blocks={
+        1: BlockDef(1, "CBOOT", 0x8001C000, 0x23E00, 0x01C000, 0x300, "FD_0"),
+        2: BlockDef(2, "ASW1",  0x80040000, 0xFFC00, 0x040000, 0x300, "FD_1"),
+        3: BlockDef(3, "ASW2",  0x80140000, 0xBFC00, 0x140000, 0x000, "FD_2"),
+        4: BlockDef(4, "ASW3",  0x80880000, 0x7FC00, 0x280000, 0x000, "FD_3"),
+        5: BlockDef(5, "CAL",   0xA0800000, 0x7FC00, 0x200000, 0x300, "FD_4",
+                    cal_block=True),
+        6: BlockDef(6, "CBOOT_TEMP", 0x80840000, 0x23E00, 0x000000, 0x340,
+                    "FD_T", flashable=False),
+    },
+    binfile_size=4194304, info_dids=STD_INFO_DIDS,
+    compatible_hw=["8S0906259", "8S0906259B", "8S0906259C",
+                   "8S0906259J", "8S0906259N", "8S0906259R"],
+    notes=(
+        "TTRS / TT 2.5T TFSI (EA855 DAZA/DNWA). Same Simos18.1 AES key as SC8 EA888. "
+        "Verified: all 8 FRF files (8S0906259B/C/J/N/R/_) decrypt correctly. "
+        "Block sizes confirmed: CBOOT=130,560  ASW1=916,480  ASW2=1,047,552  "
+        "ASW3=1,309,696  CAL=654,336. "
+        "CAL data structure differs from EA888 — map lookup routines in ASW "
+        "reference 0xA0800000+ addresses with different scaling. "
+        "Companion ECU: 06K907425x (TTRS secondary/knock controller)."
+    ),
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Simos18.10 (SCG) — Golf/A3/Tiguan 2.0T EA888 Gen3b MQB Evo
+# Different AES key from Simos18.1!
+# From bri3d/VW_Flash lib/modules/simos1810.py
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SIMOS1810 = ECUDef(
+    name="Simos18.10 — 2.0T EA888 Gen3b MQB Evo (5G0/06K)", project_code="SCG",
+    platform=Platform.MQB, can_tx=0x7E0, can_rx=0x7E8,
+    crypto=CryptoType.AES_CBC,
+    crypto_key=bytes.fromhex("AE540502E48E3854DBCA1A1545BA6F33"),
+    crypto_iv =bytes.fromhex("62F313FA5C08532798BCA452471D20D5"),
+    sa2_script=bytes.fromhex(
+        "6803814A10680293050520154A058722121954824993F423BF7D824A05875A63FC5E824A0181494C"),
+    blocks={
+        1: BlockDef(1, "CBOOT", 0x80800000, 0x1FE00,  0x200000, 0x300, "FD_01DATA"),
+        2: BlockDef(2, "ASW1",  0x80020000, 0xDFC00,  0x020000, 0x300, "FD_02DATA"),
+        3: BlockDef(3, "ASW2",  0x80100000, 0xFFC00,  0x100000, 0x000, "FD_03DATA"),
+        4: BlockDef(4, "ASW3",  0x808C0000, 0x13FC00, 0x2C0000, 0x000, "FD_04DATA"),
+        5: BlockDef(5, "CAL",   0xA0820000, 0x9FC00,  0x220000, 0x300, "FD_05DATA",
+                    cal_block=True),
+        6: BlockDef(6, "CBOOT_TEMP", 0x80880000, 0x1FE00, 0x000000, 0x340,
+                    "FD_T", flashable=False),
+    },
+    binfile_size=4194304, info_dids=STD_INFO_DIDS,
+    notes=(
+        "Simos18.10 — different AES key from 18.1! "
+        "From bri3d/VW_Flash lib/modules/simos1810.py. "
+        "Project code SCG. Larger ASW3 (0x13FC00) and CAL (0x9FC00) blocks. "
+        "CAL base at 0xA0820000 (vs 0xA0800000 on 18.1). "
+        "Patch info: 5G0906259Q__0005 block 2."
+    ),
+)
 
 # ─── Registry ────────────────────────────────────────────────────────────────
 
@@ -429,10 +512,12 @@ ECU_REGISTRY: Dict[str, ECUDef] = {
     "J255_HIGH":  J255_4ZONE,
     "J255_LOW":   J255_2ZONE,
     # Engine ECUs
-    "S85":  SIMOS85,
-    "SC1":  SIMOS12,
-    "SC2":  SIMOS122,
-    "SC8":  SIMOS18,
+    "S85":      SIMOS85,
+    "SC1":      SIMOS12,
+    "SC2":      SIMOS122,
+    "SC8":      SIMOS18,
+    "SC8_TTRS": SIMOS18_TTRS,
+    "SCG":      SIMOS1810,
 }
 
 ECU_DISPLAY_NAMES: Dict[str, str] = {k: v.name for k, v in ECU_REGISTRY.items()}
