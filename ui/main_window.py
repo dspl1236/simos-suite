@@ -356,15 +356,94 @@ class EcuInfoTab(_Tab):
                                 font=("Menlo", 10))
         self._status.pack(side="left", padx=12)
 
+        # ── VIN utility section ───────────────────────────────────────────────
+        _section(self, "VIN utility")
+
+        vin_card = _card(self, padx=14, pady=10)
+        vin_card.pack(fill="x", padx=14, pady=4)
+
+        # VIN status banner
+        self._vin_status_var = tk.StringVar(value="read ECU info to populate")
+        tk.Label(vin_card, textvariable=self._vin_status_var,
+                 fg=C["muted"], bg=C["surface"],
+                 font=("Menlo", 10), anchor="w").pack(fill="x", pady=(0, 6))
+
+        # Row 1 — chassis VIN entry + compare
+        row1 = _frame(vin_card, bg=C["surface"])
+        row1.pack(fill="x", pady=2)
+        tk.Label(row1, text="chassis VIN", fg=C["muted"],
+                 bg=C["surface"], font=("Menlo", 10), width=14,
+                 anchor="w").pack(side="left")
+        self._chassis_vin_var = tk.StringVar()
+        self._chassis_entry = tk.Entry(
+            row1, textvariable=self._chassis_vin_var,
+            bg=C["bg"], fg=C["text"], insertbackground=C["text"],
+            font=("Menlo", 11), width=20, bd=0,
+            highlightbackground=C["border"], highlightthickness=1)
+        self._chassis_entry.pack(side="left", padx=4)
+        tip(self._chassis_entry,
+            "Enter the 17-char VIN from your V5C / dashboard sticker.\n"
+            "Used to compare against what's stored in the ECU.")
+        self._compare_btn = _btn(row1, "compare", self._do_compare_vin,
+                                 state="disabled")
+        self._compare_btn.pack(side="left", padx=(4, 0))
+        tip(self._compare_btn,
+            "Compare chassis VIN vs ECU-stored VIN.\n"
+            "Flags JHM or tuner VIN-lock mismatches.")
+
+        # Row 2 — write VIN
+        row2 = _frame(vin_card, bg=C["surface"])
+        row2.pack(fill="x", pady=(6, 0))
+        tk.Label(row2, text="write VIN", fg=C["muted"],
+                 bg=C["surface"], font=("Menlo", 10), width=14,
+                 anchor="w").pack(side="left")
+        self._write_vin_var = tk.StringVar()
+        self._write_vin_entry = tk.Entry(
+            row2, textvariable=self._write_vin_var,
+            bg=C["bg"], fg=C["amber"], insertbackground=C["text"],
+            font=("Menlo", 11), width=20, bd=0,
+            highlightbackground=C["border"], highlightthickness=1)
+        self._write_vin_entry.pack(side="left", padx=4)
+        self._write_vin_btn = _btn(row2, "write to ECU", self._do_write_vin,
+                                   state="disabled")
+        self._write_vin_btn.pack(side="left", padx=(4, 0))
+        tip(self._write_vin_btn,
+            "Write VIN to ECU DID 0xF190.\n"
+            "Requires extended session + SA2 unlock.\n"
+            "Use after reflashing with a tune from a different VIN,\n"
+            "or to correct a JHM VIN-locked tune.\n"
+            "Value is read back and verified automatically.")
+
+        # Auto-fill button — copies ECU VIN into write field
+        self._autofill_btn = _btn(row2, "↑ from ECU", self._autofill_write_vin,
+                                   state="disabled")
+        self._autofill_btn.pack(side="left", padx=(4, 0))
+        tip(self._autofill_btn, "Copy ECU VIN into write field.")
+
+        # VIN result card
+        self._vin_result_var = tk.StringVar(value="")
+        self._vin_result_lbl = tk.Label(
+            vin_card, textvariable=self._vin_result_var,
+            fg=C["muted"], bg=C["surface"],
+            font=("Menlo", 9), justify="left", anchor="w", wraplength=600)
+        self._vin_result_lbl.pack(fill="x", pady=(6, 0))
+
     def on_connect(self):
         self._read_btn.config(state="normal")
         self._status.config(text="connected — press read", fg=C["green"])
+        self._write_vin_btn.config(state="normal")
+        self._compare_btn.config(state="normal")
 
     def on_disconnect(self):
         self._read_btn.config(state="disabled")
         self._status.config(text="not connected", fg=C["dim"])
+        self._write_vin_btn.config(state="disabled")
+        self._compare_btn.config(state="disabled")
+        self._autofill_btn.config(state="disabled")
         for v in self._rows.values():
             v.config(text="—", fg=C["text"])
+        self._vin_status_var.set("read ECU info to populate")
+        self._vin_result_var.set("")
 
     def _do_read(self):
         if not self.mw.connected:
@@ -394,10 +473,117 @@ class EcuInfoTab(_Tab):
         self._read_btn.config(state="normal")
         self._status.config(text="read complete", fg=C["green"])
 
+        # Populate VIN utility
+        ecu_vin = info.get("VIN", "").strip()
+        if ecu_vin and not (ecu_vin.startswith("<") and ecu_vin.endswith(">")):
+            self._vin_status_var.set(f"ECU VIN: {ecu_vin}")
+            self._write_vin_var.set(ecu_vin)
+            self._autofill_btn.config(state="normal")
+        else:
+            self._vin_status_var.set("VIN not readable from ECU")
+
     def _show_error(self, msg: str):
         self._read_btn.config(state="normal")
         self._status.config(text=f"error: {msg}", fg=C["red"])
         import logging; logging.getLogger("SimosSuite.GUI").error("ECU info error: %s", msg)
+
+    # ── VIN utility methods ────────────────────────────────────────────────
+
+    def _autofill_write_vin(self):
+        """Copy current ECU VIN row into the write field."""
+        ecu_vin = self._rows.get("VIN")
+        if ecu_vin:
+            vin = ecu_vin.cget("text").strip()
+            if vin and vin != "—":
+                self._write_vin_var.set(vin)
+                self._chassis_vin_var.set(vin)
+
+    def _do_compare_vin(self):
+        """Compare ECU VIN vs chassis VIN entered in the field."""
+        ecu_vin_lbl = self._rows.get("VIN")
+        ecu_vin = (ecu_vin_lbl.cget("text") if ecu_vin_lbl else "").strip()
+        chassis_vin = self._chassis_vin_var.get().strip().upper()
+
+        if not ecu_vin or ecu_vin == "—":
+            self._vin_result_var.set("⚠ Read ECU info first to get ECU VIN")
+            self._vin_result_lbl.config(fg=C["amber"])
+            return
+        if not chassis_vin:
+            self._vin_result_var.set("⚠ Enter your chassis VIN first")
+            self._vin_result_lbl.config(fg=C["amber"])
+            return
+
+        try:
+            from flasher.vin_utils import compare_vin, validate_vin
+            chassis_vin = validate_vin(chassis_vin)
+            result = compare_vin(ecu_vin, chassis_vin)
+            color = C["green"] if result["match"] else C["red"]
+            self._vin_result_var.set("\n".join(result["notes"]))
+            self._vin_result_lbl.config(fg=color)
+        except Exception as e:
+            self._vin_result_var.set(f"error: {e}")
+            self._vin_result_lbl.config(fg=C["red"])
+
+    def _do_write_vin(self):
+        """Write VIN to ECU DID 0xF190 (SA2 required)."""
+        if not self.mw.connected:
+            return
+        vin_raw = self._write_vin_var.get().strip()
+        if not vin_raw:
+            self._vin_result_var.set("⚠ Enter the VIN to write")
+            self._vin_result_lbl.config(fg=C["amber"])
+            return
+        try:
+            from flasher.vin_utils import validate_vin
+            vin = validate_vin(vin_raw)
+        except Exception as e:
+            self._vin_result_var.set(f"⚠ {e}")
+            self._vin_result_lbl.config(fg=C["amber"])
+            return
+
+        if not messagebox.askyesno(
+            "Write VIN",
+            f"Write VIN to ECU DID 0xF190?\n\n"
+            f"  VIN: {vin}\n\n"
+            "Requires SA2 security access unlock.\n"
+            "The ECU must be connected and in key-on state.\n\n"
+            "Continue?",
+            icon="warning",
+        ):
+            return
+
+        self._write_vin_btn.config(state="disabled")
+        self._vin_result_var.set(f"writing {vin}...")
+        self._vin_result_lbl.config(fg=C["amber"])
+        self._run(self._write_vin_task, vin)
+
+    def _write_vin_task(self, vin: str):
+        try:
+            from flasher.vin_utils import write_vin
+            write_vin(
+                self.mw.ecu,
+                vin,
+                interface=self.mw.interface,
+                interface_path=self.mw.iface_path,
+                ble_bridge=getattr(self.mw, "ble_bridge", None),
+            )
+            self._ui(self._write_vin_done, vin)
+        except Exception as e:
+            self._ui(self._write_vin_error, str(e))
+
+    def _write_vin_done(self, vin: str):
+        self._write_vin_btn.config(state="normal")
+        self._vin_result_var.set(f"✓ VIN written and verified: {vin}")
+        self._vin_result_lbl.config(fg=C["green"])
+        self._vin_status_var.set(f"ECU VIN: {vin}  (just written)")
+        # Update the VIN row in the info grid
+        if "VIN" in self._rows:
+            self._rows["VIN"].config(text=vin, fg=C["green"])
+
+    def _write_vin_error(self, msg: str):
+        self._write_vin_btn.config(state="normal")
+        self._vin_result_var.set(f"✗ {msg}")
+        self._vin_result_lbl.config(fg=C["red"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3932,7 +4118,7 @@ class MainWindow(tk.Tk):
         self.ble_bridge   — BLEBridgeSync instance or None
     """
 
-    VERSION = "0.3.2"
+    VERSION = "0.3.3"
 
     def __init__(self, ecu_key: Optional[str] = None):
         super().__init__()

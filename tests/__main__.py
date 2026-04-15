@@ -60,10 +60,26 @@ def main():
         all_pass = False
 
     # 3. Transmission tests
-    print("\n[4/4] transmission tests (sim_trans)")
+    print("\n[4/5] transmission tests (sim_trans)")
     try:
         import tests.sim_trans as sim_trans
         ok = sim_trans._print_results()
+        all_pass = all_pass and ok
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        all_pass = False
+
+    # 5. VIN utility tests
+    print("\n[5/5] VIN utility tests (test_vin_utils)")
+    try:
+        import subprocess
+        import pathlib
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest",
+             "tests/test_vin_utils.py", "-q", "--tb=short"],
+            cwd=str(pathlib.Path(__file__).resolve().parent.parent),
+        )
+        ok = result.returncode == 0
         all_pass = all_pass and ok
     except Exception as e:
         print(f"  ERROR: {e}")
