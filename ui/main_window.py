@@ -2256,8 +2256,7 @@ class CPToolsTab(_Tab):
                 ble_bridge     = getattr(self.mw, "ble_bridge", None),
             )
             cfg = dict(configs.default_client_config)
-            for did in DIAG_DIDS:
-                cfg["data_identifiers"] = {did: _BytesCodec}
+            cfg["data_identifiers"] = {did: _BytesCodec for did in DIAG_DIDS}
             cfg["request_timeout"] = 8
             cfg["use_server_timing"] = False
             conn = probe._make_conn(0x710, 0x77A)
