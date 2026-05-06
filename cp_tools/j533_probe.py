@@ -244,6 +244,23 @@ KNOWN_ADAPTATIONS = {
     0x2CA8: "Service key 2 settings",
 }
 
+# ─── Known IKA blob from J136 (Feb 2024 live capture) ─────────────────────────
+# This is the verbatim 34-byte blob read from J136 (Memory Seat Driver) on
+# Andrew's C7 A6 during a CP-cleared session.  Structure hypothesis:
+#   bytes[0:16]  = AES-128 key
+#   bytes[16:32] = MAC / verification
+#   byte[32]     = 0x26 (version/type tag)
+#   byte[33]     = 0x00 (padding/status)
+KNOWN_J136_IKA_BLOB = bytes.fromhex(
+    "E62B41D11C44AF202177FB1F274B0AC2"   # bytes 0-15:  AES key (hypothesized)
+    "D15BD262E4FD27AB61D123C2F15A2C93"   # bytes 16-31: MAC (hypothesized)
+    "2600"                                 # bytes 32-33: version + padding
+)
+
+# Known constellation snapshots (before/after CP clear)
+KNOWN_CONSTELLATION_CP_ACTIVE  = bytes.fromhex("FDA1E90CFE62648D0000")
+KNOWN_CONSTELLATION_CP_CLEARED = bytes.fromhex("FDA1E80CFE62600D0000")
+
 
 @dataclass
 class DIDResult:
@@ -1261,6 +1278,119 @@ class J533Probe:
         except Exception as e:
             results["J533_constellation"] = {"did": "0x04A3", "status": f"error: {e}"}
 
+        return results
+
+    # ── Experiment 1: J533-only quick test ────────────────────────────────────
+
+    def quick_test(self) -> dict:
+        """
+        Experiment 1 — J533-only read.  No cross-bus, no Mongoose routing.
+        Reads:
+          - DID 0x00BE  (IKA blob, 34 bytes)
+          - DID 0x04A3  (constellation bitmap, 10 bytes)
+          - DID 0x2A2A  (component allocation)
+          - DID 0xF190  (VIN)
+          - DID 0xF187  (part number)
+          - DID 0xF189  (SW version)
+          - DID 0xF18C  (serial)
+        Then compares against the known J136 blob from Feb 2024.
+
+        Returns a dict with all results + analysis text.
+        """
+        if not self._client_j533:
+            self.connect()
+
+        results = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        analysis_lines = []
+
+        # ── Read all target DIDs ──
+        target_dids = [
+            (0x00BE, "IKA Key"),
+            (0x04A3, "Constellation bitmap"),
+            (0x2A2A, "Component allocation"),
+            (0xF190, "VIN"),
+            (0xF187, "Part Number"),
+            (0xF189, "SW Version"),
+            (0xF18C, "Serial Number"),
+            (0x00BD, "GKA Key"),
+        ]
+
+        for did, label in target_dids:
+            raw, err = self._read_did(self._client_j533, did)
+            key = f"0x{did:04X}"
+            results[key] = {
+                "label": label,
+                "raw": (raw or b"").hex().upper(),
+                "hex_spaced": " ".join(f"{b:02X}" for b in (raw or b"")),
+                "length": len(raw or b""),
+                "error": err,
+            }
+            status = f"{len(raw)} bytes" if raw else f"FAILED: {err}"
+            log.info("J533 DID %s (%s): %s", key, label, status)
+
+        # ── Analysis ──
+        analysis_lines.append("=" * 60)
+        analysis_lines.append("EXPERIMENT 1 — J533 QUICK TEST RESULTS")
+        analysis_lines.append("=" * 60)
+
+        # VIN
+        vin_raw = bytes.fromhex(results.get("0xF190", {}).get("raw", ""))
+        vin_str = vin_raw.decode("ascii", errors="replace") if vin_raw else "?"
+        analysis_lines.append(f"VIN:           {vin_str}")
+        results["vin"] = vin_str
+
+        # Part / SW / Serial
+        for did_key, label in [("0xF187", "Part"), ("0xF189", "SW"), ("0xF18C", "Serial")]:
+            raw_hex = results.get(did_key, {}).get("raw", "")
+            decoded = bytes.fromhex(raw_hex).decode("ascii", errors="replace") if raw_hex else "?"
+            analysis_lines.append(f"{label:14s} {decoded}")
+
+        # Constellation
+        const_hex = results.get("0x04A3", {}).get("raw", "")
+        const_bytes = bytes.fromhex(const_hex) if const_hex else b""
+        analysis_lines.append(f"\nConstellation: {results.get('0x04A3', {}).get('hex_spaced', '?')}")
+        if const_bytes == KNOWN_CONSTELLATION_CP_CLEARED:
+            analysis_lines.append("  STATUS: MATCHES CP-CLEARED snapshot")
+        elif const_bytes == KNOWN_CONSTELLATION_CP_ACTIVE:
+            analysis_lines.append("  STATUS: MATCHES CP-ACTIVE snapshot")
+        elif const_bytes:
+            analysis_lines.append("  STATUS: UNKNOWN pattern (new data!)")
+
+        # IKA blob comparison
+        ika_hex = results.get("0x00BE", {}).get("raw", "")
+        ika_bytes = bytes.fromhex(ika_hex) if ika_hex else b""
+        analysis_lines.append(f"\nIKA blob (0x00BE): {results.get('0x00BE', {}).get('hex_spaced', '?')}")
+        analysis_lines.append(f"  Length: {len(ika_bytes)} bytes")
+
+        if not ika_bytes:
+            analysis_lines.append("  RESULT: READ FAILED — check connection")
+        elif all(b == 0 for b in ika_bytes):
+            analysis_lines.append("  RESULT: ALL ZEROS — CP slot is empty/inactive")
+        elif ika_bytes == KNOWN_J136_IKA_BLOB:
+            analysis_lines.append("  ***  MATCH: J533 blob == known J136 blob from Feb 2024  ***")
+            analysis_lines.append("  CONCLUSION: IKA key is SHARED across modules (VIN-bound)")
+            analysis_lines.append("  → Replay path CONFIRMED — write this blob to any new module")
+        else:
+            analysis_lines.append("  MISMATCH: J533 blob differs from known J136 blob")
+            analysis_lines.append(f"  Known J136: {KNOWN_J136_IKA_BLOB.hex().upper()}")
+            analysis_lines.append(f"  J533 read:  {ika_hex}")
+            # Check if first 16 bytes match (AES key same, MAC different?)
+            if len(ika_bytes) >= 16 and ika_bytes[:16] == KNOWN_J136_IKA_BLOB[:16]:
+                analysis_lines.append("  NOTE: First 16 bytes (AES key) MATCH — MAC differs")
+                analysis_lines.append("  → Key is shared, verification tag is module-specific")
+            elif len(ika_bytes) >= 32 and ika_bytes[32:] == KNOWN_J136_IKA_BLOB[32:]:
+                analysis_lines.append("  NOTE: Trailer bytes match — key material differs")
+                analysis_lines.append("  → Key is module-specific, derivation path needed")
+            else:
+                analysis_lines.append("  → Full analysis needed — check byte-by-byte diff")
+
+        # GKA key
+        gka_hex = results.get("0x00BD", {}).get("raw", "")
+        if gka_hex:
+            analysis_lines.append(f"\nGKA blob (0x00BD): {' '.join(gka_hex[i:i+2] for i in range(0, len(gka_hex), 2))}")
+
+        analysis_lines.append("\n" + "=" * 60)
+        results["analysis"] = "\n".join(analysis_lines)
         return results
 
     def save_report(self, path: str, report: ProbeReport):
