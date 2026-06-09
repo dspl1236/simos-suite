@@ -12,13 +12,36 @@ Companion repos:
 
 ---
 
+## ⚠️ Status: alpha — read before you write
+
+**Work in progress.** This is built in the open as the tooling gets developed —
+expect rough edges, missing pieces, and features that are wired but unconfirmed.
+
+- **Read-only features** (ECU Info, Logger, Raw Sniff, Trans live data) are
+  low-risk — worst case, they misread something.
+- **Write features** (Flash, Tune → save/checksums, CP Tools → IKA write /
+  constellation update) are **experimental and not fully validated on
+  hardware.** The CP routine (`0x0226`) is wired but unconfirmed. Check the
+  feature table below before trusting any of them.
+
+**Flashing an ECU/TCU can brick it.** Do not use the flash/write features on a
+vehicle you can't afford to recover — have a bench setup (boot-mode / BDM) or a
+verified known-good backup *first*. **No warranty whatsoever** (GPL §15–16).
+You run this entirely at your own risk.
+
+Unsigned, pre-1.0, not done — and shipped anyway so the community can build on
+it. Bench reports and PRs welcome.
+
+---
+
 ## Download
 
 **[SimosSuite.exe — latest](https://github.com/dspl1236/simos-suite/releases/latest)**  (Windows x64, ~30 MB)
 
-Windows x64, single file, no install required. SmartScreen will flag an
-unsigned binary on first run — click "More info" → "Run anyway". Source is
-here, GPL v3.
+Windows x64, single file, no install. It's an **unsigned alpha build** —
+SmartScreen will flag it; "More info" → "Run anyway" if you trust it, or run
+from source (see Quick start). Read the ⚠️ status above before using any write
+feature. GPL v3.
 
 ---
 
