@@ -217,6 +217,19 @@ class Cerberus:
         self._send("MON:off")
         return self._read_reply(time.time() + 1.5)
 
+    def set_mode(self, mode: str = "vci"):
+        """Declare the board's head posture in one shot (firmware >= 0.9.4):
+          'vci'   — Head 1 active VCI + Head 2 listen-only logger (default; for uds()/scan()/flash).
+          'sniff' — BOTH heads listen-only + MON on (zero bus footprint; safe alongside ODIS).
+          'dual'  — both heads active VCIs.
+        Call this to declare intent: set_mode('vci') before active work, set_mode('sniff')
+        for pure passive capture. (Older firmware just ignores it with ERR:unknown.)"""
+        m = mode.lower()
+        if m not in ("vci", "sniff", "dual"):
+            raise ValueError("mode must be vci|sniff|dual")
+        self._send("MODE:" + m)
+        return self._read_reply(time.time() + 1.5)
+
     def mon_capture(self, on_frame, stop=None, duration: float = None,
                     idlo: int = None, idhi: int = None):
         """Pure passive live-view: enable the Head-2 logger and pump frames to
