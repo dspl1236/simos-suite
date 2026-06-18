@@ -4501,8 +4501,12 @@ class CPCaptureTab(_Tab):
         self._stop = None
         self._n = 0
         self._cur_bus = 1
+        import queue
+        self._q = queue.Queue()       # M2: live-logger frames (worker -> main thread)
+        self._live = False            # True while the Head-2 MON live-view is running
+        self._ids = set()
 
-        _section(self, "CerberusCAN capture  (passive sniff)")
+        _section(self, "CerberusCAN capture  (sniff + live MON)")
         bar = _frame(self)
         bar.pack(fill="x", padx=14, pady=(2, 4))
         tk.Label(bar, text="port", fg=C["muted"], bg=C["bg"],
@@ -4515,13 +4519,14 @@ class CPCaptureTab(_Tab):
                  font=("Menlo", 10)).pack(side="left")
         self._bus = tk.StringVar(value="1 (500k diag)")
         ttk.Combobox(bar, textvariable=self._bus, state="readonly", width=15,
-                     values=["1 (500k diag)", "2 (100k comfort)"],
+                     values=["1 (500k diag, active)", "2 (500k logger, MON)"],
                      font=("Menlo", 10)).pack(side="left", padx=(4, 8))
         _btn(bar, "Detect", self._detect).pack(side="left")
 
         b2 = _frame(self)
         b2.pack(fill="x", padx=14, pady=(0, 4))
         _btn(b2, "Start sniff", self._start, primary=True).pack(side="left")
+        _btn(b2, "Live (MON)", self._start_live, primary=True).pack(side="left", padx=6)
         _btn(b2, "Stop", self._stop_capture).pack(side="left", padx=6)
         _btn(b2, "Save CSV…", self._save).pack(side="left")
         _btn(b2, "Open CSV…", self._open_csv).pack(side="left", padx=6)
@@ -4536,7 +4541,9 @@ class CPCaptureTab(_Tab):
             "Passive capture via CerberusCAN, then ISO-TP + VW TP 2.0 decode.\n"
             "Bus 1 (500k, OBD 6/14) sees ALL ODIS diagnostics incl. gateway-routed\n"
             "comfort modules. Run during an ODIS CP session -> Stop -> Decode, and the\n"
-            "TrainICA / 0x00BE / SecurityAccess get flagged.\n\n", "dim")
+            "TrainICA / 0x00BE / SecurityAccess get flagged.\n"
+            "Live (MON): firmware >=0.6.0 Head-2 always-on logger — frames stream in real\n"
+            "time and accumulate for Save/Decode (Head 2 = 2nd tap on the SAME 6/14 bus).\n\n", "dim")
         self._detect()
 
     def _set_status(self, text, color):
@@ -4610,6 +4617,80 @@ class CPCaptureTab(_Tab):
             self._append_log(self._log, "stop requested…\n", "dim")
         else:
             self._append_log(self._log, "not capturing.\n", "warn")
+
+    def _start_live(self):
+        """Head-2 always-on background logger (MON) — live streaming view (firmware >= 0.6.0).
+        Head 2 is a 2nd transceiver tapped on the SAME 6/14 bus, held listen-only, so this can
+        run WHILE Head 1 drives an active UDS/CP exchange. Frames accumulate for Save / Decode."""
+        if self._dev is not None:
+            self._append_log(self._log, "already capturing.\n", "warn")
+            return
+        port = self._port.get().strip()
+        if not port:
+            self._append_log(self._log, "pick a port first (Detect).\n", "warn")
+            return
+        import threading
+        self._cur_bus = 2
+        self._frames = []
+        self._n = 0
+        self._ids = set()
+        self._live = True
+        self._stop = threading.Event()
+
+        def work():
+            try:
+                from transport.cerberus_serial import Cerberus
+                self._dev = Cerberus(port)
+                if not self._dev.ping():
+                    self._ui(self._append_log, self._log,
+                             "no PONG (need firmware >= 0.6.0 for MON) — continuing\n", "warn")
+                self._dev.set_mon_callback(lambda t, cid, data: self._q.put((t, cid, data)))
+                rep = self._dev.mon_on()
+                self._ui(self._append_log, self._log,
+                         "MON live on Head 2 (%s) — drive Head 1 anytime; frames stream below\n"
+                         % rep, "hdr")
+                self._ui(self._live_poll)
+                while not self._stop.is_set():
+                    self._dev.pump(0.05)        # drain serial -> route M2 -> queue
+            except Exception as ex:
+                self._ui(self._append_log, self._log, "live error: %s\n" % ex, "err")
+            finally:
+                for fn in ("mon_off", "close"):
+                    try:
+                        if self._dev:
+                            getattr(self._dev, fn)()
+                    except Exception:
+                        pass
+                self._dev = None
+                self._live = False
+                self._ui(self._set_status, "idle (%d frames)" % self._n, C["dim"])
+
+        self._append_log(self._log,
+                         "starting MON live logger on %s (Head 2)…\n" % port, "hdr")
+        self._run(work)
+
+    def _live_poll(self):
+        """Main-thread: drain queued M2: frames -> accumulate + stream a throttled live line."""
+        import queue
+        last = None
+        try:
+            while True:                          # drain everything queued this tick
+                t, cid, data = self._q.get_nowait()
+                self._frames.append((t, cid, data))
+                self._n += 1
+                self._ids.add(cid)
+                last = (t, cid, data)
+        except queue.Empty:
+            pass
+        if last is not None:                     # one summary line per tick (no flood)
+            t, cid, data = last
+            self._append_log(self._log,
+                             "  live %6d fr  %3d IDs   last %03X %s\n"
+                             % (self._n, len(self._ids), cid, data.hex().upper()), None)
+        if self._dev is not None and self._live:
+            self._set_status("live: %d frames, %d IDs (Head 2 logger)" % (self._n, len(self._ids)),
+                             C["green"])
+            self.after(250, self._live_poll)
 
     def _save(self):
         from tkinter import filedialog
