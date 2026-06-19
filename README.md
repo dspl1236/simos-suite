@@ -32,8 +32,7 @@ Built in the open, pre-1.0, **unsigned**, maturity labeled honestly throughout.
   defaults to dry-run).
 
 **Flashing can brick an ECU.** Don't run write features on a car you can't recover — have a
-bench (boot-mode / BDM) setup and a verified known-good backup *first*. **No warranty** (GPL
-§15–16); entirely at your own risk. The CP work is **research** on the author's own vehicle —
+bench (boot-mode / BDM) setup and a verified known-good backup *first*. **No warranty** (provided as-is, no warranty); entirely at your own risk. The CP work is **research** on the author's own vehicle —
 it does **not** defeat cryptographic signatures (see [Status & honesty](#status--honesty)).
 
 ---
@@ -199,9 +198,9 @@ unconfirmed is labeled so; bench reports and corrections are welcome.
 
 ## License
 
-**GPL-3.0** — free for personal use and right-to-repair; modifications stay open source. No
-warranty (GPL §15–16).
+**MIT** — free for personal use and right-to-repair; free to use, modify, distribute, and sell. No
+warranty (provided as-is, no warranty).
 
 ---
 
-*Built for owners. GPL-3.0 · github.com/dspl1236/simos-suite*
+*Built for owners. MIT · github.com/dspl1236/simos-suite*
