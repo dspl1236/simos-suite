@@ -5,3 +5,4 @@ from .interfaces import InterfaceRegistry, detect_j2534_dll, detect_j2534_dlls, 
 # Backwards-compat alias — FoundDevice was renamed BLEDeviceInfo
 FoundDevice = BLEDeviceInfo
 from .ws_bridge import WSBridge, WSBridgeConnection, ws_available, detect_funkbridge_url
+from .dpdu_bridge import DPduConnection, detect_dpdu_dll, dpdu_available
